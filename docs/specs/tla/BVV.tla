@@ -191,13 +191,14 @@ Next ==
     \/ \E t \in TaskIDs, w \in Workers : ExitBlocked(t, w)
     \/ \E t \in TaskIDs, w \in Workers : ExitHandoff(t, w)
     \/ \E t \in TaskIDs, w \in Workers : ExitHandoffLimit(t, w)
-    \* --- Dispatch/recovery actions (6) ---
+    \* --- Dispatch/recovery actions (7) ---
     \/ \E t \in TaskIDs, w \in Workers : SessionTimeout(t, w)
     \/ \E w \in Workers : SessionCrash(w)
     \/ \E t \in TaskIDs, w \in Workers : WatchdogRestart(t, w)
     \/ \E t \in TaskIDs, w \in Workers : WatchdogFail(t, w)
     \/ \E t \in TaskIDs : HumanReopen(t)
     \/ \E b \in Branches : Reconcile(b)
+    \/ \E b \in Branches : AbortCleanup(b)
     \* --- Lock actions (3) ---
     \/ \E orch \in Orchestrators, b \in Branches : AcquireLock(orch, b)
     \/ \E orch \in Orchestrators, b \in Branches : ReleaseLock(orch, b)
@@ -228,7 +229,7 @@ Next ==
 
 Fairness ==
     /\ \A t \in TaskIDs, w \in Workers :
-        WF_vars(Assign(t, w))
+        SF_vars(Assign(t, w))
     /\ \A t \in TaskIDs, w \in Workers :
         WF_vars(SessionStart(t, w))
     /\ \A t \in TaskIDs, w \in Workers :
@@ -242,12 +243,23 @@ Fairness ==
         SF_vars(Reconcile(b))
     /\ \A b \in Branches :
         WF_vars(LockGoesStale(b))
+    /\ \A b \in Branches :
+        SF_vars(AbortCleanup(b))
+    /\ \A orch \in Orchestrators, b \in Branches :
+        WF_vars(AcquireLock(orch, b))
+    /\ \A orch \in Orchestrators, b \in Branches :
+        WF_vars(ReleaseLock(orch, b))
 
 \* =========================================================================
 \*  SPECIFICATION
 \* =========================================================================
 
 Spec == Init /\ [][Next]_vars /\ Fairness
+
+\* Per-config specifications (static inits with fairness)
+StaticSpec3 == StaticInit3 /\ [][Next]_vars /\ Fairness
+StaticSpec5 == StaticInit5 /\ [][Next]_vars /\ Fairness
+StaticSpecLifecycle == StaticInitLifecycle /\ [][Next]_vars /\ Fairness
 
 \* =========================================================================
 \*  TYPE CORRECTNESS INVARIANT

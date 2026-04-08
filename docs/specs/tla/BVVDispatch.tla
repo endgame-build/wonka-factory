@@ -197,6 +197,16 @@ AcquireLock(orch, b) ==
 ReleaseLock(orch, b) ==
     /\ lifecycleLock[b] = "held"
     /\ lockHolder[b] = orch
+    \* Section 8.1.3 + BVV-ERR-09: orchestrator releases lock only when
+    \* all tasks are terminal (lifecycle complete) or lifecycle is aborted
+    \* and no active sessions remain.
+    /\ ~\E w \in Workers :
+        /\ sessionAlive[w] = TRUE
+        /\ workerTask[w] /= None
+        /\ taskBranch[workerTask[w]] = b
+    /\ \/ lifecycleAborted[b] = TRUE
+       \/ \A t \in TaskIDs :
+            IsCreated(t) /\ taskBranch[t] = b => IsTerminal(taskStatus[t])
     /\ lifecycleLock' = [lifecycleLock EXCEPT ![b] = "free"]
     /\ lockHolder' = [lockHolder EXCEPT ![b] = None]
     /\ dispatching' = [dispatching EXCEPT ![b] = FALSE]
@@ -214,6 +224,10 @@ ReleaseLock(orch, b) ==
 
 LockGoesStale(b) ==
     /\ lifecycleLock[b] = "held"
+    \* Lock staleness models the holder crashing. An active orchestrator
+    \* (dispatching=TRUE) refreshes the lock — it only goes stale when
+    \* the holder is dead (stopped dispatching).
+    /\ dispatching[b] = FALSE
     /\ lifecycleLock' = [lifecycleLock EXCEPT ![b] = "stale"]
     \* Lock holder is now dead — they don't know the lock is stale
     /\ humanReopenFlag' = FALSE
@@ -221,5 +235,35 @@ LockGoesStale(b) ==
                    deps, taskBranch, critical, workerState, workerTask,
                    sessionAlive, gapCount, lifecycleAborted, lockHolder,
                    dispatching, prCreated>>
+
+\* --------------------------------------------------------------------------
+\* Action: AbortCleanup (implied by BVV-ERR-04 + Section 8.1.3)
+\* --------------------------------------------------------------------------
+\* When lifecycle is aborted, mark all remaining open tasks on that branch
+\* as blocked. Without this, undispatched tasks are stranded and
+\* EventualTermination (BVV-L-01) is violated.
+\*
+\* Justification: Section 8.1.3 requires "ALL tasks in scope terminal" for
+\* dispatch loop termination. BVV-ERR-04 stops dispatch on abort. This
+\* action bridges the gap — the orchestrator terminates stranded tasks
+\* so the dispatch loop can exit cleanly.
+
+AbortCleanup(b) ==
+    /\ lifecycleAborted[b] = TRUE
+    /\ lifecycleLock[b] = "held"
+    \* At least one open task exists on this branch
+    /\ \E t \in TaskIDs :
+        /\ taskStatus[t] = "open"
+        /\ taskBranch[t] = b
+    \* Mark all open tasks on this branch as blocked
+    /\ taskStatus' = [t \in TaskIDs |->
+        IF taskStatus[t] = "open" /\ taskBranch[t] = b
+        THEN "blocked"
+        ELSE taskStatus[t]]
+    /\ humanReopenFlag' = FALSE
+    /\ UNCHANGED <<retryCount, handoffCount, assignee, role, deps,
+                   taskBranch, critical, workerState, workerTask,
+                   sessionAlive, gapCount, lifecycleAborted,
+                   lifecycleLock, lockHolder, dispatching, prCreated>>
 
 =============================================================================
