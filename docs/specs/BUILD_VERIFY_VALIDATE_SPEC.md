@@ -509,7 +509,7 @@ Multiple feature lifecycles MAY execute concurrently. Each lifecycle runs as an 
 
 #### 8.1.3 Termination
 
-The dispatch loop terminates when ALL tasks in the lifecycle scope have reached terminal status (`completed`, `failed`, or `blocked`) AND no workers have active sessions.
+The dispatch loop terminates when ALL tasks in the lifecycle scope have reached terminal status (`completed`, `failed`, or `blocked`) AND no workers have active sessions. After termination, the orchestrator releases the lifecycle lock (BVV-ERR-10a).
 
 ### 8.2 Role-Based Routing
 
@@ -772,6 +772,10 @@ A task is **critical** if it carries the `critical:true` label in the ledger. A 
 
 > *Note (non-normative):* The gap tolerance is a dispatch threshold, not a hard ceiling. Tasks already in-flight when the tolerance is reached continue to completion. If those in-flight tasks also fail, the actual gap count may exceed the configured tolerance by up to (MaxWorkers - 1). Implementations that require a strict ceiling SHOULD drain active sessions before checking the gap count.
 
+`[BVV-ERR-04a]` When a lifecycle aborts (gap tolerance reached per BVV-ERR-04, or critical task failure per BVV-ERR-03), the orchestrator MUST set all remaining `open` tasks in the lifecycle scope to `blocked`. This bridges the gap between "stop dispatching" (BVV-ERR-04) and "ALL tasks terminal" (Section 8.1.3 termination condition). Without this cleanup, undispatched tasks are stranded in `open` status indefinitely, violating BVV-L-01 (Eventual Termination).
+
+> *Note (non-normative):* TLC model checking confirmed this gap: without abort cleanup, the `EventualTermination` liveness property is violated. The orchestrator stops dispatching but never terminates because undispatched tasks remain non-terminal. This requirement was added during formal verification.
+
 `[BVV-ERR-05]` The gap counter MUST be monotonic. Resume MUST recover the gap count by scanning `gap_recorded` events in the audit trail.
 
 ### 11.4 Transient vs. Structural Failures
@@ -820,6 +824,10 @@ On SIGINT or SIGTERM, the orchestrator:
 `[BVV-ERR-09]` Graceful shutdown MUST NOT modify task statuses in the ledger. Active tasks remain `in_progress`. The next orchestrator instance reconciles them on resume.
 
 `[BVV-ERR-10]` The lifecycle lock MUST be released on all exit paths, including signal-triggered shutdown. The orchestrator MUST register a cleanup handler at startup.
+
+`[BVV-ERR-10a]` The orchestrator MUST NOT release the lifecycle lock while active sessions exist for tasks on the locked branch. Before releasing the lock, the orchestrator MUST wait for all active sessions to exit (per BVV-ERR-09 step 2) or terminate them. The lock MUST only be released when one of the following holds: (a) all tasks in the lifecycle scope have reached terminal status (Section 8.1.3), or (b) the lifecycle has aborted and abort cleanup (BVV-ERR-04a) has completed.
+
+> *Note (non-normative):* If the orchestrator crashes without releasing the lock, the lock staleness mechanism (BVV-L-02) allows a subsequent orchestrator instance to reclaim it. This requirement constrains voluntary lock release by a running orchestrator — it does not apply to crash scenarios.
 
 ### 11a.4 Liveness Detection
 
@@ -909,7 +917,9 @@ pr_created ⟹ |gaps| < gap_tolerance
 
 ### 13.2 Lock Release (BVV-L-02)
 
-`[BVV-L-02]` The lifecycle lock MUST have a configurable staleness threshold (RECOMMENDED: 4 hours). A crashed orchestrator's lock MUST be recoverable by a subsequent orchestrator instance after the staleness period.
+`[BVV-L-02]` The lifecycle lock MUST have a configurable staleness threshold (RECOMMENDED: 4 hours). A crashed orchestrator's lock MUST be recoverable by a subsequent orchestrator instance after the staleness period. A lock is considered stale only when the holding orchestrator has stopped functioning — an actively dispatching orchestrator refreshes its lock implicitly by maintaining the dispatch loop. Lock staleness detection MUST NOT trigger while the holder is actively dispatching tasks.
+
+> *Note (non-normative):* TLC model checking showed that without this constraint, a spurious stale→reacquire→stale cycle can prevent dispatch progress. In practice, the staleness threshold (4 hours) makes this unlikely, but the constraint makes the intent explicit: staleness models holder death, not transient inactivity.
 
 ### 13.3 Worker Recovery (BVV-L-03)
 

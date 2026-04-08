@@ -17,13 +17,13 @@ The orchestrator replaces phase-driven pipeline execution with DAG-driven dispat
 
 | Document | Purpose |
 |----------|---------|
-| `docs/specs/BUILD_VERIFY_VALIDATE_SPEC.md` | Primary spec — 68 normative requirements (BVV-*) |
+| `docs/specs/BUILD_VERIFY_VALIDATE_SPEC.md` | Primary spec — 70 normative requirements (BVV-*) |
 | `docs/specs/BVV_VALIDATION_REPORT.md` | Prose validation: state matrix, deadlock analysis, termination proof |
 | `docs/specs/MULTI_AGENT_PIPELINE_ORCHESTRATION_SPEC.md` | Infrastructure layer — BVV reuses Sections 4-11a (LDG-*, WKR-*, SUP-*, RCV-*, CTY-*) |
 
 ## Formal Verification (TLA+)
 
-TLA+ model in `docs/specs/tla/` encodes 52 of 68 BVV requirements as mechanically verifiable invariants and temporal properties. TLC model checking precedes Go implementation.
+TLA+ model in `docs/specs/tla/` encodes 52 of 70 BVV requirements as mechanically verifiable invariants and temporal properties. TLC model checking precedes Go implementation.
 
 ```bash
 # Install TLA+ tooling
@@ -89,14 +89,14 @@ Forked from `facet-scan/orch` and simplified per BVV Appendix B:
 | `engine.go` | Top-level: `Engine.Run()` (fresh) and `Engine.Resume()` (interrupted) | BVV-ERR-06..08 |
 | `session.go` | WorkerPool lifecycle (Allocate/Spawn/Release) | WKR-04..12 |
 | `tmux.go` | Socket-isolated tmux wrapper | — |
-| `lock.go` | Per-branch lifecycle lock with staleness detection | BVV-S-01, BVV-ERR-06, BVV-L-02 |
-| `recovery.go` | RetryState (exit code 1), GapTracker (BVV-ERR-03..05), handoff counter | BVV-ERR-01..05 |
+| `lock.go` | Per-branch lifecycle lock with staleness detection | BVV-S-01, BVV-ERR-06, BVV-ERR-10a, BVV-L-02 |
+| `recovery.go` | RetryState (exit code 1), GapTracker (BVV-ERR-03..05), abort cleanup, handoff counter | BVV-ERR-01..05, BVV-ERR-04a |
 | `resume.go` | State reconciliation: stale assignments, orphan cleanup, counter recovery | BVV-ERR-07..08 |
 | `gate.go` | PR gate: create PR, poll CI, exit code protocol | BVV-GT-01..03 |
 | `watchdog.go` | Tmux liveness detection + circuit breaker | BVV-ERR-11..11a, SUP-05..06 |
 | `eventlog.go` | Append-only JSONL audit trail (16 event kinds) | BVV-SS, Section 10.3 |
 | `invariant.go` | Runtime assertions (build tag `verify`) | BVV-S-01..10 |
-| `signal.go` | Graceful shutdown (SIGINT/SIGTERM), no status modification | BVV-ERR-09..10 |
+| `signal.go` | Graceful shutdown (SIGINT/SIGTERM), no status modification | BVV-ERR-09..10a |
 
 ### What was removed from facet-scan/orch
 

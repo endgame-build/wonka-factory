@@ -163,14 +163,16 @@ Enforcement splits between the planning agent (serializes overlapping build task
 
 ### Summary
 
-**Total unique BVV requirements: 68** (post-defect-fix, up from 62 original)
+**Total unique BVV requirements: 70** (post-formal-verification, up from 68 post-defect-fix, 62 original)
 
 | Level | Count | Domains |
 |---|---|---|
-| L1 (Core Dispatch) | 50 | DSN(4), AI(3), TG(1), DSP(13), SS(1), ERR(13), S(11), L(4) |
+| L1 (Core Dispatch) | 52 | DSN(4), AI(3), TG(1), DSP(13), SS(1), ERR(15), S(11), L(4) |
 | L2 (Feature Lifecycle) | 18 | TG(11), DSP(4), GT(3) |
 
 New requirements added during validation (all L1): BVV-ERR-02a (base session timeout), BVV-ERR-11a (watchdog handoff semantics), BVV-S-09 (workspace write serialization), BVV-S-10 (watchdog-retry non-interference), BVV-DSP-16 (Beads ledger implementation), BVV-DSP-03a (unknown role escalation).
+
+New requirements added during formal verification (all L1): BVV-ERR-04a (abort cleanup — mark stranded open tasks as blocked), BVV-ERR-10a (lock release preconditions — sessions drained, lifecycle done/aborted). BVV-L-02 was strengthened (lock staleness requires holder crashed) but retains its existing ID.
 
 Note: BVV-TG-01 is L1 (Section 7.1) but references "planning agent" — an L2 concept. At L1, this reduces to "only human operators create tasks."
 
@@ -289,6 +291,8 @@ Note: BVV-TG-01 is L1 (Section 7.1) but references "planning agent" — an L2 co
 | Conformance level partition | **7 L1→L2 cross-dependencies** — vacuously satisfied but could confuse L1 implementers |
 | Termination proof | **HOLDS** under closed-system assumption |
 | Scenario walkthroughs | **ALL PASS** — 5 scenarios verified |
+| TLC model checking (smoke) | **PASS** — 1,177 distinct states, 9 invariants + 2 action constraints + EventualTermination |
+| TLC model checking (small) | **PENDING** — 1.29M distinct states, safety invariants pass, liveness checking in progress |
 
 ### Work Package Template Traceability (BVV-TG-04)
 
@@ -308,4 +312,7 @@ The template supports traceability. The planning agent's instruction file must d
 1. **BVV-S-09 partial enforcement:** Planner error → concurrent writes. Mitigated by git conflict detection at runtime. Acceptable.
 2. ~~**Human re-open loop:** BVV-L-01 requires closed-system assumption.~~ **ADDRESSED** — closed-system assumption now documented in BVV-L-01 non-normative note.
 3. **Gap tolerance overshoot:** Documented in non-normative note under BVV-ERR-04. Acceptable.
+4. ~~**Stranded open tasks on lifecycle abort:** Undispatched tasks remain in `open` status after abort, violating BVV-L-01.~~ **ADDRESSED** — BVV-ERR-04a added during formal verification. Orchestrator marks remaining open tasks as `blocked` on abort.
+5. ~~**Lock release during active dispatch:** Orchestrator could release lock while sessions still running or tasks still dispatchable.~~ **ADDRESSED** — BVV-ERR-10a added during formal verification. Lock release requires sessions drained and lifecycle done/aborted.
+6. ~~**Spurious lock staleness cycle:** Lock oscillates held→stale→reacquired without dispatch progress.~~ **ADDRESSED** — BVV-L-02 strengthened during formal verification. Staleness requires holder crashed (not actively dispatching).
 4. ~~**L1→L2 specification coupling:** 7 requirements reference L2 concepts.~~ **ADDRESSED** — 7 non-normative Level 1 notes added to the spec.
