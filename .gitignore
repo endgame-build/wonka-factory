@@ -1,0 +1,11 @@
+# Binaries
+bin/
+
+# TLA+ artifacts
+docs/specs/tla/tla2tools.jar
+docs/specs/tla/states/
+docs/specs/tla/*-run.log
+docs/specs/tla/*-safety-run.log
+
+# Local tool config
+.serena/
