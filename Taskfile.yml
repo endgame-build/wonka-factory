@@ -24,9 +24,9 @@ tasks:
       - go test -race -tags "verify integration" -count=1 ./orch/...
 
   lint:
-    desc: Run golangci-lint
+    desc: Run golangci-lint (with verify build tag so BVV spec tests are checked)
     cmds:
-      - golangci-lint run --timeout=5m
+      - golangci-lint run --build-tags=verify --timeout=5m
 
   check:
     desc: Local quality gate — lint + test + build
