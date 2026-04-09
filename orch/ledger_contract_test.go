@@ -159,7 +159,9 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		assert.Equal(t, 1, successes, "exactly one concurrent assign should succeed")
 	})
 
-	t.Run("LDG12_AtomicWrites", func(t *testing.T) {
+	// LDG-12: atomic writes. This test only verifies read-after-write
+	// consistency, not crash-safety (which requires fault injection).
+	t.Run("LDG12_ReadAfterWrite", func(t *testing.T) {
 		store, _ := factory(t)
 		require.NoError(t, store.CreateTask(&orch.Task{ID: "atomic", Status: orch.StatusOpen}))
 		got, err := store.GetTask("atomic")
