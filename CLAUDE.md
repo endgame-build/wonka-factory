@@ -65,7 +65,7 @@ go test -race -tags verify -run TestBVV_DSP01 ./orch/...
 task test-prop         # or: RAPID_CHECKS=10000 go test -race -tags verify -run Prop ./orch/...
 
 # Lint
-task lint              # or: golangci-lint run --timeout=5m
+task lint              # or: golangci-lint run --build-tags=verify --timeout=5m
 ```
 
 The `-tags verify` build tag enables runtime invariant assertions that panic with requirement IDs (e.g., `[BVV-DSP-01]`, `[BVV-S-03]`). CI always runs with this tag.
@@ -82,7 +82,7 @@ Forked from `facet-scan/orch` and simplified per BVV Appendix B:
 
 | File | Purpose | Key requirement IDs |
 |------|---------|-------------------|
-| `types.go` | Task, Worker, Store interface, Preset, role constants | — |
+| `types.go` | Task, Worker, Preset, role constants, LifecycleConfig | — |
 | `ledger_beads.go` | Beads/Dolt Store implementation (default) | LDG-01..19, BVV-DSP-16 |
 | `dispatch.go` | DAG-driven dispatch loop — query ready tasks, assign to idle workers | BVV-DSP-01..02, BVV-DSP-08 |
 | `agent.go` | Role-to-instruction-file routing, exit-code-based outcome | BVV-AI-02, BVV-DSP-03..04 |
