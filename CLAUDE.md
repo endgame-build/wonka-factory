@@ -82,7 +82,7 @@ Forked from `facet-scan/orch` and simplified per BVV Appendix B:
 
 | File | Purpose | Key requirement IDs |
 |------|---------|-------------------|
-| `types.go` | Task, Worker, Preset, role constants, LifecycleConfig | — |
+| `types.go` | Task, Worker, Preset, typed enums (TaskStatus, Criticality, WorkerStatus, Model, LedgerKind), label key constants, LockConfig, LifecycleConfig | — |
 | `ledger_beads.go` | Beads/Dolt Store implementation (default) | LDG-01..19, BVV-DSP-16 |
 | `dispatch.go` | DAG-driven dispatch loop — query ready tasks, assign to idle workers | BVV-DSP-01..02, BVV-DSP-08 |
 | `agent.go` | Role-to-instruction-file routing, exit-code-based outcome | BVV-AI-02, BVV-DSP-03..04 |

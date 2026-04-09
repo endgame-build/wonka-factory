@@ -10,8 +10,8 @@ import "testing"
 //
 // Covers: BVV spec §5.1a (task status enum).
 // Prerequisite for: BVV-S-02 (terminal irreversibility) — a status must be
-// classifiable as terminal for the safety invariant to be checkable at
-// runtime by invariant.go's AssertTerminalIrreversibility (Phase 7).
+// classifiable as terminal before runtime invariant assertions can enforce
+// irreversibility (planned for Phase 7).
 func TestTaskStatus_Terminal(t *testing.T) {
 	cases := []struct {
 		status TaskStatus
@@ -22,7 +22,9 @@ func TestTaskStatus_Terminal(t *testing.T) {
 		{StatusInProgress, false},
 		{StatusCompleted, true},
 		{StatusFailed, true},
-		{StatusBlocked, true}, // NEW in BVV per §5.1a
+		{StatusBlocked, true},          // BVV addition per §5.1a
+		{TaskStatus("garbage"), false}, // unknown statuses must not be terminal
+		{TaskStatus(""), false},        // zero-value must not be terminal
 	}
 	for _, c := range cases {
 		if got := c.status.Terminal(); got != c.want {
@@ -40,9 +42,9 @@ func TestTaskStatus_Terminal(t *testing.T) {
 func TestTask_LabelAccessors(t *testing.T) {
 	t.Run("populated labels", func(t *testing.T) {
 		task := &Task{Labels: map[string]string{
-			"role":        "builder",
-			"branch":      "feat/login",
-			"criticality": string(Critical),
+			LabelRole:        "builder",
+			LabelBranch:      "feat/login",
+			LabelCriticality: string(Critical),
 		}}
 		if got := task.Role(); got != "builder" {
 			t.Errorf("Role() = %q, want %q", got, "builder")
@@ -57,10 +59,17 @@ func TestTask_LabelAccessors(t *testing.T) {
 
 	t.Run("non-critical task", func(t *testing.T) {
 		task := &Task{Labels: map[string]string{
-			"criticality": string(NonCritical),
+			LabelCriticality: string(NonCritical),
 		}}
 		if task.IsCritical() {
 			t.Error("IsCritical() = true, want false for criticality=non_critical")
+		}
+	})
+
+	t.Run("missing criticality key", func(t *testing.T) {
+		task := &Task{Labels: map[string]string{LabelRole: "builder"}}
+		if task.IsCritical() {
+			t.Error("IsCritical() = true, want false when criticality key absent")
 		}
 	})
 

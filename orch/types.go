@@ -20,7 +20,7 @@ const (
 	StatusInProgress TaskStatus = "in_progress"
 	StatusCompleted  TaskStatus = "completed"
 	StatusFailed     TaskStatus = "failed"
-	StatusBlocked    TaskStatus = "blocked" // BVV addition — agent-declared unrecoverable
+	StatusBlocked    TaskStatus = "blocked" // BVV addition — terminal for orchestrator dispatch
 )
 
 // Terminal reports whether the status is a terminal state.
@@ -33,6 +33,11 @@ func (s TaskStatus) Terminal() bool {
 // Criticality represents whether a task's failure is lifecycle-terminal.
 // BVV-ERR-03 (critical failures abort immediately) vs. BVV-ERR-04
 // (non-critical failures accumulate into gap tolerance).
+//
+// Spec adaptation: BVV spec §11.3 uses a "critical:true" label. This
+// implementation uses key "criticality" with value "critical"/"non_critical"
+// to align with the typed Criticality enum and avoid the ambiguous
+// Labels["critical"] == "critical" pattern (see commit 5082f32).
 type Criticality string
 
 const (
@@ -78,6 +83,15 @@ type LockConfig struct {
 	RetryDelay         time.Duration
 }
 
+// Label key constants for domain metadata stored in Task.Labels.
+// BVV-DSN-04: the orchestrator is phase-agnostic — role, branch, and
+// criticality are carried as labels, not typed struct fields.
+const (
+	LabelRole        = "role"
+	LabelBranch      = "branch"
+	LabelCriticality = "criticality"
+)
+
 // --- Runtime types ---
 
 // Task is the BVV unit of work. Role, branch, and criticality live in Labels
@@ -97,16 +111,16 @@ type Task struct {
 
 // Role returns the role tag from labels. Empty if unset.
 // BVV-AI-02: the role label drives instruction file and preset selection.
-func (t *Task) Role() string { return t.Labels["role"] }
+func (t *Task) Role() string { return t.Labels[LabelRole] }
 
 // Branch returns the lifecycle branch from labels. Empty if unset.
 // Used for per-branch lifecycle scoping (BVV-S-01).
-func (t *Task) Branch() string { return t.Labels["branch"] }
+func (t *Task) Branch() string { return t.Labels[LabelBranch] }
 
 // IsCritical reports whether this task is BVV-critical. Non-critical
 // failures accumulate into gap tolerance (BVV-ERR-04); critical failures
 // abort the lifecycle immediately (BVV-ERR-03).
-func (t *Task) IsCritical() bool { return t.Labels["criticality"] == string(Critical) }
+func (t *Task) IsCritical() bool { return t.Labels[LabelCriticality] == string(Critical) }
 
 // Worker represents a process slot that executes agent tasks.
 type Worker struct {
@@ -143,7 +157,7 @@ type Preset struct {
 }
 
 // RoleConfig binds a role tag to an instruction file and launch preset.
-// The orchestrator looks up the role from a task's Labels["role"] and
+// The orchestrator looks up the role from a task's Labels[LabelRole] and
 // routes to the matching RoleConfig. BVV-AI-02, BVV-DSP-03.
 type RoleConfig struct {
 	InstructionFile string  // path to OOMPA.md / LOOMPA.md / CHARLIE.md / etc.
