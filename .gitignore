@@ -9,3 +9,8 @@ docs/specs/tla/*-safety-run.log
 
 # Local tool config
 .serena/
+
+# Go test artifacts
+*.test
+*.out
+coverage.*
