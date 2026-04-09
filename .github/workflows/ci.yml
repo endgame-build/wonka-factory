@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Gate: secret scanning ─────────────────────────────────────────
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.24.3"
+          GITLEAKS_SHA256: "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c"
+        run: |
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+
+      - name: Run gitleaks
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          ARGS="detect --source=. --redact --verbose"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            ARGS="$ARGS --log-opts=${PR_BASE_SHA}..${PR_HEAD_SHA}"
+          fi
+          gitleaks $ARGS
+
+  # ── Gate: conventional commit PR title ────────────────────────────
+  commit-lint:
+    name: Commit Lint
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            refactor
+            docs
+            chore
+            test
+            ci
+            build
+            perf
+
+  # ── Go quality gates (sequential, fail-fast) ─────────────────────
+  go-quality:
+    name: Go Quality
+    needs: [secret-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install tools
+        run: go install golang.org/x/tools/cmd/goimports@latest
+
+      - name: Check goimports
+        run: |
+          set -euo pipefail
+          UNFORMATTED=$(goimports -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "::error::Files not formatted with goimports:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Check go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Run golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+          golangci-lint run --build-tags=verify --timeout=5m
+
+      - name: Run unit tests
+        run: go test -race -tags verify -count=1 -coverprofile=coverage.out ./orch/... ./internal/...
+
+      - name: Build binary
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/wonka ./cmd/wonka
+
+      - name: Run govulncheck
+        continue-on-error: true
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: always()
+        with:
+          name: go-coverage
+          path: coverage.out
+          retention-days: 14
+
+  # ── Property-based tests (parallel with go-quality) ──────────────
+  property-tests:
+    name: Property Tests
+    needs: [secret-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run property tests (10k iterations)
+        run: RAPID_CHECKS=10000 go test -race -tags verify -run Prop ./orch/...
+
+  # ── Integration / fault injection tests ───────────────────────────
+  integration:
+    name: Integration Tests
+    needs: [go-quality]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install tmux
+        # Required when orch/ tmux spec tests graduate from _fork/ (BVV-ERR-11, SUP-05).
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+
+      - name: Run fault injection tests
+        run: go test -race -tags 'verify integration' -count=1 -timeout 10m -v ./orch/...

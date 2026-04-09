@@ -70,6 +70,20 @@ task lint              # or: golangci-lint run --build-tags=verify --timeout=5m
 
 The `-tags verify` build tag enables runtime invariant assertions that panic with requirement IDs (e.g., `[BVV-DSP-01]`, `[BVV-S-03]`). CI always runs with this tag.
 
+## Continuous Integration
+
+GitHub Actions workflows in `.github/workflows/`:
+
+| Workflow | Trigger | Purpose |
+|----------|---------|---------|
+| `ci.yml` | PR, push to main | 5 jobs: secret-scan (gitleaks), commit-lint (semantic PR titles), go-quality (lint + test + build + coverage + govulncheck), property-tests (rapid 10k iterations), integration (tmux fault injection) |
+| `release.yml` | Tag `v*.*.*` or manual dispatch | GoReleaser cross-platform build (linux/darwin × amd64/arm64), draft release |
+| `auto-release.yml` | Successful CI run on main | svu-based semver detection, tag creation, dispatches `release.yml` |
+
+`.goreleaser.yaml` configures the release build. `.github/dependabot.yml` tracks gomod + github-actions updates weekly.
+
+Third-party actions are pinned to 40-char SHAs. External binaries (gitleaks, svu) are installed via checksum-verified tarballs. Conventional commit types allowed: `feat`, `fix`, `refactor`, `docs`, `chore`, `test`, `ci`, `build`, `perf` — `feat`/`fix` drive svu bumps; the rest patch-bump via auto-release logic.
+
 ## Architecture
 
 ### Spec-driven design
