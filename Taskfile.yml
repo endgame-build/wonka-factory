@@ -1,0 +1,36 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Build wonka binary
+    cmds:
+      - CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/wonka ./cmd/wonka
+
+  test:
+    desc: Run unit/spec/property tests with verify tag
+    cmds:
+      - go test -race -tags verify -count=1 ./orch/... ./internal/...
+
+  test-prop:
+    desc: Run property tests with high iteration count (RAPID_CHECKS=10000)
+    env:
+      RAPID_CHECKS: '10000'
+    cmds:
+      - go test -race -tags verify -run Prop ./orch/...
+
+  test-integration:
+    desc: Tier 3 tests (tmux required)
+    cmds:
+      - go test -race -tags "verify integration" -count=1 ./orch/...
+
+  lint:
+    desc: Run golangci-lint
+    cmds:
+      - golangci-lint run --timeout=5m
+
+  check:
+    desc: Local quality gate — lint + test + build
+    cmds:
+      - task: lint
+      - task: test
+      - task: build
