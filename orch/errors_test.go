@@ -5,6 +5,7 @@ package orch
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -55,20 +56,7 @@ func TestErrInvalidLabelFilter_Format(t *testing.T) {
 		t.Error("ErrInvalidLabelFilter.Error() is empty")
 	}
 	// The message should hint at the expected format.
-	if !containsSubstring(msg, "key:value") {
+	if !strings.Contains(msg, "key:value") {
 		t.Errorf("ErrInvalidLabelFilter message %q does not mention expected format", msg)
 	}
-}
-
-func containsSubstring(s, sub string) bool {
-	return len(s) >= len(sub) && searchSubstring(s, sub)
-}
-
-func searchSubstring(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

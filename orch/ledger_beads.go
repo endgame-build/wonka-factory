@@ -231,6 +231,9 @@ func (b *BeadsStore) GetTask(id string) (*Task, error) {
 	return b.toTask(issue, labels), nil
 }
 
+// UpdateTask persists the task's current state. The store does NOT enforce
+// BVV-S-02 (terminal irreversibility) — that invariant is the dispatcher's
+// responsibility (see invariant.go, Phase 4). The store is a dumb writer.
 func (b *BeadsStore) UpdateTask(t *Task) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

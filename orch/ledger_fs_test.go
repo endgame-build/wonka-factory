@@ -10,6 +10,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Compile-time interface shape guards — prevent method-signature drift.
+var (
+	_ orch.Store = (*orch.FSStore)(nil)
+	_ orch.Store = (*orch.BeadsStore)(nil)
+)
+
 func fsFactory(t *testing.T) (orch.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
