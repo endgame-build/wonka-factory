@@ -175,3 +175,28 @@ type LifecycleConfig struct {
 	Lock         LockConfig            // reused from facet-scan
 	Roles        map[string]RoleConfig // role tag → binding
 }
+
+// --- Agent outcome (exit code protocol) ---
+
+// AgentOutcome represents the result of an agent invocation, determined
+// solely by the agent's exit code. The orchestrator never inspects agent
+// output content (ZFC / BVV-DSN-04).
+//
+// This is a semantic rewrite of the fork's AgentOutcome (which derived
+// outcomes from output validation). BVV agents signal their own outcome
+// via exit codes 0–3; see BVVTaskMachine.tla for the formal model.
+type AgentOutcome string
+
+const (
+	// OutcomeSuccess — exit 0: task completed successfully (BVV-DSP-03).
+	OutcomeSuccess AgentOutcome = "success"
+	// OutcomeFailure — exit 1: retryable failure (BVV-ERR-01).
+	OutcomeFailure AgentOutcome = "failure"
+	// OutcomeBlocked — exit 2: terminal, non-retryable (BVV-ERR-04a).
+	OutcomeBlocked AgentOutcome = "blocked"
+	// OutcomeHandoff — exit 3: new session for same task (BVV-DSP-14, BVV-L-04).
+	OutcomeHandoff AgentOutcome = "handoff"
+)
+
+// String returns the outcome label for logging and event serialization.
+func (o AgentOutcome) String() string { return string(o) }

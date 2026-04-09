@@ -86,3 +86,53 @@ func TestTask_LabelAccessors(t *testing.T) {
 		}
 	})
 }
+
+// TestAgentOutcome_String verifies that all four BVV outcomes produce stable,
+// human-readable strings suitable for JSONL event serialization.
+//
+// Covers: BVV-DSP-03 (exit 0), BVV-ERR-01 (exit 1), BVV-ERR-04a (exit 2),
+// BVV-DSP-14 / BVV-L-04 (exit 3).
+func TestAgentOutcome_String(t *testing.T) {
+	cases := []struct {
+		outcome AgentOutcome
+		want    string
+	}{
+		{OutcomeSuccess, "success"},
+		{OutcomeFailure, "failure"},
+		{OutcomeBlocked, "blocked"},
+		{OutcomeHandoff, "handoff"},
+		{AgentOutcome(""), ""},             // zero value
+		{AgentOutcome("custom"), "custom"}, // unknown value passthrough
+	}
+	for _, c := range cases {
+		if got := c.outcome.String(); got != c.want {
+			t.Errorf("%#v.String() = %q, want %q", c.outcome, got, c.want)
+		}
+	}
+}
+
+// TestAgentOutcome_ExitCodeMapping documents the canonical exit-code-to-outcome
+// mapping as a table test. Phase 3's dispatcher will implement the actual mapping;
+// this test pins the enum values that mapping must target.
+//
+// Covers: BVV spec §8.3 exit code protocol.
+// See also: BVVTaskMachine.tla (Assign, SessionComplete actions).
+func TestAgentOutcome_ExitCodeMapping(t *testing.T) {
+	exitCodeToOutcome := map[int]AgentOutcome{
+		0: OutcomeSuccess,
+		1: OutcomeFailure,
+		2: OutcomeBlocked,
+		3: OutcomeHandoff,
+	}
+	// Verify all four exit codes map to distinct outcomes.
+	seen := make(map[AgentOutcome]int)
+	for code, outcome := range exitCodeToOutcome {
+		if prev, dup := seen[outcome]; dup {
+			t.Errorf("exit code %d and %d both map to %q", prev, code, outcome)
+		}
+		seen[outcome] = code
+	}
+	if len(seen) != 4 {
+		t.Errorf("expected 4 distinct outcomes, got %d", len(seen))
+	}
+}

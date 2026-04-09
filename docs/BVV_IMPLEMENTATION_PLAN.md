@@ -107,7 +107,7 @@ Build order follows dependency graph: types → errors → eventlog → store in
   }
   ```
 
-- `AgentOutcome` — extend with `OutcomeBlocked`, `OutcomeHandoff` (4 values total).
+- `AgentOutcome` — **semantic rewrite** (not extension). Fork's `AgentOutcome int` with `OutcomeCompleted/Retry/Gap/Failed` derived outcomes from output validation via `DetermineOutcome()`. BVV replaces this with `AgentOutcome string` mapping 1:1 to agent exit codes: `OutcomeSuccess` (0), `OutcomeFailure` (1), `OutcomeBlocked` (2), `OutcomeHandoff` (3). `DetermineOutcome()` is deleted entirely — agents signal their own outcome via exit codes, not output inspection (ZFC / BVV-DSN-04). Using typed strings instead of iota ensures human-readable JSONL event serialization.
 
 **Design decision — labels as `map[string]string`:** The orchestrator uses labels for all metadata routing (role, branch, critical flag). Beads labels are `"key:value"` strings; the Store implementations parse them into the map on read and serialize back on write. This keeps the Task struct clean and aligns with BVV-DSN-04 (phase-agnostic orchestration).
 
