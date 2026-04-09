@@ -16,7 +16,7 @@ tasks:
     env:
       RAPID_CHECKS: '10000'
     cmds:
-      - go test -race -tags verify -run Prop ./orch/...
+      - go test -race -tags verify -count=1 -run Prop ./orch/...
 
   test-integration:
     desc: Tier 3 tests (tmux required)

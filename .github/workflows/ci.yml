@@ -140,7 +140,7 @@ jobs:
           cache: true
 
       - name: Run property tests (10k iterations)
-        run: RAPID_CHECKS=10000 go test -race -tags verify -run Prop ./orch/...
+        run: RAPID_CHECKS=10000 go test -race -tags verify -count=1 -run Prop ./orch/...
 
   # ── Integration / fault injection tests ───────────────────────────
   integration:
