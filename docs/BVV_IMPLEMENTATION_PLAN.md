@@ -169,14 +169,20 @@ type Store interface {
 - Remove `GetChildren`.
 - Task JSON files now include `Labels` field.
 
-### 2.6 `orch/ledger_beads.go` — ADAPT from facet-scan
+### 2.6 `orch/ledger_beads.go` — REWRITE around beads v0.63.3 API
 
-- Add `StatusBlocked` mapping: `blocked` → beads native `blocked` status.
-- Add `orch:in_progress` label for in_progress status mapping.
-- Rewrite `ReadyTasks(labels ...string)` with beads label filter queries.
-- Implement `ListTasks(labels ...string)` using `GetIssuesByLabel`.
-- Remove `GetChildren`, `orch:parent=` label convention.
-- Remove `orch:type=`, `orch:agent=`, `orch:output=` labels (these were Expand-driven; BVV tasks carry their own labels set by the planner).
+**Note:** Fork's beads integration was rewritten rather than adapted. beads@v0.63.3 API matched the fork more closely than initially estimated (the fork already used `context.Background()` and map-based `UpdateIssue`). Key changes vs fork:
+
+- `StatusBlocked → beads.StatusBlocked` (native, D3 — verified `beads@v0.63.3/beads.go:130`).
+- `orch:in_progress` label deferred (D4) — beads native `StatusInProgress` is sufficient. TODO in code for Phase 3 dispatcher.
+- `orch:assigned` label deleted — `beads.Issue.Assignee` field is the source of truth (`beads@v0.63.3/internal/types/types.go:35`).
+- `orch:failed` label kept — essential distinguisher (`StatusFailed` and `StatusCompleted` both map to `beads.StatusClosed`).
+- `orch:parent=`, `orch:type=`, `orch:agent=`, `orch:output=` labels deleted.
+- User labels stored as flat `"key:value"` beads labels; parsed back via `strings.Cut` on read.
+- `NewBeadsStore(dir, actor)` takes an `actor` string for beads audit trail.
+- `ReadyTasks(labels ...)` and `ListTasks(labels ...)` with label filter + validation.
+- `GetChildren` deleted (parent-child hierarchy removed).
+- `ListWorkers` sorted by name ASC per interface contract.
 
 ### 2.7 `orch/store_factory.go` — FORK unchanged
 
