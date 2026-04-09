@@ -425,7 +425,7 @@ func (b *BeadsStore) CreateWorker(w *Worker) error {
 
 	path := b.workerPath(w.Name)
 	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("create worker %s: worker already exists", w.Name)
+		return fmt.Errorf("worker %q already exists", w.Name)
 	}
 	return atomicWriteJSON(path, w)
 }
