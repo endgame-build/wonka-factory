@@ -106,7 +106,7 @@ func (t *Task) Branch() string { return t.Labels["branch"] }
 // IsCritical reports whether this task is BVV-critical. Non-critical
 // failures accumulate into gap tolerance (BVV-ERR-04); critical failures
 // abort the lifecycle immediately (BVV-ERR-03).
-func (t *Task) IsCritical() bool { return t.Labels["critical"] == "true" }
+func (t *Task) IsCritical() bool { return t.Labels["criticality"] == string(Critical) }
 
 // Worker represents a process slot that executes agent tasks.
 type Worker struct {
