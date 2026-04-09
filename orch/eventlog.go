@@ -62,14 +62,17 @@ type ProgressReporter interface {
 }
 
 // emitAndNotify writes an event to the log and forwards it to the progress reporter.
-// Either log or progress may be nil.
-func emitAndNotify(log *EventLog, progress ProgressReporter, ev Event) {
-	if log != nil {
-		_ = log.Emit(ev)
-	}
+// Either log or progress may be nil. Returns the Emit error (if any) so callers
+// can decide whether to propagate or log — audit trail gaps corrupt GapTracker
+// recovery (BVV-ERR-03..05).
+func emitAndNotify(log *EventLog, progress ProgressReporter, ev Event) error {
 	if progress != nil {
 		progress.OnEvent(ev)
 	}
+	if log != nil {
+		return log.Emit(ev)
+	}
+	return nil
 }
 
 // EventLog provides append-only JSONL event logging.
@@ -112,11 +115,14 @@ func (el *EventLog) Emit(e Event) error {
 	return nil
 }
 
-// Close flushes and closes the underlying file.
+// Close closes the underlying file.
 func (el *EventLog) Close() error {
 	el.mu.Lock()
 	defer el.mu.Unlock()
-	return el.file.Close()
+	if err := el.file.Close(); err != nil {
+		return fmt.Errorf("eventlog: close %s: %w", el.path, err)
+	}
+	return nil
 }
 
 // Path returns the log file path.

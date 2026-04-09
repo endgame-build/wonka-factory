@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// TestErrorSentinels_DistinctAndWrappable verifies that all 12 sentinel errors
+// TestErrorSentinels_DistinctAndWrappable verifies that all sentinel errors
 // are distinct values and survive wrapping via errors.Is.
 //
 // Covers: LDG-02 (ledger as single source of truth — errors must be matchable).
@@ -17,6 +17,7 @@ func TestErrorSentinels_DistinctAndWrappable(t *testing.T) {
 	sentinels := []error{
 		ErrNotFound,
 		ErrTaskExists,
+		ErrWorkerExists,
 		ErrCycle,
 		ErrAlreadyAssigned,
 		ErrTaskNotReady,
@@ -27,6 +28,7 @@ func TestErrorSentinels_DistinctAndWrappable(t *testing.T) {
 		ErrResumeNoLedger,
 		ErrHandoffLimitReached,
 		ErrInvalidLabelFilter,
+		ErrInvalidID,
 	}
 
 	// Verify distinctness: no two sentinels should match via errors.Is.
@@ -49,7 +51,7 @@ func TestErrorSentinels_DistinctAndWrappable(t *testing.T) {
 
 // TestErrInvalidLabelFilter_Format verifies the error message is descriptive.
 //
-// Covers: D9 (malformed label filter returns error, not silent match).
+// Covers: malformed label filter returns error, not silent match.
 func TestErrInvalidLabelFilter_Format(t *testing.T) {
 	msg := ErrInvalidLabelFilter.Error()
 	if msg == "" {

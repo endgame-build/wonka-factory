@@ -130,21 +130,33 @@ func TestProgressReporter_NilSafe(t *testing.T) {
 
 	ev := Event{Kind: EventTaskCompleted, Summary: "test"}
 
-	// nil log, nil progress
-	emitAndNotify(nil, nil, ev)
+	// nil log, nil progress — no error
+	err := emitAndNotify(nil, nil, ev)
+	if err != nil {
+		t.Errorf("nil/nil: unexpected error: %v", err)
+	}
 
-	// non-nil log, nil progress
-	emitAndNotify(el, nil, ev)
+	// non-nil log, nil progress — no error
+	err = emitAndNotify(el, nil, ev)
+	if err != nil {
+		t.Errorf("log/nil: unexpected error: %v", err)
+	}
 
-	// nil log, non-nil progress
+	// nil log, non-nil progress — no error, progress called
 	pr := &countReporter{}
-	emitAndNotify(nil, pr, ev)
+	err = emitAndNotify(nil, pr, ev)
+	if err != nil {
+		t.Errorf("nil/progress: unexpected error: %v", err)
+	}
 	if pr.count != 1 {
 		t.Errorf("progress count = %d, want 1", pr.count)
 	}
 
-	// both non-nil
-	emitAndNotify(el, pr, ev)
+	// both non-nil — no error, progress called
+	err = emitAndNotify(el, pr, ev)
+	if err != nil {
+		t.Errorf("both: unexpected error: %v", err)
+	}
 	if pr.count != 2 {
 		t.Errorf("progress count = %d, want 2", pr.count)
 	}

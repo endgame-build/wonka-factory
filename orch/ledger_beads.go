@@ -54,7 +54,7 @@ func NewBeadsStore(dir, actor string) (*BeadsStore, error) {
 		return nil, fmt.Errorf("create worker dir: %w", err)
 	}
 	if actor == "" {
-		actor = "orch"
+		actor = defaultActor
 	}
 
 	dbPath := filepath.Join(dir, "dolt")
@@ -83,6 +83,8 @@ func (b *BeadsStore) Close() error {
 // Status-distinguishing labels (orch-internal):
 //   - orch:failed — present when orch status is StatusFailed
 //     (both Completed and Failed map to beads StatusClosed)
+//   - StatusAssigned: derived from beads StatusOpen + non-empty Assignee field
+//     (see toTask). No label needed — beads.Issue.Assignee is the source of truth.
 //
 // Removed from fork: orch:parent, orch:type, orch:agent, orch:output,
 // orch:assigned (Assignee field is now authoritative).
@@ -163,9 +165,9 @@ func orchStatusToBeads(s TaskStatus) beads.Status {
 	case StatusFailed:
 		return beads.StatusClosed // distinguished by labelFailed
 	case StatusBlocked:
-		return beads.StatusBlocked // native in beads@v0.63.3 (D3)
+		return beads.StatusBlocked // native in beads@v0.63.3
 	default:
-		return beads.StatusOpen
+		panic(fmt.Sprintf("orchStatusToBeads: unmapped TaskStatus %q", s))
 	}
 }
 
@@ -191,13 +193,16 @@ func beadsStatusToOrch(s beads.Status, beadsLabels []string) TaskStatus {
 	case beads.StatusBlocked:
 		return StatusBlocked
 	default:
-		return StatusOpen
+		panic(fmt.Sprintf("beadsStatusToOrch: unmapped beads.Status %q", s))
 	}
 }
 
 // --- Store interface: Task operations ---
 
 func (b *BeadsStore) CreateTask(t *Task) error {
+	if err := validateID(t.ID); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -315,7 +320,7 @@ func (b *BeadsStore) ListTasks(labels ...string) ([]*Task, error) {
 			tasks = append(tasks, t)
 		}
 	}
-	sort.Slice(tasks, func(i, j int) bool { return taskLess(tasks[i], tasks[j]) })
+	sortTasks(tasks)
 	return tasks, nil
 }
 
@@ -323,8 +328,9 @@ func (b *BeadsStore) ListTasks(labels ...string) ([]*Task, error) {
 // empty, and all label filters match. Sorted by taskLess (LDG-07).
 //
 // BVV-DSP-01: ready = open ∧ deps-terminal ∧ unassigned ∧ labels-match.
-// TODO(D4): verify whether orch:in_progress label is needed for dispatch
-// filtering when Phase 3 dispatcher lands.
+// TODO: verify whether beads native StatusInProgress is sufficient for
+// dispatch filtering in Phase 3, or if the spec's orch:in_progress label
+// is also needed (current implementation uses beads.StatusInProgress directly).
 func (b *BeadsStore) ReadyTasks(labels ...string) ([]*Task, error) {
 	if err := validateLabelFilters(labels); err != nil {
 		return nil, err
@@ -356,14 +362,17 @@ func (b *BeadsStore) ReadyTasks(labels ...string) ([]*Task, error) {
 		tasks = append(tasks, t)
 	}
 
-	sort.Slice(tasks, func(i, j int) bool { return taskLess(tasks[i], tasks[j]) })
+	sortTasks(tasks)
 	return tasks, nil
 }
 
-// Assign atomically sets task.Status=assigned, task.Assignee=workerName,
-// and worker.CurrentTaskID=taskID.
+// Assign sets task.Assignee=workerName and worker.CurrentTaskID=taskID.
+// StatusAssigned is derived on read-back from StatusOpen+Assignee (see toTask);
+// the beads issue status is not explicitly changed.
 // BVV-S-03: at most one worker per task (see BVVTaskMachine.tla Assign action).
-// LDG-08: atomic task+worker update.
+// LDG-08: task+worker update serialized by mu (single-process). Task assignee
+// is set via beads transaction; worker JSON is updated separately with rollback
+// on failure. Not cross-store atomic.
 func (b *BeadsStore) Assign(taskID, workerName string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -427,12 +436,17 @@ func (b *BeadsStore) Assign(taskID, workerName string) error {
 // --- Store interface: Worker operations (filesystem JSON) ---
 
 func (b *BeadsStore) CreateWorker(w *Worker) error {
+	if err := validateID(w.Name); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	path := b.workerPath(w.Name)
 	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("worker %q already exists", w.Name)
+		return fmt.Errorf("worker %q: %w", w.Name, ErrWorkerExists)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("worker %q stat: %w", w.Name, err)
 	}
 	return atomicWriteJSON(path, w)
 }
@@ -457,9 +471,6 @@ func (b *BeadsStore) getWorker(name string) (*Worker, error) {
 func (b *BeadsStore) ListWorkers() ([]*Worker, error) {
 	entries, err := os.ReadDir(b.workerDir)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
 		return nil, fmt.Errorf("list workers: %w", err)
 	}
 	var workers []*Worker
@@ -482,8 +493,11 @@ func (b *BeadsStore) UpdateWorker(w *Worker) error {
 	defer b.mu.Unlock()
 
 	path := b.workerPath(w.Name)
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("update worker %s: %w", w.Name, ErrNotFound)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("update worker %s: %w", w.Name, ErrNotFound)
+		}
+		return fmt.Errorf("update worker %q stat: %w", w.Name, err)
 	}
 	return atomicWriteJSON(path, w)
 }

@@ -167,8 +167,8 @@ Four test categories in `orch/`:
 
 ## Key Design Decisions
 
-- **Store factory** (`NewStore(kind, dir)`): Defaults to `"beads"`, falls back to `"fs"` when Beads/Dolt unavailable. CLI flag `--ledger` overrides.
-- **Beads status mapping**: `assigned` → beads `open` + `orch:assigned` label. `blocked` → beads `blocked` (new BVV status). Orch fields stored as `orch:` prefixed labels.
+- **Store factory** (`NewStore(kind, dir) → (Store, LedgerKind, error)`): Defaults to `"beads"`, falls back to `"fs"` when Beads/Dolt unavailable. Returns the actual backend kind so callers can detect fallback. CLI flag `--ledger` overrides.
+- **Beads status mapping**: `assigned` → beads `open` + non-empty `Assignee` field (derived on read-back). `blocked` → beads `blocked` (native). `failed` → beads `closed` + `orch:failed` label. Orch fields stored as `orch:` prefixed labels.
 - **Atomic writes**: All JSON writes via tmp+rename pattern.
 - **Cycle detection**: `AddDep` runs DFS reachability check before adding any edge.
 - **Per-branch lifecycle lock**: `O_CREATE|O_EXCL` semantics, staleness-based recovery, lock path scoped by branch name.
