@@ -37,7 +37,7 @@ func (s TaskStatus) Terminal() bool {
 // Spec adaptation: BVV spec §11.3 uses a "critical:true" label. This
 // implementation uses key "criticality" with value "critical"/"non_critical"
 // to align with the typed Criticality enum and avoid the ambiguous
-// Labels["critical"] == "critical" pattern (see commit 5082f32).
+// Labels["critical"] == "critical" pattern.
 type Criticality string
 
 const (
@@ -192,7 +192,7 @@ const (
 	OutcomeSuccess AgentOutcome = "success"
 	// OutcomeFailure — exit 1: retryable failure (BVV-ERR-01).
 	OutcomeFailure AgentOutcome = "failure"
-	// OutcomeBlocked — exit 2: terminal, non-retryable (BVV-ERR-04a).
+	// OutcomeBlocked — exit 2: terminal, non-retryable (BVV spec §5.1a).
 	OutcomeBlocked AgentOutcome = "blocked"
 	// OutcomeHandoff — exit 3: new session for same task (BVV-DSP-14, BVV-L-04).
 	OutcomeHandoff AgentOutcome = "handoff"

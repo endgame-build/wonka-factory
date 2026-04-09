@@ -37,7 +37,10 @@ func NewFSStore(dir string) (*FSStore, error) {
 	}
 	// Initialise empty deps.json if it doesn't exist.
 	depsPath := filepath.Join(dir, "deps.json")
-	if _, err := os.Stat(depsPath); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(depsPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("stat deps.json: %w", err)
+		}
 		if err := atomicWriteJSON(depsPath, map[string][]string{}); err != nil {
 			return nil, fmt.Errorf("init deps.json: %w", err)
 		}
@@ -54,6 +57,9 @@ func (s *FSStore) Close() error { return nil }
 // --- Task operations ---
 
 func (s *FSStore) CreateTask(t *Task) error {
+	if err := validateID(t.ID); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.lock.Lock(); err != nil {
@@ -64,6 +70,8 @@ func (s *FSStore) CreateTask(t *Task) error {
 	path := s.taskPath(t.ID)
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("task %q: %w", t.ID, ErrTaskExists)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("task %q stat: %w", t.ID, err)
 	}
 	now := time.Now()
 	t.CreatedAt = now
@@ -94,8 +102,11 @@ func (s *FSStore) UpdateTask(t *Task) error {
 	defer s.lock.Unlock() //nolint:errcheck // flock.Unlock error is always nil
 
 	path := s.taskPath(t.ID)
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("task %q: %w", t.ID, ErrNotFound)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("task %q: %w", t.ID, ErrNotFound)
+		}
+		return fmt.Errorf("update task %q stat: %w", t.ID, err)
 	}
 	t.UpdatedAt = time.Now()
 	return atomicWriteJSON(path, t)
@@ -119,7 +130,7 @@ func (s *FSStore) ListTasks(labels ...string) ([]*Task, error) {
 			result = append(result, t)
 		}
 	}
-	sort.Slice(result, func(i, j int) bool { return taskLess(result[i], result[j]) })
+	sortTasks(result)
 	return result, nil
 }
 
@@ -168,7 +179,7 @@ func (s *FSStore) ReadyTasks(labels ...string) ([]*Task, error) {
 		}
 	}
 
-	sort.Slice(ready, func(i, j int) bool { return taskLess(ready[i], ready[j]) })
+	sortTasks(ready)
 	return ready, nil
 }
 
@@ -226,8 +237,10 @@ func (s *FSStore) Assign(taskID, workerName string) error {
 	worker.CurrentTaskID = taskID
 	if err := atomicWriteJSON(s.workerPath(workerName), &worker); err != nil {
 		// Rollback the task write to maintain consistency.
-		_ = atomicWriteJSON(s.taskPath(taskID), &origTask) //nolint:errcheck // best-effort rollback
-		return err
+		if rbErr := atomicWriteJSON(s.taskPath(taskID), &origTask); rbErr != nil {
+			return fmt.Errorf("assign update worker: %w (rollback failed: %v)", err, rbErr)
+		}
+		return fmt.Errorf("assign update worker (rolled back task): %w", err)
 	}
 	return nil
 }
@@ -235,6 +248,9 @@ func (s *FSStore) Assign(taskID, workerName string) error {
 // --- Worker operations ---
 
 func (s *FSStore) CreateWorker(w *Worker) error {
+	if err := validateID(w.Name); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.lock.Lock(); err != nil {
@@ -244,7 +260,9 @@ func (s *FSStore) CreateWorker(w *Worker) error {
 
 	path := s.workerPath(w.Name)
 	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("worker %q already exists", w.Name)
+		return fmt.Errorf("worker %q: %w", w.Name, ErrWorkerExists)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("worker %q stat: %w", w.Name, err)
 	}
 	return atomicWriteJSON(path, w)
 }
@@ -290,8 +308,11 @@ func (s *FSStore) UpdateWorker(w *Worker) error {
 	defer s.lock.Unlock() //nolint:errcheck // flock.Unlock error is always nil
 
 	path := s.workerPath(w.Name)
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("worker %q: %w", w.Name, ErrNotFound)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("worker %q: %w", w.Name, ErrNotFound)
+		}
+		return fmt.Errorf("update worker %q stat: %w", w.Name, err)
 	}
 	return atomicWriteJSON(path, w)
 }
@@ -409,10 +430,30 @@ func atomicWriteJSON(path string, v any) error {
 	}
 	data = append(data, '\n')
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create tmp: %w", err)
+	}
+	tmp := f.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			f.Close()
+			os.Remove(tmp)
+		}
+	}()
+
+	if _, err := f.Write(data); err != nil {
 		return fmt.Errorf("write tmp: %w", err)
 	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync tmp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close tmp: %w", err)
+	}
+	committed = true
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("rename: %w", err)
@@ -426,5 +467,8 @@ func readJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, v)
+	if err := json.Unmarshal(data, v); err != nil {
+		return fmt.Errorf("unmarshal %s: %w", path, err)
+	}
+	return nil
 }

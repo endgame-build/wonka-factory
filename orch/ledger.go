@@ -2,8 +2,23 @@ package orch
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
+
+// defaultActor is the beads audit trail actor used by the store factory
+// and as a fallback when NewBeadsStore receives an empty actor string.
+const defaultActor = "orch"
+
+// validateID rejects identifiers that could escape filesystem directories via
+// path traversal. Task IDs come from the planning agent (Charlie) and worker
+// names from CLI configuration — both are external inputs.
+func validateID(id string) error {
+	if id == "" || strings.ContainsAny(id, "/\\") || id == "." || strings.Contains(id, "..") {
+		return fmt.Errorf("id %q: %w", id, ErrInvalidID)
+	}
+	return nil
+}
 
 // Store is the assignment ledger interface consumed by the dispatcher, engine,
 // and recovery subsystems. Implementations must be safe for concurrent use
@@ -42,12 +57,16 @@ type Store interface {
 
 // taskLess is the canonical sort order: priority ascending (lower number =
 // dispatched first), then lexicographic ID. Deterministic per LDG-07.
-// Ported verbatim from _fork/ledger_fs.go:314-320.
 func taskLess(a, b *Task) bool {
 	if a.Priority != b.Priority {
 		return a.Priority < b.Priority
 	}
 	return a.ID < b.ID
+}
+
+// sortTasks sorts a task slice in-place by the canonical LDG-07 ordering.
+func sortTasks(tasks []*Task) {
+	sort.Slice(tasks, func(i, j int) bool { return taskLess(tasks[i], tasks[j]) })
 }
 
 // validateLabelFilters checks that all filter strings are in "key:value" format.

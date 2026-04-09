@@ -38,7 +38,7 @@ func TestTaskStatus_Terminal(t *testing.T) {
 //
 // Covers: BVV-AI-02 (role routing), BVV-S-01 (branch scoping),
 // BVV-ERR-03/04 (criticality classification).
-// Regression: IsCritical() must use string(Critical), not "true" (fix 5082f32).
+// Regression: IsCritical() must use string(Critical), not "true".
 func TestTask_LabelAccessors(t *testing.T) {
 	t.Run("populated labels", func(t *testing.T) {
 		task := &Task{Labels: map[string]string{

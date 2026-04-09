@@ -7,11 +7,12 @@ import "errors"
 var (
 	ErrNotFound        = errors.New("not found")
 	ErrTaskExists      = errors.New("task already exists")
+	ErrWorkerExists    = errors.New("worker already exists")
 	ErrCycle           = errors.New("dependency cycle detected")
 	ErrAlreadyAssigned = errors.New("task already assigned")
 	ErrTaskNotReady    = errors.New("task not ready for assignment")
 	ErrWorkerBusy      = errors.New("worker is not idle")
-	ErrPoolExhausted   = errors.New("worker pool exhausted")
+	ErrPoolExhausted   = errors.New("worker pool exhausted") // Phase 3: dispatcher pool exhaustion
 )
 
 // Sentinel errors for lifecycle control flow.
@@ -19,10 +20,11 @@ var (
 	ErrLifecycleAborted    = errors.New("lifecycle aborted: gap tolerance reached") // BVV-ERR-04
 	ErrLockContention      = errors.New("lifecycle lock held by another process")   // BVV-S-01, BVV-ERR-06
 	ErrResumeNoLedger      = errors.New("no ledger found for resume")              // BVV-ERR-07
-	ErrHandoffLimitReached = errors.New("handoff limit reached for task")          // BVV-L-04, BVV-DSP-14
+	ErrHandoffLimitReached = errors.New("handoff limit reached for task")          // BVV-L-04
 )
 
 // Sentinel errors for input validation.
 var (
-	ErrInvalidLabelFilter = errors.New("invalid label filter: expected key:value format") // D9
+	ErrInvalidLabelFilter = errors.New("invalid label filter: expected key:value format")
+	ErrInvalidID          = errors.New("invalid identifier: must not contain path separators or '..'")
 )

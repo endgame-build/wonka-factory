@@ -246,6 +246,155 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		assert.True(t, ids["waiter"], "waiter should be ready — dep is terminal")
 	})
 
+	// --- Status round-trip tests (prevents beads mapping regressions) ---
+
+	// StatusFailed round-trip: create→update to failed→read back, verify not
+	// confused with StatusCompleted (both map to beads.StatusClosed, distinguished
+	// by orch:failed label).
+	t.Run("StatusFailed_RoundTrip", func(t *testing.T) {
+		store, _ := factory(t)
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "fail-rt", Status: orch.StatusOpen}))
+		task, err := store.GetTask("fail-rt")
+		require.NoError(t, err)
+		task.Status = orch.StatusFailed
+		require.NoError(t, store.UpdateTask(task))
+
+		got, err := store.GetTask("fail-rt")
+		require.NoError(t, err)
+		assert.Equal(t, orch.StatusFailed, got.Status, "StatusFailed must survive round-trip")
+	})
+
+	// StatusCompleted round-trip: ensure not confused with StatusFailed.
+	t.Run("StatusCompleted_RoundTrip", func(t *testing.T) {
+		store, _ := factory(t)
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "done-rt", Status: orch.StatusOpen}))
+		task, err := store.GetTask("done-rt")
+		require.NoError(t, err)
+		task.Status = orch.StatusCompleted
+		require.NoError(t, store.UpdateTask(task))
+
+		got, err := store.GetTask("done-rt")
+		require.NoError(t, err)
+		assert.Equal(t, orch.StatusCompleted, got.Status, "StatusCompleted must survive round-trip")
+	})
+
+	// StatusAssigned round-trip (regression: commit 574f7cb).
+	t.Run("StatusAssigned_RoundTrip", func(t *testing.T) {
+		store, _ := factory(t)
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "asgn-rt", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w-rt", Status: orch.WorkerIdle}))
+		require.NoError(t, store.Assign("asgn-rt", "w-rt"))
+
+		got, err := store.GetTask("asgn-rt")
+		require.NoError(t, err)
+		assert.Equal(t, orch.StatusAssigned, got.Status, "StatusAssigned must survive round-trip")
+		assert.Equal(t, "w-rt", got.Assignee)
+	})
+
+	// StatusBlocked round-trip.
+	t.Run("StatusBlocked_RoundTrip", func(t *testing.T) {
+		store, _ := factory(t)
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "blk-rt", Status: orch.StatusOpen}))
+		task, err := store.GetTask("blk-rt")
+		require.NoError(t, err)
+		task.Status = orch.StatusBlocked
+		require.NoError(t, store.UpdateTask(task))
+
+		got, err := store.GetTask("blk-rt")
+		require.NoError(t, err)
+		assert.Equal(t, orch.StatusBlocked, got.Status, "StatusBlocked must survive round-trip")
+	})
+
+	// --- Not-found error path tests ---
+
+	t.Run("UpdateTask_NotFound", func(t *testing.T) {
+		store, _ := factory(t)
+		err := store.UpdateTask(&orch.Task{ID: "ghost", Status: orch.StatusOpen})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, orch.ErrNotFound)
+	})
+
+	t.Run("GetWorker_NotFound", func(t *testing.T) {
+		store, _ := factory(t)
+		_, err := store.GetWorker("ghost")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, orch.ErrNotFound)
+	})
+
+	t.Run("UpdateWorker_NotFound", func(t *testing.T) {
+		store, _ := factory(t)
+		err := store.UpdateWorker(&orch.Worker{Name: "ghost", Status: orch.WorkerIdle})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, orch.ErrNotFound)
+	})
+
+	t.Run("Assign_TaskNotFound", func(t *testing.T) {
+		store, _ := factory(t)
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w1", Status: orch.WorkerIdle}))
+		err := store.Assign("ghost-task", "w1")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, orch.ErrNotFound)
+	})
+
+	t.Run("Assign_WorkerNotFound", func(t *testing.T) {
+		store, _ := factory(t)
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "t1", Status: orch.StatusOpen}))
+		err := store.Assign("t1", "ghost-worker")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, orch.ErrNotFound)
+	})
+
+	// --- Worker contract tests ---
+
+	t.Run("CreateWorker_DuplicateReturnsErrWorkerExists", func(t *testing.T) {
+		store, _ := factory(t)
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "dup", Status: orch.WorkerIdle}))
+		err := store.CreateWorker(&orch.Worker{Name: "dup", Status: orch.WorkerIdle})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, orch.ErrWorkerExists)
+	})
+
+	t.Run("ListWorkers_SortedByName", func(t *testing.T) {
+		store, _ := factory(t)
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "zulu", Status: orch.WorkerIdle}))
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "alpha", Status: orch.WorkerIdle}))
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "mid", Status: orch.WorkerIdle}))
+
+		workers, err := store.ListWorkers()
+		require.NoError(t, err)
+		require.Len(t, workers, 3)
+		assert.Equal(t, "alpha", workers[0].Name)
+		assert.Equal(t, "mid", workers[1].Name)
+		assert.Equal(t, "zulu", workers[2].Name)
+	})
+
+	t.Run("ListWorkers_Empty", func(t *testing.T) {
+		store, _ := factory(t)
+		workers, err := store.ListWorkers()
+		require.NoError(t, err)
+		assert.Empty(t, workers)
+	})
+
+	// UpdateTask with label mutation: old labels fully replaced.
+	t.Run("UpdateTask_LabelMutation", func(t *testing.T) {
+		store, _ := factory(t)
+		require.NoError(t, store.CreateTask(&orch.Task{
+			ID:     "lbl-mut",
+			Status: orch.StatusOpen,
+			Labels: map[string]string{"role": "builder", "branch": "feat/x"},
+		}))
+
+		task, err := store.GetTask("lbl-mut")
+		require.NoError(t, err)
+		task.Labels = map[string]string{"role": "verifier", "branch": "main"}
+		require.NoError(t, store.UpdateTask(task))
+
+		got, err := store.GetTask("lbl-mut")
+		require.NoError(t, err)
+		assert.Equal(t, "verifier", got.Labels["role"], "role label should be updated")
+		assert.Equal(t, "main", got.Labels["branch"], "branch label should be updated")
+	})
+
 	// --- BVV-specific additions ---
 
 	// Label filter: ReadyTasks with branch label filter.
