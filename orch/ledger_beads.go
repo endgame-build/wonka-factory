@@ -131,6 +131,13 @@ func (b *BeadsStore) toTask(issue *beads.Issue, beadsLabels []string) *Task {
 		CreatedAt: issue.CreatedAt,
 		UpdatedAt: issue.UpdatedAt,
 	}
+	// StatusAssigned maps to beads.StatusOpen (both are "open" in beads).
+	// Distinguish by checking the Assignee field — this replaces the fork's
+	// orch:assigned label approach. The Assignee field is the source of truth
+	// since beads.Issue.Assignee exists natively in v0.63.3.
+	if t.Status == StatusOpen && t.Assignee != "" {
+		t.Status = StatusAssigned
+	}
 	// Parse user labels (key:value format), skip orch-internal labels.
 	for _, l := range beadsLabels {
 		if strings.HasPrefix(l, labelPrefix) {
