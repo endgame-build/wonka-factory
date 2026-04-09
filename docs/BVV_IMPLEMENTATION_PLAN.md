@@ -111,15 +111,17 @@ Build order follows dependency graph: types → errors → eventlog → store in
 
 **Design decision — labels as `map[string]string`:** The orchestrator uses labels for all metadata routing (role, branch, critical flag). Beads labels are `"key:value"` strings; the Store implementations parse them into the map on read and serialize back on write. This keeps the Task struct clean and aligns with BVV-DSN-04 (phase-agnostic orchestration).
 
-### 2.2 `orch/errors.go` — ADAPT from facet-scan
+### 2.2 `orch/errors.go` — CONSOLIDATE from 3 fork files
+
+**Note:** The fork scattered sentinels across `_fork/ledger.go` (16 errors), `_fork/lock.go` (`ErrLockContention`), and `_fork/errors.go` (only `SubprocessError` type). The port consolidates all sentinels into a single `errors.go` — 12 total (9 kept + 1 renamed + 2 added).
 
 **Keep:** `ErrNotFound`, `ErrTaskExists`, `ErrCycle`, `ErrAlreadyAssigned`, `ErrTaskNotReady`, `ErrWorkerBusy`, `ErrPoolExhausted`, `ErrLockContention`, `ErrResumeNoLedger`.
 
-**Remove:** `ErrOutputMissing`, `ErrOutputInvalid` (no output validation), `ErrGateHalt` (gates are regular tasks), `SubprocessError` type.
+**Remove:** `ErrInputMissing`, `ErrOutputMissing`, `ErrOutputInvalid` (no output validation), `ErrEnvKeyInvalid`, `ErrGateHalt` (gates are regular tasks), `ErrRetriesExhausted`, `ErrLedgerUnavailable` (deferred to Phase 3), `SubprocessError` type.
 
 **Rename:** `ErrPipelineAborted` → `ErrLifecycleAborted`.
 
-**Add:** `ErrHandoffLimitReached`.
+**Add:** `ErrHandoffLimitReached` (BVV-L-04), `ErrInvalidLabelFilter` (malformed label filter).
 
 ### 2.3 `orch/eventlog.go` — ADAPT from facet-scan
 
