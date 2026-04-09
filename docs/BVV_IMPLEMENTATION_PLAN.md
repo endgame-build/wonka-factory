@@ -26,7 +26,7 @@ Dependencies to declare:
 - `github.com/steveyegge/beads` — Beads/Dolt store backend
 - `github.com/gofrs/flock` — FSStore file locking
 - `github.com/google/uuid` — run ID generation
-- `gopkg.in/yaml.v3` — YAML frontmatter parsing
+- `gopkg.in/yaml.v3` — YAML frontmatter parsing (**Phase 3 dep**, not Phase 2 — no Phase 2 code imports YAML)
 - `github.com/stretchr/testify` — test assertions
 - `pgregory.net/rapid` — property-based testing
 - `github.com/spf13/cobra` — CLI framework

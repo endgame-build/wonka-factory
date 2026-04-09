@@ -82,6 +82,9 @@ func (s *FSStore) GetTask(id string) (*Task, error) {
 	return &t, nil
 }
 
+// UpdateTask persists the task's current state. The store does NOT enforce
+// BVV-S-02 (terminal irreversibility) — that invariant is the dispatcher's
+// responsibility (see invariant.go, Phase 4). The store is a dumb writer.
 func (s *FSStore) UpdateTask(t *Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
