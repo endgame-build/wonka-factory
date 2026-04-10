@@ -375,6 +375,77 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		assert.Empty(t, workers)
 	})
 
+	// validateID path-traversal rejection: every Store method that accepts
+	// an external task ID or worker name must reject traversal attempts
+	// with ErrInvalidID rather than leaking ENOENT or writing outside the
+	// ledger directory. Contract-level so both FSStore and BeadsStore stay
+	// consistent (BeadsStore still resolves workers on the filesystem).
+	t.Run("ValidateID_RejectsPathTraversal", func(t *testing.T) {
+		store, _ := factory(t)
+		const bad = "../escape"
+
+		err := store.CreateTask(&orch.Task{ID: bad, Status: orch.StatusOpen})
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "CreateTask should reject traversal")
+
+		_, err = store.GetTask(bad)
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "GetTask should reject traversal")
+
+		err = store.UpdateTask(&orch.Task{ID: bad, Status: orch.StatusOpen})
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "UpdateTask should reject traversal")
+
+		err = store.CreateWorker(&orch.Worker{Name: bad, Status: orch.WorkerIdle})
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "CreateWorker should reject traversal")
+
+		_, err = store.GetWorker(bad)
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "GetWorker should reject traversal")
+
+		err = store.UpdateWorker(&orch.Worker{Name: bad, Status: orch.WorkerIdle})
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "UpdateWorker should reject traversal")
+
+		err = store.Assign(bad, "whatever")
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "Assign should reject traversal taskID")
+
+		err = store.Assign("whatever", bad)
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "Assign should reject traversal workerName")
+
+		err = store.AddDep(bad, "whatever")
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "AddDep should reject traversal taskID")
+
+		err = store.AddDep("whatever", bad)
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "AddDep should reject traversal dependsOn")
+
+		_, err = store.GetDeps(bad)
+		assert.ErrorIs(t, err, orch.ErrInvalidID, "GetDeps should reject traversal")
+	})
+
+	// Title/Body round-trip: both fields must survive create + update cycles
+	// across every backend. Regression guard for beads silently dropping
+	// Title/Body from the UpdateIssue path (the fork mapped Body to nothing
+	// at all, and UpdateTask only pushed status/priority/assignee).
+	t.Run("TitleBody_RoundTrip", func(t *testing.T) {
+		store, _ := factory(t)
+		require.NoError(t, store.CreateTask(&orch.Task{
+			ID:     "tb-rt",
+			Title:  "initial title",
+			Body:   "initial body text\nwith multiple lines",
+			Status: orch.StatusOpen,
+		}))
+
+		got, err := store.GetTask("tb-rt")
+		require.NoError(t, err)
+		assert.Equal(t, "initial title", got.Title, "Title must survive CreateTask")
+		assert.Equal(t, "initial body text\nwith multiple lines", got.Body, "Body must survive CreateTask")
+
+		got.Title = "updated title"
+		got.Body = "updated body"
+		require.NoError(t, store.UpdateTask(got))
+
+		got2, err := store.GetTask("tb-rt")
+		require.NoError(t, err)
+		assert.Equal(t, "updated title", got2.Title, "Title must survive UpdateTask")
+		assert.Equal(t, "updated body", got2.Body, "Body must survive UpdateTask")
+	})
+
 	// UpdateTask with label mutation: old labels fully replaced.
 	t.Run("UpdateTask_LabelMutation", func(t *testing.T) {
 		store, _ := factory(t)
@@ -442,49 +513,101 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		assert.True(t, errors.Is(err, orch.ErrInvalidLabelFilter))
 	})
 
-	// BVV-S-03 torture: 100 goroutines racing to assign 50 tasks to 50 workers.
-	// Exactly 50 assignments must succeed; no double-assignment.
+	// BVV-S-03 torture: generate high cross-worker and cross-task contention
+	// by spawning every (task, worker) pair as a racing goroutine. With
+	// numTasks=numWorkers=20 that is 400 goroutines contending over shared
+	// state. A correct Store must guarantee both halves of BVV-S-03:
+	//
+	//   1. No task ends up with two different assignees.
+	//   2. No worker ends up holding two different tasks simultaneously.
+	//
+	// Asserting only the total success count (as the previous version did)
+	// is insufficient — a broken Store could assign two workers to the same
+	// task and still report the "right" count. This test verifies the
+	// invariant directly by inspecting ledger state after the race.
 	t.Run("LDG_S03_NoDoubleAssignment", func(t *testing.T) {
 		store, _ := factory(t)
-		const numTasks = 50
-		const numWorkers = 50
-		const goroutines = 100
+		const numTasks = 20
+		const numWorkers = 20
+
+		taskID := func(i int) string { return fmt.Sprintf("t%d", i) }
+		workerName := func(i int) string { return fmt.Sprintf("w%d", i) }
 
 		for i := 0; i < numTasks; i++ {
 			require.NoError(t, store.CreateTask(&orch.Task{
-				ID:     fmt.Sprintf("t%d", i),
+				ID:     taskID(i),
 				Status: orch.StatusOpen,
 			}))
 		}
 		for i := 0; i < numWorkers; i++ {
 			require.NoError(t, store.CreateWorker(&orch.Worker{
-				Name:   fmt.Sprintf("w%d", i),
+				Name:   workerName(i),
 				Status: orch.WorkerIdle,
 			}))
 		}
 
-		var (
-			wg        sync.WaitGroup
-			mu        sync.Mutex
-			successes int
-		)
-		wg.Add(goroutines)
-		for g := 0; g < goroutines; g++ {
-			taskIdx := g % numTasks
-			workerIdx := g % numWorkers
-			go func(tID, wName string) {
-				defer wg.Done()
-				if err := store.Assign(tID, wName); err == nil {
-					mu.Lock()
-					successes++
-					mu.Unlock()
-				}
-			}(fmt.Sprintf("t%d", taskIdx), fmt.Sprintf("w%d", workerIdx))
+		// Every (task, worker) pair races simultaneously. This creates both
+		// task-level contention (workers 0..19 all targeting task 0) and
+		// worker-level contention (tasks 0..19 all targeting worker 0).
+		var wg sync.WaitGroup
+		wg.Add(numTasks * numWorkers)
+		for ti := 0; ti < numTasks; ti++ {
+			for wi := 0; wi < numWorkers; wi++ {
+				go func(tID, wName string) {
+					defer wg.Done()
+					_ = store.Assign(tID, wName)
+				}(taskID(ti), workerName(wi))
+			}
 		}
 		wg.Wait()
 
-		assert.Equal(t, numWorkers, successes,
-			"exactly %d assignments should succeed (1 per worker)", numWorkers)
+		// Invariant 1: no task has more than one assignee, and each assigned
+		// task's assignee points to a worker that actually holds it.
+		taskToWorker := make(map[string]string)
+		for i := 0; i < numTasks; i++ {
+			task, err := store.GetTask(taskID(i))
+			require.NoError(t, err)
+			if task.Assignee != "" {
+				taskToWorker[task.ID] = task.Assignee
+				assert.Equal(t, orch.StatusAssigned, task.Status,
+					"task %s has assignee %s but status %s", task.ID, task.Assignee, task.Status)
+			}
+		}
+
+		// Invariant 2: no worker holds more than one task, and each active
+		// worker's CurrentTaskID points to a task that actually names it.
+		workerToTask := make(map[string]string)
+		for i := 0; i < numWorkers; i++ {
+			worker, err := store.GetWorker(workerName(i))
+			require.NoError(t, err)
+			if worker.Status == orch.WorkerActive {
+				workerToTask[worker.Name] = worker.CurrentTaskID
+				assert.NotEmpty(t, worker.CurrentTaskID,
+					"worker %s is active but has no CurrentTaskID", worker.Name)
+			}
+		}
+
+		// Sanity floor: a Store that rejects every Assign would pass the
+		// invariant checks above trivially (empty maps are consistent).
+		// All tasks start open and all workers idle, so at least one
+		// Assign is guaranteed to succeed.
+		assert.GreaterOrEqual(t, len(taskToWorker), 1,
+			"expected at least one successful assignment under contention")
+
+		// Cross-consistency: the task→worker and worker→task maps must be
+		// mutual inverses. A broken Store could leave a task pointing at a
+		// worker that is already busy with a different task (or vice versa).
+		assert.Equal(t, len(taskToWorker), len(workerToTask),
+			"mismatched assignment counts: %d tasks assigned, %d workers active",
+			len(taskToWorker), len(workerToTask))
+		for tID, wName := range taskToWorker {
+			assert.Equal(t, tID, workerToTask[wName],
+				"task %s claims worker %s, but worker holds %q", tID, wName, workerToTask[wName])
+		}
+		for wName, tID := range workerToTask {
+			assert.Equal(t, wName, taskToWorker[tID],
+				"worker %s claims task %s, but task holds %q", wName, tID, taskToWorker[tID])
+		}
 	})
 
 	// Criticality label round-trip: create task with criticality=critical,
