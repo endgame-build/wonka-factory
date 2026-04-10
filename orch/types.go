@@ -162,6 +162,11 @@ type Preset struct {
 type RoleConfig struct {
 	InstructionFile string  // path to OOMPA.md / LOOMPA.md / CHARLIE.md / etc.
 	Preset          *Preset // launch command, flags, model
+	// MaxTurns caps the conversational turns for a single agent invocation
+	// via the preset's --max-turns flag. Zero means "preset default" (no
+	// flag appended). Distinct from LifecycleConfig.MaxHandoffs, which caps
+	// session restarts across the task's lifetime.
+	MaxTurns int
 }
 
 // LifecycleConfig is the per-branch runtime configuration assembled by the
