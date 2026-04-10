@@ -27,4 +27,5 @@ var (
 var (
 	ErrInvalidLabelFilter = errors.New("invalid label filter: expected key:value format")
 	ErrInvalidID          = errors.New("invalid identifier: must not contain path separators or '..'")
+	ErrInvalidEnvKey      = errors.New("invalid environment variable key: must match [A-Za-z_][A-Za-z0-9_]*")
 )
