@@ -19,8 +19,8 @@ var (
 var (
 	ErrLifecycleAborted    = errors.New("lifecycle aborted: gap tolerance reached") // BVV-ERR-04
 	ErrLockContention      = errors.New("lifecycle lock held by another process")   // BVV-S-01, BVV-ERR-06
-	ErrResumeNoLedger      = errors.New("no ledger found for resume")              // BVV-ERR-07
-	ErrHandoffLimitReached = errors.New("handoff limit reached for task")          // BVV-L-04
+	ErrResumeNoLedger      = errors.New("no ledger found for resume")               // BVV-ERR-07
+	ErrHandoffLimitReached = errors.New("handoff limit reached for task")           // BVV-L-04
 )
 
 // Sentinel errors for input validation.
