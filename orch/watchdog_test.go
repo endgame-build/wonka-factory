@@ -298,29 +298,24 @@ func TestBVV_ERR11a_WatchdogTaskHandoffPayload(t *testing.T) {
 // the watchdog emits EventHandoffLimitReached and does NOT call
 // RestartSession. The dispatcher will observe the event on its next tick
 // and convert the task to a failure — the watchdog does not.
+//
+// The stop-at-limit property is verified two ways:
+//  1. Exactly ONE EventTaskHandoff is emitted (from tick 1). If tick 2 had
+//     restarted, a second EventTaskHandoff would be emitted.
+//  2. Exactly ONE EventHandoffLimitReached is emitted (from tick 2).
+//
+// This closes the gap in the original test which only checked (2) and would
+// have silently passed if the watchdog had erroneously restarted on tick 2.
 func TestBVV_L04_WatchdogStopsAtHandoffLimit(t *testing.T) {
-	// Construct fixture with limit=1. First setup consumes 0 handoffs; we
-	// pre-seed the HandoffState to 1 so the watchdog hits the limit on its
-	// first tick.
-	wd, rec, pool, logPath := newWatchdogFixture(t, 1)
+	wd, rec, pool, logPath := newWatchdogFixture(t, 1) // limit = 1 handoff
 	setupDeadSessionTask(t, rec, pool, "task-limit", "w-01")
-
-	// Pre-seed: task-limit already used its 1 handoff. Use SetCounts — it
-	// doesn't lock the mutex because it's designed for init-time replay,
-	// which is exactly what this test does (before CheckOnce starts).
-	//
-	// We can't call handoffs directly (no public accessor) so we poke via
-	// the watchdog fixture — the test exercises the public API anyway by
-	// checking CanHandoff via the emitted event.
-	//
-	// Simpler: check CanHandoff indirectly by running CheckOnce twice and
-	// verifying the second tick emits limit-reached.
 
 	rec.mu.Lock()
 	rec.enforceS10 = true
 	rec.mu.Unlock()
 
-	// First tick: consumes the 1 allowed handoff.
+	// First tick: consumes the 1 allowed handoff, emits EventTaskHandoff,
+	// RestartSession runs ok.sh.
 	require.NoError(t, wd.CheckOnce())
 
 	// Wait for the RESTARTED session (still running ok.sh) to die so the
@@ -330,14 +325,25 @@ func TestBVV_L04_WatchdogStopsAtHandoffLimit(t *testing.T) {
 	// Second tick: limit exhausted → emit EventHandoffLimitReached, no restart.
 	require.NoError(t, wd.CheckOnce())
 
+	// Verify emission counts. ONE of each, not TWO of either.
 	events := readEvents(t, logPath)
+	var handoffCount, limitCount int
 	var limitEv *orch.Event
 	for i := range events {
-		if events[i].Kind == orch.EventHandoffLimitReached {
+		switch events[i].Kind {
+		case orch.EventTaskHandoff:
+			handoffCount++
+		case orch.EventHandoffLimitReached:
+			limitCount++
 			limitEv = &events[i]
 		}
 	}
-	require.NotNil(t, limitEv, "expected EventHandoffLimitReached on second tick")
+	assert.Equal(t, 1, handoffCount,
+		"exactly 1 EventTaskHandoff expected (from tick 1); a second event would mean the watchdog ignored the limit on tick 2")
+	assert.Equal(t, 1, limitCount,
+		"exactly 1 EventHandoffLimitReached expected (from tick 2)")
+
+	require.NotNil(t, limitEv)
 	assert.Equal(t, "task-limit", limitEv.TaskID)
 	assert.Equal(t, "w-01", limitEv.Worker)
 	assert.Contains(t, limitEv.Detail, "branch=feature-x")

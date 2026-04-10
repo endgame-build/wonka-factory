@@ -2,6 +2,8 @@ package orch
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -92,5 +94,44 @@ func TestReadExitCode_MissingSidecar(t *testing.T) {
 	}
 	if code != -1 {
 		t.Errorf("missing sidecar: got exit code %d, want -1", code)
+	}
+}
+
+// TestReadExitCode_EmptySidecar covers the partial-write edge case: the
+// sidecar file exists (bash opened it) but has no content (bash was killed
+// before the write completed). Must return (-1, nil) — the same "unknown
+// exit code" signal as a missing file. BVV-DSP-04 treats unknown as failure.
+func TestReadExitCode_EmptySidecar(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "task-x.stdout")
+	if err := os.WriteFile(logPath+".exitcode", []byte{}, 0o644); err != nil {
+		t.Fatalf("write empty sidecar: %v", err)
+	}
+
+	code, err := ReadExitCode(logPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != -1 {
+		t.Errorf("empty sidecar: got exit code %d, want -1", code)
+	}
+}
+
+// TestReadExitCode_WhitespaceOnlySidecar covers another partial-write case:
+// bash wrote whitespace (e.g., a stray newline) but no integer. The parser
+// must treat this as unknown (-1), not as a parse error.
+func TestReadExitCode_WhitespaceOnlySidecar(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "task-y.stdout")
+	if err := os.WriteFile(logPath+".exitcode", []byte("   \n"), 0o644); err != nil {
+		t.Fatalf("write whitespace sidecar: %v", err)
+	}
+
+	code, err := ReadExitCode(logPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != -1 {
+		t.Errorf("whitespace sidecar: got exit code %d, want -1", code)
 	}
 }

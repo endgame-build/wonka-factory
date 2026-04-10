@@ -187,10 +187,13 @@ func (h *HandoffState) Reset(taskID string) {
 }
 
 // SetCounts replaces the entire counter map. Intended for Phase 5 Resume
-// replay — the caller guarantees no concurrent access at init time, so this
-// method does not lock. If a later caller holds the mutex, the unlocked write
-// here would race; do not call SetCounts after the watchdog has started.
+// replay from the event log. Designed to be called at init time before any
+// other goroutine can access the state — the mutex is held as defensive
+// insurance against contract drift rather than as a correctness requirement.
+// The lock cost is negligible on the one-shot init path.
 func (h *HandoffState) SetCounts(counts map[string]int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	clone := make(map[string]int, len(counts))
 	for k, v := range counts {
 		clone[k] = v
