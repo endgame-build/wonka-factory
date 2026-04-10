@@ -125,13 +125,16 @@ func TestEventLog_EmitZeroTimestamp(t *testing.T) {
 func TestProgressReporter_NilSafe(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "events.jsonl")
-	el, _ := NewEventLog(path)
+	el, err := NewEventLog(path)
+	if err != nil {
+		t.Fatalf("NewEventLog: %v", err)
+	}
 	defer el.Close()
 
 	ev := Event{Kind: EventTaskCompleted, Summary: "test"}
 
 	// nil log, nil progress — no error
-	err := emitAndNotify(nil, nil, ev)
+	err = emitAndNotify(nil, nil, ev)
 	if err != nil {
 		t.Errorf("nil/nil: unexpected error: %v", err)
 	}

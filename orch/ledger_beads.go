@@ -96,16 +96,20 @@ const (
 
 // --- Task ↔ Issue mapping ---
 
+// toIssue / toTask translate between BVV Task and beads Issue. The only
+// non-obvious mapping is Task.Body ↔ Issue.Description; every other field
+// carries its name across the boundary.
 func (b *BeadsStore) toIssue(t *Task) *beads.Issue {
 	return &beads.Issue{
-		ID:        t.ID,
-		Title:     t.Title,
-		Status:    orchStatusToBeads(t.Status),
-		Priority:  t.Priority,
-		IssueType: beads.TypeTask,
-		Assignee:  t.Assignee,
-		CreatedAt: t.CreatedAt,
-		UpdatedAt: t.UpdatedAt,
+		ID:          t.ID,
+		Title:       t.Title,
+		Description: t.Body,
+		Status:      orchStatusToBeads(t.Status),
+		Priority:    t.Priority,
+		IssueType:   beads.TypeTask,
+		Assignee:    t.Assignee,
+		CreatedAt:   t.CreatedAt,
+		UpdatedAt:   t.UpdatedAt,
 	}
 }
 
@@ -126,6 +130,7 @@ func (b *BeadsStore) toTask(issue *beads.Issue, beadsLabels []string) *Task {
 	t := &Task{
 		ID:        issue.ID,
 		Title:     issue.Title,
+		Body:      issue.Description,
 		Status:    beadsStatusToOrch(issue.Status, beadsLabels),
 		Priority:  issue.Priority,
 		Assignee:  issue.Assignee,
@@ -228,17 +233,27 @@ func (b *BeadsStore) CreateTask(t *Task) error {
 }
 
 func (b *BeadsStore) GetTask(id string) (*Task, error) {
-	ctx := context.Background()
+	if err := validateID(id); err != nil {
+		return nil, err
+	}
+	return b.readTask(context.Background(), id)
+}
+
+// readTask fetches a task from beads (issue + labels) without acquiring b.mu.
+// Reads are safe for concurrent callers because beads provides its own
+// transaction isolation; the mutex only guards combined task+worker writes.
+// Shared by GetTask and Assign.
+func (b *BeadsStore) readTask(ctx context.Context, id string) (*Task, error) {
 	issue, err := b.storage.GetIssue(ctx, id)
 	if err != nil {
 		if beadsNotFound(err) {
-			return nil, fmt.Errorf("get task %s: %w", id, ErrNotFound)
+			return nil, fmt.Errorf("task %s: %w", id, ErrNotFound)
 		}
 		return nil, fmt.Errorf("get task: %w", err)
 	}
 	labels, err := b.storage.GetLabels(ctx, id)
 	if err != nil {
-		return nil, fmt.Errorf("get labels: %w", err)
+		return nil, fmt.Errorf("get labels for %s: %w", id, err)
 	}
 	return b.toTask(issue, labels), nil
 }
@@ -246,27 +261,32 @@ func (b *BeadsStore) GetTask(id string) (*Task, error) {
 // UpdateTask persists the task's current state. The store does NOT enforce
 // BVV-S-02 (terminal irreversibility) — that invariant is the dispatcher's
 // responsibility (see invariant.go, Phase 4). The store is a dumb writer.
+//
+// Existence is checked by beads inside the transaction (UpdateIssueInTx reads
+// the old issue before updating), so we translate that error rather than
+// performing a separate GetIssue round-trip.
 func (b *BeadsStore) UpdateTask(t *Task) error {
+	if err := validateID(t.ID); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	ctx := context.Background()
-	if _, err := b.storage.GetIssue(ctx, t.ID); err != nil {
-		if beadsNotFound(err) {
-			return fmt.Errorf("update task %s: %w", t.ID, ErrNotFound)
-		}
-		return fmt.Errorf("update task check: %w", err)
-	}
-
 	t.UpdatedAt = time.Now()
 
 	return b.storage.RunInTransaction(ctx, b.actor, func(tx beads.Transaction) error {
 		updates := map[string]any{
-			"status":   string(orchStatusToBeads(t.Status)),
-			"priority": t.Priority,
-			"assignee": t.Assignee,
+			"status":      string(orchStatusToBeads(t.Status)),
+			"priority":    t.Priority,
+			"assignee":    t.Assignee,
+			"title":       t.Title,
+			"description": t.Body,
 		}
 		if err := tx.UpdateIssue(ctx, t.ID, updates, b.actor); err != nil {
+			if beadsNotFound(err) {
+				return fmt.Errorf("update task %s: %w", t.ID, ErrNotFound)
+			}
 			return fmt.Errorf("update issue: %w", err)
 		}
 
@@ -374,23 +394,20 @@ func (b *BeadsStore) ReadyTasks(labels ...string) ([]*Task, error) {
 // is set via beads transaction; worker JSON is updated separately with rollback
 // on failure. Not cross-store atomic.
 func (b *BeadsStore) Assign(taskID, workerName string) error {
+	if err := validateID(taskID); err != nil {
+		return err
+	}
+	if err := validateID(workerName); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	ctx := context.Background()
-	issue, err := b.storage.GetIssue(ctx, taskID)
+	task, err := b.readTask(ctx, taskID)
 	if err != nil {
-		if beadsNotFound(err) {
-			return fmt.Errorf("assign task %s: %w", taskID, ErrNotFound)
-		}
-		return fmt.Errorf("assign get task: %w", err)
+		return err
 	}
-	beadsLabels, err := b.storage.GetLabels(ctx, taskID)
-	if err != nil {
-		return fmt.Errorf("assign get labels: %w", err)
-	}
-	task := b.toTask(issue, beadsLabels)
-
 	if task.Assignee != "" {
 		return fmt.Errorf("assign %s: %w", taskID, ErrAlreadyAssigned)
 	}
@@ -456,6 +473,9 @@ func (b *BeadsStore) GetWorker(name string) (*Worker, error) {
 }
 
 func (b *BeadsStore) getWorker(name string) (*Worker, error) {
+	if err := validateID(name); err != nil {
+		return nil, err
+	}
 	path := b.workerPath(name)
 	var w Worker
 	if err := readJSON(path, &w); err != nil {
@@ -489,6 +509,9 @@ func (b *BeadsStore) ListWorkers() ([]*Worker, error) {
 }
 
 func (b *BeadsStore) UpdateWorker(w *Worker) error {
+	if err := validateID(w.Name); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -509,6 +532,12 @@ func (b *BeadsStore) workerPath(name string) string {
 // --- Store interface: Dependency operations ---
 
 func (b *BeadsStore) AddDep(taskID, dependsOn string) error {
+	if err := validateID(taskID); err != nil {
+		return err
+	}
+	if err := validateID(dependsOn); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -557,6 +586,9 @@ func (b *BeadsStore) AddDep(taskID, dependsOn string) error {
 }
 
 func (b *BeadsStore) GetDeps(taskID string) ([]string, error) {
+	if err := validateID(taskID); err != nil {
+		return nil, err
+	}
 	issues, err := b.storage.GetDependencies(context.Background(), taskID)
 	if err != nil {
 		return nil, fmt.Errorf("get deps: %w", err)

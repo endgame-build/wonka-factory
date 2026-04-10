@@ -80,6 +80,9 @@ func (s *FSStore) CreateTask(t *Task) error {
 }
 
 func (s *FSStore) GetTask(id string) (*Task, error) {
+	if err := validateID(id); err != nil {
+		return nil, err
+	}
 	var t Task
 	if err := readJSON(s.taskPath(id), &t); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -94,6 +97,9 @@ func (s *FSStore) GetTask(id string) (*Task, error) {
 // BVV-S-02 (terminal irreversibility) — that invariant is the dispatcher's
 // responsibility (see invariant.go, Phase 4). The store is a dumb writer.
 func (s *FSStore) UpdateTask(t *Task) error {
+	if err := validateID(t.ID); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.lock.Lock(); err != nil {
@@ -187,6 +193,12 @@ func (s *FSStore) ReadyTasks(labels ...string) ([]*Task, error) {
 // BVV-S-03: at most one worker per task (see BVVTaskMachine.tla Assign action).
 // LDG-08: atomic task+worker update under flock.
 func (s *FSStore) Assign(taskID, workerName string) error {
+	if err := validateID(taskID); err != nil {
+		return err
+	}
+	if err := validateID(workerName); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.lock.Lock(); err != nil {
@@ -268,6 +280,9 @@ func (s *FSStore) CreateWorker(w *Worker) error {
 }
 
 func (s *FSStore) GetWorker(name string) (*Worker, error) {
+	if err := validateID(name); err != nil {
+		return nil, err
+	}
 	var w Worker
 	if err := readJSON(s.workerPath(name), &w); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -300,6 +315,9 @@ func (s *FSStore) ListWorkers() ([]*Worker, error) {
 }
 
 func (s *FSStore) UpdateWorker(w *Worker) error {
+	if err := validateID(w.Name); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.lock.Lock(); err != nil {
@@ -320,6 +338,12 @@ func (s *FSStore) UpdateWorker(w *Worker) error {
 // --- Dependency operations ---
 
 func (s *FSStore) AddDep(taskID, dependsOn string) error {
+	if err := validateID(taskID); err != nil {
+		return err
+	}
+	if err := validateID(dependsOn); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.lock.Lock(); err != nil {
@@ -349,6 +373,9 @@ func (s *FSStore) AddDep(taskID, dependsOn string) error {
 }
 
 func (s *FSStore) GetDeps(taskID string) ([]string, error) {
+	if err := validateID(taskID); err != nil {
+		return nil, err
+	}
 	deps, err := s.loadDeps()
 	if err != nil {
 		return nil, err
