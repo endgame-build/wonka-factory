@@ -278,7 +278,9 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		assert.Equal(t, orch.StatusCompleted, got.Status, "StatusCompleted must survive round-trip")
 	})
 
-	// StatusAssigned round-trip (regression: commit 574f7cb).
+	// StatusAssigned round-trip: beads maps StatusAssigned→StatusOpen and
+	// distinguishes via Issue.Assignee. A regression in toTask that forgets
+	// the Assignee check will read back StatusOpen instead of StatusAssigned.
 	t.Run("StatusAssigned_RoundTrip", func(t *testing.T) {
 		store, _ := factory(t)
 		require.NoError(t, store.CreateTask(&orch.Task{ID: "asgn-rt", Status: orch.StatusOpen}))
@@ -419,9 +421,9 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 	})
 
 	// Title/Body round-trip: both fields must survive create + update cycles
-	// across every backend. Regression guard for beads silently dropping
-	// Title/Body from the UpdateIssue path (the fork mapped Body to nothing
-	// at all, and UpdateTask only pushed status/priority/assignee).
+	// across every backend. Regression guard: beads UpdateIssue is map-based,
+	// so Title and Body must be explicitly included in the updates map (see
+	// BeadsStore.UpdateTask) — previously omitted and silently dropped.
 	t.Run("TitleBody_RoundTrip", func(t *testing.T) {
 		store, _ := factory(t)
 		require.NoError(t, store.CreateTask(&orch.Task{
@@ -634,7 +636,8 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		assert.False(t, got2.IsCritical(), "IsCritical() should be false for non_critical")
 	})
 
-	// ReadyTasks correctness (ported from fork, adapted for BVV).
+	// ReadyTasks correctness: ready set excludes terminal, assigned, and
+	// dependency-blocked tasks.
 	t.Run("ReadyTasks_Correctness", func(t *testing.T) {
 		store, _ := factory(t)
 		require.NoError(t, store.CreateTask(&orch.Task{ID: "blocker", Status: orch.StatusOpen}))

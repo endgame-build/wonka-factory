@@ -42,8 +42,8 @@ var AllEventKinds = []EventKind{
 }
 
 // Event is a single JSONL audit record (BVV spec §10.3).
-// Phase and Agent fields from the fork are removed — BVV is phase-agnostic
-// (BVV-DSN-04) and agents are identified by role labels, not event fields.
+// BVV-DSN-04: phase-agnostic — no Phase field; agents are identified by
+// role labels carried on the referenced Task, not by an Agent field.
 type Event struct {
 	Timestamp time.Time    `json:"timestamp"`
 	Kind      EventKind    `json:"kind"`

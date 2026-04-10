@@ -1,14 +1,11 @@
 package orch
 
 import (
+	"cmp"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 )
-
-// defaultActor is the beads audit trail actor used by the store factory
-// and as a fallback when NewBeadsStore receives an empty actor string.
-const defaultActor = "orch"
 
 // validateID rejects identifiers that could escape filesystem directories via
 // path traversal. Task IDs come from the planning agent (Charlie) and worker
@@ -36,6 +33,10 @@ func validateID(id string) error {
 //   - ReadyTasks and ListTasks return results sorted by taskLess
 //     (priority ASC — lower number = higher priority, then ID ASC).
 //   - ListWorkers returns workers sorted by name ASC.
+//
+// UpdateTask is a dumb writer: implementations must NOT enforce BVV-S-02
+// (terminal irreversibility). The dispatcher enforces that invariant via
+// invariant.go (Phase 4).
 type Store interface {
 	CreateTask(t *Task) error
 	GetTask(id string) (*Task, error)
@@ -66,7 +67,18 @@ func taskLess(a, b *Task) bool {
 
 // sortTasks sorts a task slice in-place by the canonical LDG-07 ordering.
 func sortTasks(tasks []*Task) {
-	sort.Slice(tasks, func(i, j int) bool { return taskLess(tasks[i], tasks[j]) })
+	slices.SortFunc(tasks, func(a, b *Task) int {
+		if a.Priority != b.Priority {
+			return cmp.Compare(a.Priority, b.Priority)
+		}
+		return cmp.Compare(a.ID, b.ID)
+	})
+}
+
+// sortWorkers sorts a worker slice in-place by name ASC. Shared by both
+// Store backends for the ListWorkers ordering contract.
+func sortWorkers(ws []*Worker) {
+	slices.SortFunc(ws, func(a, b *Worker) int { return cmp.Compare(a.Name, b.Name) })
 }
 
 // validateLabelFilters checks that all filter strings are in "key:value" format.

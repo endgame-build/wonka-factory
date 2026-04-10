@@ -12,7 +12,7 @@ var (
 	ErrAlreadyAssigned = errors.New("task already assigned")
 	ErrTaskNotReady    = errors.New("task not ready for assignment")
 	ErrWorkerBusy      = errors.New("worker is not idle")
-	ErrPoolExhausted   = errors.New("worker pool exhausted") // Phase 3: dispatcher pool exhaustion
+	ErrPoolExhausted   = errors.New("worker pool exhausted") // returned by the dispatcher when every worker slot is busy
 )
 
 // Sentinel errors for lifecycle control flow.

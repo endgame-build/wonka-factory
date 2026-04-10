@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -93,9 +93,9 @@ func (s *FSStore) GetTask(id string) (*Task, error) {
 	return &t, nil
 }
 
-// UpdateTask persists the task's current state. The store does NOT enforce
-// BVV-S-02 (terminal irreversibility) — that invariant is the dispatcher's
-// responsibility (see invariant.go, Phase 4). The store is a dumb writer.
+// UpdateTask persists the task's current state. BVV-S-02 (terminal
+// irreversibility) is documented on the Store interface and enforced by the
+// dispatcher, not here.
 func (s *FSStore) UpdateTask(t *Task) error {
 	if err := validateID(t.ID); err != nil {
 		return err
@@ -310,7 +310,7 @@ func (s *FSStore) ListWorkers() ([]*Worker, error) {
 		}
 		workers = append(workers, &w)
 	}
-	sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
+	sortWorkers(workers)
 	return workers, nil
 }
 
@@ -356,11 +356,8 @@ func (s *FSStore) AddDep(taskID, dependsOn string) error {
 		return err
 	}
 
-	// Check for duplicate.
-	for _, d := range deps[taskID] {
-		if d == dependsOn {
-			return nil // idempotent
-		}
+	if slices.Contains(deps[taskID], dependsOn) {
+		return nil // idempotent
 	}
 
 	// Cycle detection: DFS from dependsOn following edges. If we reach taskID, it's a cycle (LDG-06).
@@ -480,11 +477,12 @@ func atomicWriteJSON(path string, v any) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close tmp: %w", err)
 	}
-	committed = true
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
 		return fmt.Errorf("rename: %w", err)
 	}
+	// Past this point, tmp has been renamed away; tell the deferred cleanup
+	// not to touch it.
+	committed = true
 	return nil
 }
 

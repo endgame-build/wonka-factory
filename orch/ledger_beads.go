@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -14,8 +14,16 @@ import (
 	beads "github.com/steveyegge/beads"
 )
 
+// defaultActor is the beads audit trail actor used when NewBeadsStore receives
+// an empty actor string, and by the store factory for its default constructor.
+const defaultActor = "orch"
+
 // beadsNotFound returns true if the error indicates a missing issue.
-// The Beads SDK does not export sentinel errors, so we match by message substring.
+// The Beads SDK does not export sentinel errors (storage.ErrNotFound lives in
+// an internal package), so we match by message substring. This is fragile
+// under beads version bumps — if beads reworks its error phrasing, every
+// ErrNotFound-sensitive call site (recovery, Assign, UpdateTask) silently
+// changes behavior. File an upstream issue to export a sentinel.
 func beadsNotFound(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "not found")
 }
@@ -80,17 +88,21 @@ func (b *BeadsStore) Close() error {
 // BVV uses Task.Labels (map[string]string) for all domain metadata (role,
 // branch, criticality). These are stored as beads labels in "key:value" format.
 //
-// Status-distinguishing labels (orch-internal):
-//   - orch:failed — present when orch status is StatusFailed
-//     (both Completed and Failed map to beads StatusClosed)
-//   - StatusAssigned: derived from beads StatusOpen + non-empty Assignee field
-//     (see toTask). No label needed — beads.Issue.Assignee is the source of truth.
+// The "orch:" namespace is reserved for internal status distinguishers:
 //
-// Removed from fork: orch:parent, orch:type, orch:agent, orch:output,
-// orch:assigned (Assignee field is now authoritative).
+//   - orch:failed — present when orch status is StatusFailed. Both
+//     StatusCompleted and StatusFailed map to beads.StatusClosed (beads has
+//     no "failed" state), so taskLabelsToBeads attaches this label whenever
+//     Status == StatusFailed, and beadsStatusToOrch inspects it on read-back.
+//     Do not repurpose this label.
+//
+//   - StatusAssigned is derived from beads.StatusOpen + non-empty Issue.Assignee
+//     (see toTask). No label needed — Issue.Assignee is the source of truth.
 
 const (
 	labelPrefix = "orch:"
+	// labelFailed distinguishes StatusFailed from StatusCompleted. See the
+	// package comment above for the rationale.
 	labelFailed = "orch:failed"
 )
 
@@ -138,10 +150,8 @@ func (b *BeadsStore) toTask(issue *beads.Issue, beadsLabels []string) *Task {
 		CreatedAt: issue.CreatedAt,
 		UpdatedAt: issue.UpdatedAt,
 	}
-	// StatusAssigned maps to beads.StatusOpen (both are "open" in beads).
-	// Distinguish by checking the Assignee field — this replaces the fork's
-	// orch:assigned label approach. The Assignee field is the source of truth
-	// since beads.Issue.Assignee exists natively in v0.63.3.
+	// StatusAssigned maps to beads.StatusOpen; beads.Issue.Assignee is the
+	// source of truth for the Open → Assigned distinction (requires beads ≥ v0.63.3).
 	if t.Status == StatusOpen && t.Assignee != "" {
 		t.Status = StatusAssigned
 	}
@@ -157,6 +167,11 @@ func (b *BeadsStore) toTask(issue *beads.Issue, beadsLabels []string) *Task {
 	return t
 }
 
+// orchStatusToBeads translates a BVV TaskStatus to its beads encoding.
+// Panics on unmapped values: callers must only pass the six TaskStatus
+// constants declared in types.go. A panic here indicates a caller bug or a
+// missed case when TaskStatus is extended. BVV-S-02 relies on this mapping
+// being total and faithful.
 func orchStatusToBeads(s TaskStatus) beads.Status {
 	switch s {
 	case StatusOpen:
@@ -172,33 +187,30 @@ func orchStatusToBeads(s TaskStatus) beads.Status {
 	case StatusBlocked:
 		return beads.StatusBlocked // native in beads@v0.63.3
 	default:
-		panic(fmt.Sprintf("orchStatusToBeads: unmapped TaskStatus %q", s))
+		panic(fmt.Sprintf("[BVV-S-02] orchStatusToBeads: unmapped TaskStatus %q", s))
 	}
 }
 
+// beadsStatusToOrch is the inverse of orchStatusToBeads. Panics on unmapped
+// beads statuses — a new beads status appearing on read-back means either the
+// beads SDK was upgraded without updating this switch, or data written by an
+// incompatible writer ended up in the Dolt database. BVV-S-02 relies on the
+// round-trip being total.
 func beadsStatusToOrch(s beads.Status, beadsLabels []string) TaskStatus {
-	hasLabel := func(target string) bool {
-		for _, l := range beadsLabels {
-			if l == target {
-				return true
-			}
-		}
-		return false
-	}
 	switch s {
 	case beads.StatusOpen:
 		return StatusOpen
 	case beads.StatusInProgress:
 		return StatusInProgress
 	case beads.StatusClosed:
-		if hasLabel(labelFailed) {
+		if slices.Contains(beadsLabels, labelFailed) {
 			return StatusFailed
 		}
 		return StatusCompleted
 	case beads.StatusBlocked:
 		return StatusBlocked
 	default:
-		panic(fmt.Sprintf("beadsStatusToOrch: unmapped beads.Status %q", s))
+		panic(fmt.Sprintf("[BVV-S-02] beadsStatusToOrch: unmapped beads.Status %q", s))
 	}
 }
 
@@ -258,9 +270,9 @@ func (b *BeadsStore) readTask(ctx context.Context, id string) (*Task, error) {
 	return b.toTask(issue, labels), nil
 }
 
-// UpdateTask persists the task's current state. The store does NOT enforce
-// BVV-S-02 (terminal irreversibility) — that invariant is the dispatcher's
-// responsibility (see invariant.go, Phase 4). The store is a dumb writer.
+// UpdateTask persists the task's current state. BVV-S-02 (terminal
+// irreversibility) is documented on the Store interface and enforced by the
+// dispatcher, not here.
 //
 // Existence is checked by beads inside the transaction (UpdateIssueInTx reads
 // the old issue before updating), so we translate that error rather than
@@ -348,9 +360,11 @@ func (b *BeadsStore) ListTasks(labels ...string) ([]*Task, error) {
 // empty, and all label filters match. Sorted by taskLess (LDG-07).
 //
 // BVV-DSP-01: ready = open ∧ deps-terminal ∧ unassigned ∧ labels-match.
-// TODO: verify whether beads native StatusInProgress is sufficient for
-// dispatch filtering in Phase 3, or if the spec's orch:in_progress label
-// is also needed (current implementation uses beads.StatusInProgress directly).
+//
+// TODO(BVV-DSP, Phase 3, deferred-D4): BVV spec §5.1a defines in_progress as
+// "open + orch:in_progress". This implementation uses beads.StatusInProgress
+// directly and omits the label. Re-evaluate when dispatch filters by
+// in_progress state; see docs/BVV_IMPLEMENTATION_PLAN.md §2.6.
 func (b *BeadsStore) ReadyTasks(labels ...string) ([]*Task, error) {
 	if err := validateLabelFilters(labels); err != nil {
 		return nil, err
@@ -504,7 +518,7 @@ func (b *BeadsStore) ListWorkers() ([]*Worker, error) {
 		}
 		workers = append(workers, &w)
 	}
-	sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
+	sortWorkers(workers)
 	return workers, nil
 }
 
@@ -546,10 +560,8 @@ func (b *BeadsStore) AddDep(taskID, dependsOn string) error {
 	if err != nil {
 		return fmt.Errorf("add dep check existing: %w", err)
 	}
-	for _, issue := range existing {
-		if issue.ID == dependsOn {
-			return nil // idempotent
-		}
+	if slices.ContainsFunc(existing, func(i *beads.Issue) bool { return i.ID == dependsOn }) {
+		return nil // idempotent
 	}
 
 	// Cycle detection: build the full dependency graph via per-issue queries.
