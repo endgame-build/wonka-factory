@@ -1,3 +1,5 @@
+//go:build verify
+
 package orch_test
 
 import (
@@ -233,6 +235,23 @@ func TestBVV_S02a_HandoffStateReset(t *testing.T) {
 	assert.Equal(t, 0, h.Count("task-reopened"), "reset task should be 0")
 	assert.Equal(t, 1, h.Count("task-untouched"), "other task must be unaffected by Reset")
 	assert.True(t, h.CanHandoff("task-reopened"), "reset task has full budget again")
+}
+
+// TestBVV_ERR11a_HandoffStateSetCountsNil verifies that SetCounts(nil) is
+// safe: the internal map is normalised to empty (not left nil), so the next
+// RecordHandoff call doesn't panic on a nil-map write. This covers the
+// normalisation branch introduced when SetCounts was refactored to use
+// maps.Clone (which returns nil on nil input).
+func TestBVV_ERR11a_HandoffStateSetCountsNil(t *testing.T) {
+	h := orch.NewHandoffState(5)
+	h.SetCounts(nil)
+
+	// Internal map must be non-nil — a subsequent RecordHandoff must not
+	// panic. Assertion is by behavior, not by inspection.
+	assert.NotPanics(t, func() {
+		h.RecordHandoff("task-after-nil-reset")
+	})
+	assert.Equal(t, 1, h.Count("task-after-nil-reset"))
 }
 
 // TestBVV_ERR11a_HandoffStateSetCounts verifies SetCounts restores state from
