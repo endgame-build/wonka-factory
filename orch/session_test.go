@@ -226,6 +226,47 @@ func TestBVV_DSP05_SpawnSessionExitOne(t *testing.T) {
 	assert.Equal(t, 1, code, "fail.sh exits 1")
 }
 
+// TestBVV_DSP04_SpawnSessionExitCodeTable verifies the full BVV exit-code
+// protocol (BVV-DSP-04): exit 0 → success, exit 1 → retryable failure, exit
+// 2 → blocked (terminal), exit 3 → handoff. SpawnSession itself doesn't
+// interpret the exit codes — Phase 4 DetermineOutcome does — but the
+// sidecar-capture path must preserve all four values faithfully.
+//
+// This is the integration smoke the Phase 3 plan's verification section
+// referenced (exit 2 specifically). Running under -tags verify (no separate
+// integration tag) because the mechanism under test is the infrastructure
+// primitive, not a Phase 4 dispatch decision.
+func TestBVV_DSP04_SpawnSessionExitCodeTable(t *testing.T) {
+	cases := []struct {
+		name   string
+		script string
+		want   int
+	}{
+		{"exit_0_success", "ok.sh", 0},
+		{"exit_1_failure", "fail.sh", 1},
+		{"exit_2_blocked", "blocked.sh", 2},
+		{"exit_3_handoff", "handoff.sh", 3},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, store, outDir := newTestSessionPool(t)
+			taskID := "task-" + tc.name
+			task, _ := createAssignedTask(t, store, taskID, "w-01")
+
+			roleCfg := mockRoleConfig(t, tc.script)
+			require.NoError(t, pool.SpawnSession("w-01", task, roleCfg, "feature-x"))
+
+			logPath := orch.LogPath(outDir, taskID)
+			waitForSidecar(t, logPath, 3*time.Second)
+
+			code, err := orch.ReadExitCode(logPath)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, code, "sidecar must preserve exit code %d from %s", tc.want, tc.script)
+		})
+	}
+}
+
 // TestBVV_DSP05_SpawnSessionNilPresetError verifies the nil-preset guard.
 // A role config with a nil preset is a programming error the dispatcher
 // must catch before calling SpawnSession.
