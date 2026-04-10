@@ -23,10 +23,10 @@ func DefaultRetryConfig() RetryConfig {
 
 // RetryState tracks per-task retry counters (BVV-ERR-01).
 //
-// BVV retries reset the same task (stable ID) — the fork's retry-task-creation
-// pattern (RetryTaskID, isRetryTask) is gone. The dispatcher transitions
-// exit-code-1 tasks back to StatusOpen for re-dispatch without creating new
-// task entities.
+// BVV retries reset the same task (stable ID) — the fork's pattern of
+// creating retry-task clones with suffixed IDs is gone. The dispatcher
+// transitions exit-code-1 tasks back to StatusOpen for re-dispatch without
+// creating new task entities.
 //
 // Not thread-safe. Only the dispatcher's outcome-processing step mutates
 // RetryState, and that runs on a single goroutine (the dispatch tick drains

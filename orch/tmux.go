@@ -175,7 +175,7 @@ func BuildShellCommand(cmd []string, env map[string]string, logPath, textFilter 
 //
 // BVV-DSP-04: the orchestrator determines agent outcome solely from the exit
 // code. An unknown exit code (-1) is treated as failure by the dispatcher
-// (conservative default; see Phase 4 DetermineOutcome).
+// (conservative default; Phase 4 will wire this into the outcome switch).
 func ReadExitCode(logPath string) (int, error) {
 	data, err := os.ReadFile(logPath + ".exitcode")
 	if err != nil {
