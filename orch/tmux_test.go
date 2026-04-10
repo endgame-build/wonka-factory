@@ -1,3 +1,5 @@
+//go:build verify
+
 package orch
 
 import (

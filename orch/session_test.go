@@ -229,7 +229,7 @@ func TestBVV_DSP05_SpawnSessionExitOne(t *testing.T) {
 // TestBVV_DSP04_SpawnSessionExitCodeTable verifies the full BVV exit-code
 // protocol (BVV-DSP-04): exit 0 → success, exit 1 → retryable failure, exit
 // 2 → blocked (terminal), exit 3 → handoff. SpawnSession itself doesn't
-// interpret the exit codes — Phase 4 DetermineOutcome does — but the
+// interpret the exit codes — Phase 4 will map them to outcomes — but the
 // sidecar-capture path must preserve all four values faithfully.
 //
 // This is the integration smoke the Phase 3 plan's verification section
