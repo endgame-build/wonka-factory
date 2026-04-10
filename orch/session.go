@@ -1,0 +1,204 @@
+package orch
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+// WorkerPool manages a bounded pool of workers that execute agent tasks
+// via tmux sessions. BVV-DSP-05: one task per session — each SpawnSession
+// call creates a fresh session for a specific task, and the session ends
+// when the agent exits.
+type WorkerPool struct {
+	store      Store
+	tmux       *TmuxClient
+	maxWorkers int
+	runID      string
+	repoPath   string
+	outputDir  string // run directory; holds logs/{taskID}.stdout and sidecar files
+}
+
+// NewWorkerPool creates a worker pool backed by the given store and tmux client.
+func NewWorkerPool(store Store, tmux *TmuxClient, maxWorkers int, runID, repoPath, outputDir string) *WorkerPool {
+	return &WorkerPool{
+		store:      store,
+		tmux:       tmux,
+		maxWorkers: maxWorkers,
+		runID:      runID,
+		repoPath:   repoPath,
+		outputDir:  outputDir,
+	}
+}
+
+// Allocate returns an idle worker, or creates a new one if capacity allows.
+// Worker names are w-01, w-02, etc. Returns ErrPoolExhausted if all workers
+// are active (BVV WKR-04..07).
+func (wp *WorkerPool) Allocate() (*Worker, error) {
+	workers, err := wp.store.ListWorkers()
+	if err != nil {
+		return nil, fmt.Errorf("allocate: list workers: %w", err)
+	}
+	for _, w := range workers {
+		if w.Status == WorkerIdle {
+			return w, nil
+		}
+	}
+
+	if len(workers) >= wp.maxWorkers {
+		return nil, ErrPoolExhausted
+	}
+
+	w := &Worker{
+		Name:   fmt.Sprintf("w-%02d", len(workers)+1),
+		Status: WorkerIdle,
+	}
+	if err := wp.store.CreateWorker(w); err != nil {
+		return nil, fmt.Errorf("allocate: create worker: %w", err)
+	}
+	return w, nil
+}
+
+// SpawnSession starts a tmux session for a worker executing an agent task
+// (BVV WKR-05, BVV-DSP-05).
+//
+// Steps:
+//  1. Resolve instruction + model from roleCfg.InstructionFile.
+//  2. Build env with ORCH_TASK_ID / ORCH_BRANCH (BVV-ITF-01, BVV-DSP-06).
+//  3. Build command from preset + instruction + model + maxTurns.
+//  4. Wrap with sidecar exit-code capture (BVV Appendix A).
+//  5. Create tmux session in repoPath (so CLAUDE.md auto-discovers).
+//  6. Transition worker → active (WKR-05).
+//  7. Transition task → in_progress (LDG-14a).
+//
+// On any failure after step 5, the tmux session is killed via a defer-flag
+// pattern to prevent orphans. The task ID comes from the passed *Task
+// (task.ID) — no separate taskID parameter.
+func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleConfig, branch string) error {
+	if roleCfg.Preset == nil {
+		return fmt.Errorf("spawn: role %q has nil preset", task.Role())
+	}
+	sessionName := SessionName(wp.runID, workerName)
+
+	if err := os.MkdirAll(filepath.Join(wp.outputDir, "logs"), 0o755); err != nil {
+		return fmt.Errorf("spawn: create log dir: %w", err)
+	}
+
+	// 1. Resolve instruction and model.
+	_, model, err := ReadAgentPrompt(roleCfg.InstructionFile)
+	if err != nil {
+		return fmt.Errorf("spawn: read instruction: %w", err)
+	}
+
+	// 2. Build env — BVV-ITF-01 env-only identity, BVV-DSP-06 ORCH_TASK_ID.
+	env := BuildEnv(workerName, wp.runID, wp.repoPath, task.ID, branch, roleCfg.Preset.Env)
+
+	// 3. Build command — preset + instruction file + model override + maxTurns.
+	cmd := BuildCommand(roleCfg.Preset, roleCfg.InstructionFile, model, roleCfg.MaxTurns)
+
+	// 4. Wrap with sidecar exit-code capture (BVV Appendix A).
+	shellCmd, err := BuildShellCommand(cmd, env, LogPath(wp.outputDir, task.ID), roleCfg.Preset.TextFilter)
+	if err != nil {
+		return fmt.Errorf("spawn: %w", err)
+	}
+
+	// 5. Start the tmux session in the target repo directory so the agent
+	// analyses the correct codebase and picks up its CLAUDE.md.
+	if err := wp.tmux.CreateSession(sessionName, shellCmd, wp.repoPath); err != nil {
+		return fmt.Errorf("spawn: tmux: %w", err)
+	}
+
+	// If any subsequent step fails, kill the tmux session to prevent orphans.
+	cleanupSession := true
+	defer func() {
+		if cleanupSession {
+			_ = wp.tmux.KillSession(sessionName) // best-effort cleanup
+		}
+	}()
+
+	// 6. WKR-05: worker → active.
+	worker, err := wp.store.GetWorker(workerName)
+	if err != nil {
+		return fmt.Errorf("spawn: get worker: %w", err)
+	}
+	worker.Status = WorkerActive
+	worker.CurrentTaskID = task.ID
+	worker.SessionStartedAt = time.Now()
+	if err := wp.store.UpdateWorker(worker); err != nil {
+		return fmt.Errorf("spawn: update worker: %w", err)
+	}
+
+	// 7. LDG-14a: task → in_progress. The dispatcher has already called
+	// Assign which set the task to StatusAssigned; SpawnSession completes
+	// the Assigned → InProgress transition once the tmux session is live.
+	task.Status = StatusInProgress
+	task.UpdatedAt = time.Now()
+	if err := wp.store.UpdateTask(task); err != nil {
+		return fmt.Errorf("spawn: update task: %w", err)
+	}
+
+	cleanupSession = false // all steps succeeded — keep the session
+	return nil
+}
+
+// IsAlive reports whether the worker's tmux session is running (BVV-ERR-11
+// prerequisite). Returns a non-nil error if tmux infrastructure is broken
+// (distinct from "session dead" — callers of Watchdog.CheckOnce treat
+// (false, nil) as "restart candidate" and error as "skip this tick").
+func (wp *WorkerPool) IsAlive(workerName string) (bool, error) {
+	return wp.tmux.HasSession(SessionName(wp.runID, workerName))
+}
+
+// Release transitions a worker from active to idle (WKR-04). Kills the
+// worker's tmux session to prevent orphans, clears session state and
+// CurrentTaskID. The task's Assignee field is NOT modified here — the
+// dispatcher is the sole owner of task status transitions per BVV-S-02.
+func (wp *WorkerPool) Release(workerName string) error {
+	worker, err := wp.store.GetWorker(workerName)
+	if err != nil {
+		return fmt.Errorf("release: %w", err)
+	}
+
+	if err := wp.tmux.KillSessionIfExists(SessionName(wp.runID, workerName)); err != nil {
+		return fmt.Errorf("release: kill session: %w", err)
+	}
+
+	worker.Status = WorkerIdle
+	worker.CurrentTaskID = ""
+	worker.SessionPID = 0
+	worker.SessionStartedAt = time.Time{}
+
+	return wp.store.UpdateWorker(worker)
+}
+
+// Deallocate removes a worker from the pool. Returns ErrWorkerBusy if the
+// worker has an active assignment (WKR-11). Kills any tmux session (WKR-12).
+// Note: the Store interface does not yet have DeleteWorker; full removal is
+// deferred — Deallocate today is only responsible for tmux cleanup.
+func (wp *WorkerPool) Deallocate(workerName string) error {
+	worker, err := wp.store.GetWorker(workerName)
+	if err != nil {
+		return fmt.Errorf("deallocate: %w", err)
+	}
+	if worker.CurrentTaskID != "" {
+		return ErrWorkerBusy
+	}
+
+	if err := wp.tmux.KillSessionIfExists(SessionName(wp.runID, workerName)); err != nil {
+		return fmt.Errorf("deallocate: %w", err)
+	}
+	return nil
+}
+
+// RestartSession kills an existing session and spawns a new one for the same
+// task. Used by Watchdog on dead-session detection (BVV-ERR-11) and by the
+// dispatcher on exit-code-3 handoff processing. Task assignment is unchanged.
+// The HandoffState counter is NOT modified here — the caller (watchdog or
+// dispatcher) owns that accounting per the BVV-L-04 budget contract.
+func (wp *WorkerPool) RestartSession(workerName string, task *Task, roleCfg RoleConfig, branch string) error {
+	if err := wp.tmux.KillSessionIfExists(SessionName(wp.runID, workerName)); err != nil {
+		return fmt.Errorf("restart: kill: %w", err)
+	}
+	return wp.SpawnSession(workerName, task, roleCfg, branch)
+}
