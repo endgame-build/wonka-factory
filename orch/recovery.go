@@ -1,6 +1,7 @@
 package orch
 
 import (
+	"maps"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -191,12 +192,14 @@ func (h *HandoffState) Reset(taskID string) {
 // other goroutine can access the state — the mutex is held as defensive
 // insurance against contract drift rather than as a correctness requirement.
 // The lock cost is negligible on the one-shot init path.
+//
+// A nil input is normalised to an empty map so subsequent RecordHandoff
+// calls (which mutate the map in place) don't panic.
 func (h *HandoffState) SetCounts(counts map[string]int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	clone := make(map[string]int, len(counts))
-	for k, v := range counts {
-		clone[k] = v
+	h.counts = maps.Clone(counts)
+	if h.counts == nil {
+		h.counts = make(map[string]int)
 	}
-	h.counts = clone
 }

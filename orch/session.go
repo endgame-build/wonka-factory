@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,12 @@ type WorkerPool struct {
 	runID      string
 	repoPath   string
 	outputDir  string // run directory; holds logs/{taskID}.stdout and sidecar files
+
+	// logDirOnce guarantees the per-run logs directory is created at most
+	// once per pool — without this, every SpawnSession would issue a stat
+	// syscall against an existing directory.
+	logDirOnce sync.Once
+	logDirErr  error
 }
 
 // NewWorkerPool creates a worker pool backed by the given store and tmux client.
@@ -79,11 +86,10 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 	if roleCfg.Preset == nil {
 		return fmt.Errorf("spawn: role %q has nil preset", task.Role())
 	}
-	sessionName := SessionName(wp.runID, workerName)
-
-	if err := os.MkdirAll(filepath.Join(wp.outputDir, "logs"), 0o755); err != nil {
+	if err := wp.ensureLogDir(); err != nil {
 		return fmt.Errorf("spawn: create log dir: %w", err)
 	}
+	sessionName := SessionName(wp.runID, workerName)
 
 	// 1. Resolve instruction and model.
 	_, model, err := ReadAgentPrompt(roleCfg.InstructionFile)
@@ -189,6 +195,16 @@ func (wp *WorkerPool) Deallocate(workerName string) error {
 		return fmt.Errorf("deallocate: %w", err)
 	}
 	return nil
+}
+
+// ensureLogDir creates the per-run logs directory exactly once per pool
+// lifetime, regardless of how many times SpawnSession is called. The first
+// call does the MkdirAll; subsequent calls return the cached result.
+func (wp *WorkerPool) ensureLogDir() error {
+	wp.logDirOnce.Do(func() {
+		wp.logDirErr = os.MkdirAll(filepath.Join(wp.outputDir, "logs"), 0o755)
+	})
+	return wp.logDirErr
 }
 
 // RestartSession kills an existing session and spawns a new one for the same
