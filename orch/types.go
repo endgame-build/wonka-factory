@@ -172,7 +172,7 @@ type LifecycleConfig struct {
 	MaxRetries   int                   // BVV-ERR-01
 	MaxHandoffs  int                   // BVV-DSP-14, BVV-L-04
 	BaseTimeout  time.Duration         // BVV-ERR-02a
-	Lock         LockConfig            // reused from facet-scan
+	Lock         LockConfig            // per-branch exclusive lifecycle lock; see lock.go (Phase 3)
 	Roles        map[string]RoleConfig // role tag → binding
 }
 
@@ -182,9 +182,8 @@ type LifecycleConfig struct {
 // solely by the agent's exit code. The orchestrator never inspects agent
 // output content (ZFC / BVV-DSN-04).
 //
-// This is a semantic rewrite of the fork's AgentOutcome (which derived
-// outcomes from output validation). BVV agents signal their own outcome
-// via exit codes 0–3; see BVVTaskMachine.tla for the formal model.
+// Values are in 1:1 correspondence with agent exit codes 0–3; see
+// BVVTaskMachine.tla for the formal state-machine model.
 type AgentOutcome string
 
 const (
