@@ -170,6 +170,15 @@ func (h *HandoffState) RecordHandoff(taskID string) {
 	h.counts[taskID]++
 }
 
+// RecordAndCount atomically increments the handoff counter and returns the
+// post-increment value under a single lock acquisition.
+func (h *HandoffState) RecordAndCount(taskID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.counts[taskID]++
+	return h.counts[taskID]
+}
+
 // Count returns the current handoff count for a task. Safe to call from any
 // goroutine.
 func (h *HandoffState) Count(taskID string) int {

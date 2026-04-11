@@ -4,6 +4,7 @@ package orch_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -58,18 +59,22 @@ func TestBVV_SUP05_CircuitBreakerReset(t *testing.T) {
 
 // --- Watchdog CheckOnce tests ---
 
-// recordingStore wraps an orch.Store and enforces BVV-S-10 during watchdog
-// ticks: the watchdog must never transition a task to a TERMINAL status, and
-// must never call Assign. Non-terminal UpdateTask calls are allowed because
-// the watchdog's RestartSession path legitimately re-asserts StatusInProgress
-// via pool.SpawnSession.
+// recordingStore wraps an orch.Store and enforces BVV-S-02 (Terminal Status
+// Irreversibility, spec §12.2) during watchdog ticks: the watchdog must never
+// transition a task to a TERMINAL status, and must never call Assign.
+// Non-terminal UpdateTask calls are allowed because the watchdog's
+// RestartSession path legitimately re-asserts StatusInProgress via
+// pool.SpawnSession. The distinct BVV-S-10 rule (Watchdog-Retry
+// Non-Interference §12.10) is about the retry-vs-handoff budget and is
+// tested elsewhere via TestBVV_ERR11_SessionRestartNotRetry.
 type recordingStore struct {
 	inner            orch.Store
 	t                *testing.T
 	terminalAttempts int // number of forbidden terminal transitions observed
 	assignAttempts   int // number of forbidden Assign calls observed
 	mu               sync.Mutex
-	enforceS10       bool // flip on before the watchdog tick
+	enforceS02       bool  // flip on before the watchdog tick
+	failUpdateTask   error // when non-nil, UpdateTask returns it instead of calling inner
 }
 
 func (r *recordingStore) CreateTask(t *orch.Task) error { return r.inner.CreateTask(t) }
@@ -78,11 +83,15 @@ func (r *recordingStore) GetTask(id string) (*orch.Task, error) {
 }
 func (r *recordingStore) UpdateTask(t *orch.Task) error {
 	r.mu.Lock()
-	if r.enforceS10 && t.Status.Terminal() {
+	if r.enforceS02 && t.Status.Terminal() {
 		r.terminalAttempts++
-		r.t.Errorf("BVV-S-10 violation: watchdog called UpdateTask with terminal status %s on task %s", t.Status, t.ID)
+		r.t.Errorf("BVV-S-02 violation: watchdog called UpdateTask with terminal status %s on task %s", t.Status, t.ID)
 	}
+	injected := r.failUpdateTask
 	r.mu.Unlock()
+	if injected != nil {
+		return injected
+	}
 	return r.inner.UpdateTask(t)
 }
 func (r *recordingStore) ListTasks(labels ...string) ([]*orch.Task, error) {
@@ -93,9 +102,9 @@ func (r *recordingStore) ReadyTasks(labels ...string) ([]*orch.Task, error) {
 }
 func (r *recordingStore) Assign(taskID, workerName string) error {
 	r.mu.Lock()
-	if r.enforceS10 {
+	if r.enforceS02 {
 		r.assignAttempts++
-		r.t.Errorf("BVV-S-10 violation: watchdog called Assign for task %s", taskID)
+		r.t.Errorf("BVV-S-02 violation: watchdog called Assign for task %s", taskID)
 	}
 	r.mu.Unlock()
 	return r.inner.Assign(taskID, workerName)
@@ -135,7 +144,7 @@ func newWatchdogFixture(t *testing.T, maxHandoffs int) (*orch.Watchdog, *recordi
 	recStore := &recordingStore{
 		inner:      fsStore,
 		t:          t,
-		enforceS10: false, // off during setup; tests flip it on before calling CheckOnce
+		enforceS02: false, // off during setup; tests flip it on before calling CheckOnce
 	}
 
 	runID := "wd-test"
@@ -227,10 +236,10 @@ func TestBVV_ERR11_WatchdogDetectsDeadSession(t *testing.T) {
 	task := setupDeadSessionTask(t, rec, pool, "task-dead", "w-01")
 	_ = task
 
-	// Tighten BVV-S-10 enforcement: any UpdateTask/Assign call from here on
+	// Tighten BVV-S-02 enforcement: any UpdateTask/Assign call from here on
 	// is a test failure.
 	rec.mu.Lock()
-	rec.enforceS10 = true
+	rec.enforceS02 = true
 	rec.mu.Unlock()
 
 	require.NoError(t, wd.CheckOnce())
@@ -247,7 +256,7 @@ func TestBVV_ERR11a_WatchdogEmitsTaskHandoff(t *testing.T) {
 	setupDeadSessionTask(t, rec, pool, "task-handoff", "w-01")
 
 	rec.mu.Lock()
-	rec.enforceS10 = true
+	rec.enforceS02 = true
 	rec.mu.Unlock()
 
 	require.NoError(t, wd.CheckOnce())
@@ -274,7 +283,7 @@ func TestBVV_ERR11a_WatchdogTaskHandoffPayload(t *testing.T) {
 	setupDeadSessionTask(t, rec, pool, "task-payload", "w-01")
 
 	rec.mu.Lock()
-	rec.enforceS10 = true
+	rec.enforceS02 = true
 	rec.mu.Unlock()
 
 	require.NoError(t, wd.CheckOnce())
@@ -311,7 +320,7 @@ func TestBVV_L04_WatchdogStopsAtHandoffLimit(t *testing.T) {
 	setupDeadSessionTask(t, rec, pool, "task-limit", "w-01")
 
 	rec.mu.Lock()
-	rec.enforceS10 = true
+	rec.enforceS02 = true
 	rec.mu.Unlock()
 
 	// First tick: consumes the 1 allowed handoff, emits EventTaskHandoff,
@@ -349,22 +358,17 @@ func TestBVV_L04_WatchdogStopsAtHandoffLimit(t *testing.T) {
 	assert.Contains(t, limitEv.Detail, "branch=feature-x")
 }
 
-// TestBVV_S10_WatchdogNeverMutatesTaskStatus is the load-bearing safety test
-// for BVV-S-10: the watchdog must never transition a task to a TERMINAL
-// status (Completed/Failed/Blocked), and must never call Assign. Non-terminal
-// UpdateTask calls are allowed because the watchdog's RestartSession path
-// legitimately re-asserts StatusInProgress via pool.SpawnSession — that's a
-// no-op state transition from the spec's perspective.
-//
-// The recordingStore guards trip the test via t.Errorf if the forbidden
-// calls happen. After the ticks, we also verify the task is still in
-// StatusInProgress (not moved to any terminal state).
-func TestBVV_S10_WatchdogNeverMutatesTaskStatus(t *testing.T) {
+// TestBVV_S02_WatchdogNeverMutatesTaskStatus verifies BVV-S-02 (Terminal
+// Status Irreversibility §12.2): the watchdog must never transition a task
+// to terminal status and must never call Assign. Non-terminal UpdateTask
+// is allowed because RestartSession re-asserts StatusInProgress via
+// SpawnSession.
+func TestBVV_S02_WatchdogNeverMutatesTaskStatus(t *testing.T) {
 	wd, rec, pool, _ := newWatchdogFixture(t, 3)
-	setupDeadSessionTask(t, rec, pool, "task-s10", "w-01")
+	setupDeadSessionTask(t, rec, pool, "task-s02", "w-01")
 
 	rec.mu.Lock()
-	rec.enforceS10 = true
+	rec.enforceS02 = true
 	rec.mu.Unlock()
 
 	// Run several ticks so both the restart path AND any follow-up ticks
@@ -375,9 +379,9 @@ func TestBVV_S10_WatchdogNeverMutatesTaskStatus(t *testing.T) {
 	}
 
 	// Verify the task is still non-terminal. If the watchdog had violated
-	// S-10, the recording store would have already reported a test failure,
+	// S-02, the recording store would have already reported a test failure,
 	// but this is a belt-and-braces check on the observable end-state.
-	got, err := rec.inner.GetTask("task-s10")
+	got, err := rec.inner.GetTask("task-s02")
 	require.NoError(t, err)
 	assert.False(t, got.Status.Terminal(), "task must not be terminal after watchdog ticks; got %s", got.Status)
 
@@ -403,4 +407,62 @@ func readEvents(t *testing.T, logPath string) []orch.Event {
 		events = append(events, ev)
 	}
 	return events
+}
+
+// TestWatchdogCheckOnceAccumulatesGetTaskErrors verifies that a worker
+// pointing at a non-existent task surfaces ErrNotFound via CheckOnce's
+// return value instead of being silently skipped. An Active worker with
+// no tmux session causes IsAlive to return (false, nil) via the
+// isSessionNotFound path, so the GetTask error path is reached.
+func TestWatchdogCheckOnceAccumulatesGetTaskErrors(t *testing.T) {
+	wd, rec, _, _ := newWatchdogFixture(t, 3)
+
+	ghost := &orch.Worker{
+		Name:          "w-ghost",
+		Status:        orch.WorkerActive,
+		CurrentTaskID: "ghost-task",
+	}
+	require.NoError(t, rec.inner.CreateWorker(ghost))
+
+	err := wd.CheckOnce()
+	require.Error(t, err, "CheckOnce must surface per-worker errors, not silently skip")
+	assert.Contains(t, err.Error(), "get_task ghost-task",
+		"error must identify the failing operation and worker")
+	assert.Contains(t, err.Error(), "w-ghost",
+		"error must identify the worker the failure belongs to")
+
+	// S-02 invariant still holds even in the error path.
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	assert.Equal(t, 0, rec.terminalAttempts, "no terminal transitions even on error")
+	assert.Equal(t, 0, rec.assignAttempts, "no Assign calls even on error")
+}
+
+// TestWatchdogRunExitsOnContextCancel verifies the Run goroutine loop
+// returns when ctx is cancelled. The fixture has no active workers so
+// CheckOnce is a no-op per tick — this test exercises the loop structure.
+func TestWatchdogRunExitsOnContextCancel(t *testing.T) {
+	wd, _, _, _ := newWatchdogFixture(t, 3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Run in a goroutine; close the channel when it returns.
+	done := make(chan struct{})
+	go func() {
+		wd.Run(ctx)
+		close(done)
+	}()
+
+	// Let at least one tick fire (fixture Interval = 50ms).
+	time.Sleep(120 * time.Millisecond)
+
+	// Cancel and wait for Run to return.
+	cancel()
+
+	select {
+	case <-done:
+		// Run returned as expected.
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Watchdog.Run did not exit within 500ms of context cancellation")
+	}
 }

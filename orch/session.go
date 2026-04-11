@@ -79,9 +79,10 @@ func (wp *WorkerPool) Allocate() (*Worker, error) {
 //  6. Transition worker → active (WKR-05).
 //  7. Transition task → in_progress (LDG-14a).
 //
-// On any failure after step 5, the tmux session is killed via a defer-flag
-// pattern to prevent orphans. The task ID comes from the passed *Task
-// (task.ID) — no separate taskID parameter.
+// On any failure after step 5, a deferred rollback kills the tmux session
+// and (if step 6 landed) restores the worker's prior store record. The
+// task ID comes from the passed *Task (task.ID) — no separate taskID
+// parameter.
 func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleConfig, branch string) error {
 	if roleCfg.Preset == nil {
 		return fmt.Errorf("spawn: role %q has nil preset", task.Role())
@@ -91,8 +92,9 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 	}
 	sessionName := SessionName(wp.runID, workerName)
 
-	// 1. Resolve instruction and model.
-	_, model, err := ReadAgentPrompt(roleCfg.InstructionFile)
+	// 1. Resolve instruction body + model from the role's .md file. The body
+	// is the frontmatter-stripped content; the model comes from frontmatter.
+	body, model, err := ReadAgentPrompt(roleCfg.InstructionFile)
 	if err != nil {
 		return fmt.Errorf("spawn: read instruction: %w", err)
 	}
@@ -100,8 +102,10 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 	// 2. Build env — BVV-ITF-01 env-only identity, BVV-DSP-06 ORCH_TASK_ID.
 	env := BuildEnv(workerName, wp.runID, wp.repoPath, task.ID, branch, roleCfg.Preset.Env)
 
-	// 3. Build command — preset + instruction file + model override + maxTurns.
-	cmd := BuildCommand(roleCfg.Preset, roleCfg.InstructionFile, model, roleCfg.MaxTurns)
+	// 3. Build command — preset + instruction body + model override + maxTurns.
+	// The body is passed as the literal --append-system-prompt argument so the
+	// CLI uses it as the prompt string (not as a file path).
+	cmd := BuildCommand(roleCfg.Preset, body, model, roleCfg.MaxTurns)
 
 	// 4. Wrap with sidecar exit-code capture (BVV Appendix A).
 	shellCmd, err := BuildShellCommand(cmd, env, LogPath(wp.outputDir, task.ID), roleCfg.Preset.TextFilter)
@@ -115,11 +119,15 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 		return fmt.Errorf("spawn: tmux: %w", err)
 	}
 
-	// If any subsequent step fails, kill the tmux session to prevent orphans.
-	cleanupSession := true
+	var priorWorker *Worker // set after step 6 lands; drives the rollback
+	success := false
 	defer func() {
-		if cleanupSession {
-			_ = wp.tmux.KillSession(sessionName) // best-effort cleanup
+		if success {
+			return
+		}
+		_ = wp.tmux.KillSession(sessionName)
+		if priorWorker != nil {
+			_ = wp.store.UpdateWorker(priorWorker)
 		}
 	}()
 
@@ -128,23 +136,23 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 	if err != nil {
 		return fmt.Errorf("spawn: get worker: %w", err)
 	}
+	snap := *worker
 	worker.Status = WorkerActive
 	worker.CurrentTaskID = task.ID
 	worker.SessionStartedAt = time.Now()
 	if err := wp.store.UpdateWorker(worker); err != nil {
 		return fmt.Errorf("spawn: update worker: %w", err)
 	}
+	priorWorker = &snap
 
-	// 7. LDG-14a: task → in_progress. The dispatcher has already called
-	// Assign which set the task to StatusAssigned; SpawnSession completes
-	// the Assigned → InProgress transition once the tmux session is live.
+	// 7. LDG-14a: task → in_progress.
 	task.Status = StatusInProgress
 	task.UpdatedAt = time.Now()
 	if err := wp.store.UpdateTask(task); err != nil {
 		return fmt.Errorf("spawn: update task: %w", err)
 	}
 
-	cleanupSession = false // all steps succeeded — keep the session
+	success = true
 	return nil
 }
 

@@ -140,10 +140,9 @@ type Preset struct {
 	PromptFlag   string
 	AgentFlag    string
 	PluginFlag   string
-	// SystemPromptFlag injects the agent definition body as a system prompt
-	// (e.g. "--append-system-prompt"). SpawnSession reads the agent's .md file
-	// from the plugin directory, strips YAML frontmatter, and passes the content
-	// via this flag. Empty means no system prompt injection.
+	// SystemPromptFlag names the CLI flag that injects the role instruction
+	// body as a system prompt (e.g. "--append-system-prompt"). Empty means
+	// no injection. BuildCommand passes the body string as the flag value.
 	SystemPromptFlag string
 	// ModelFlag overrides the model selection (e.g. "--model"). The model name
 	// comes from the agent definition frontmatter. Empty means no override.

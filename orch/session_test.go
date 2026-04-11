@@ -3,6 +3,7 @@
 package orch_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -370,4 +371,51 @@ func waitForSidecar(t *testing.T, logPath string, timeout time.Duration) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("sidecar file %s.exitcode did not appear within %s", logPath, timeout)
+}
+
+var errInjectedUpdateTask = errors.New("injected UpdateTask failure")
+
+// TestSpawnSessionRevertsWorkerOnTaskUpdateFailure drives a step-7 failure
+// (UpdateTask after UpdateWorker landed) and asserts the worker snapshot
+// is restored. The load-bearing field is SessionStartedAt: Assign already
+// set Status=Active and CurrentTaskID, so only SessionStartedAt is
+// spawn-specific and must not persist if the task update fails.
+func TestSpawnSessionRevertsWorkerOnTaskUpdateFailure(t *testing.T) {
+	skipIfNoTmux(t)
+
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "out")
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+
+	inner, err := orch.NewFSStore(filepath.Join(dir, "ledger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = inner.Close() })
+
+	store := &recordingStore{inner: inner, t: t}
+
+	runID := "test-revert"
+	tmuxClient := newTestTmux(t, runID)
+	pool := orch.NewWorkerPool(store, tmuxClient, 4, runID, "/repo", outDir)
+
+	task, _ := createAssignedTask(t, store, "task-revert", "w-01")
+
+	preWorker, err := store.GetWorker("w-01")
+	require.NoError(t, err)
+	require.Equal(t, orch.WorkerActive, preWorker.Status)
+	require.Equal(t, "task-revert", preWorker.CurrentTaskID)
+	require.Zero(t, preWorker.SessionStartedAt)
+
+	store.mu.Lock()
+	store.failUpdateTask = errInjectedUpdateTask
+	store.mu.Unlock()
+
+	err = pool.SpawnSession("w-01", task, mockRoleConfig(t, "ok.sh"), "feature-x")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errInjectedUpdateTask)
+
+	got, err := store.GetWorker("w-01")
+	require.NoError(t, err)
+	assert.Equal(t, orch.WorkerActive, got.Status)
+	assert.Equal(t, "task-revert", got.CurrentTaskID)
+	assert.Zero(t, got.SessionStartedAt, "SessionStartedAt must be reverted")
 }

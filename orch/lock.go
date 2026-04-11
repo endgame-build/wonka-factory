@@ -92,7 +92,14 @@ func (l *LifecycleLock) Acquire(holderID, branch string) error {
 		if time.Since(existing.Timestamp) >= l.stalenessThreshold {
 			// Stale lock — remove and retry create.
 			// The next iteration's tryCreate will write a fresh timestamp.
-			_ = os.Remove(l.path)
+			// ErrNotExist is OK (a concurrent holder beat us to removing it);
+			// any other error (EACCES, EROFS, EIO) is a real FS failure that
+			// must not masquerade as generic lock contention. Surfacing it
+			// lets the operator distinguish "someone else holds the lock"
+			// from "I can't write to the lock directory".
+			if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove stale lock: %w", err)
+			}
 			continue
 		}
 

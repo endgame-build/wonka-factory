@@ -63,6 +63,8 @@ func TestBVV_ITF01_PresetEnvCannotShadowIdentity(t *testing.T) {
 // preset command with the system-prompt flag, model flag, and max-turns flag
 // in the canonical order. BVV-DSP-04 requires the command to be content-
 // independent — the test confirms nothing from agent output flows into args.
+// The instruction body is passed as the literal flag argument (not a path),
+// matching the Claude/codex/goose CLI contract.
 func TestBVV_DSP04_BuildCommandAssembly(t *testing.T) {
 	preset := &orch.Preset{
 		Name:             "claude",
@@ -72,12 +74,13 @@ func TestBVV_DSP04_BuildCommandAssembly(t *testing.T) {
 		ModelFlag:        "--model",
 	}
 
-	cmd := orch.BuildCommand(preset, "/path/to/builder.md", "opus", 20)
+	body := "You are a builder agent.\nWrite code."
+	cmd := orch.BuildCommand(preset, body, "opus", 20)
 
 	assert.Equal(t, []string{
 		"claude",
 		"-p", "--verbose",
-		"--append-system-prompt", "/path/to/builder.md",
+		"--append-system-prompt", body,
 		"--model", "opus",
 		"--max-turns", "20",
 	}, cmd)
@@ -92,11 +95,11 @@ func TestBVV_DSP04_BuildCommandOmitsEmptyFlags(t *testing.T) {
 		SystemPromptFlag: "--append-system-prompt",
 	}
 
-	cmd := orch.BuildCommand(preset, "/path/to/role.md", "", 0)
+	cmd := orch.BuildCommand(preset, "You are a builder.", "", 0)
 
 	assert.Equal(t, []string{
 		"claude",
-		"--append-system-prompt", "/path/to/role.md",
+		"--append-system-prompt", "You are a builder.",
 	}, cmd)
 	for _, arg := range cmd {
 		assert.NotEqual(t, "--model", arg, "ModelFlag empty → no --model")
@@ -104,9 +107,10 @@ func TestBVV_DSP04_BuildCommandOmitsEmptyFlags(t *testing.T) {
 	}
 }
 
-// TestBVV_DSP04_BuildCommandOmitsSystemPromptWhenPathEmpty verifies that a
-// role with no instruction file falls through to preset defaults.
-func TestBVV_DSP04_BuildCommandOmitsSystemPromptWhenPathEmpty(t *testing.T) {
+// TestBVV_DSP04_BuildCommandOmitsSystemPromptWhenBodyEmpty verifies that a
+// role with no instruction body (missing or empty .md file) falls through to
+// preset defaults without appending the system-prompt flag.
+func TestBVV_DSP04_BuildCommandOmitsSystemPromptWhenBodyEmpty(t *testing.T) {
 	preset := &orch.Preset{
 		Command:          "claude",
 		SystemPromptFlag: "--append-system-prompt",

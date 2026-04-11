@@ -190,7 +190,10 @@ func ReadExitCode(logPath string) (int, error) {
 	}
 	code, err := strconv.Atoi(s)
 	if err != nil {
-		return 0, fmt.Errorf("parse exit code %q: %w", s, err)
+		// Return -1, not 0: 0 means success in BVV-DSP-04, so pairing it
+		// with an error would let log-and-continue callers mark a
+		// corrupted sidecar as task-complete.
+		return -1, fmt.Errorf("parse exit code %q: %w", s, err)
 	}
 	return code, nil
 }
