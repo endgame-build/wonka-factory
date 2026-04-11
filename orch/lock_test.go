@@ -50,6 +50,40 @@ func TestBVV_S01_ExclusiveLock(t *testing.T) {
 	assert.ErrorIs(t, err, orch.ErrLockContention)
 }
 
+// TestBVV_S01_PerBranchScoping verifies BVV-S-01's "per-branch" qualifier:
+// two lifecycle locks at distinct paths (one per branch) must both acquire
+// without contending with each other. This pins the "two branches = two
+// locks" property — a regression where the lock accidentally ignored the
+// path-branch relationship (e.g., a global singleton) would trip this test
+// even though the single-path exclusion test above would still pass.
+func TestBVV_S01_PerBranchScoping(t *testing.T) {
+	dir := t.TempDir()
+	mkLock := func(branch string) *orch.LifecycleLock {
+		return orch.NewLifecycleLock(orch.LockConfig{
+			Path:               filepath.Join(dir, ".wonka."+branch+".lock"),
+			StalenessThreshold: 2 * time.Second,
+			RetryCount:         0,
+			RetryDelay:         1 * time.Millisecond,
+		})
+	}
+
+	lockA := mkLock("feature-a")
+	lockB := mkLock("feature-b")
+
+	require.NoError(t, lockA.Acquire("holder-a", "feature-a"))
+	defer lockA.Release() //nolint:errcheck // test cleanup
+
+	// lockB is at a different path — must acquire even though lockA is held.
+	require.NoError(t, lockB.Acquire("holder-b", "feature-b"))
+	defer lockB.Release() //nolint:errcheck // test cleanup
+
+	// Sanity: a second lock at lockA's path still contends.
+	lockAContender := mkLock("feature-a")
+	err := lockAContender.Acquire("intruder", "feature-a")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, orch.ErrLockContention, "same-branch second acquire must still fail")
+}
+
 // TestBVV_ERR06_StaleLockRecovery verifies BVV-ERR-06: stale locks from dead
 // orchestrator processes can be reclaimed by a resume attempt. Formerly OPS-11.
 func TestBVV_ERR06_StaleLockRecovery(t *testing.T) {

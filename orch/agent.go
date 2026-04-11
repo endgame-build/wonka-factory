@@ -1,7 +1,6 @@
 package orch
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -75,9 +74,14 @@ func LogPath(runDir, taskID string) string {
 // and returns the body (suitable for --append-system-prompt injection) plus
 // the model name from the frontmatter (suitable for --model).
 //
-// Returns empty strings (no error) when the file doesn't exist — the agent
-// runs without custom instructions, which is acceptable for generic presets
-// that carry their own defaults.
+// An empty instructionFile short-circuits with ("", "", nil) — the caller
+// explicitly opted out of custom instructions, and generic presets that
+// carry their own defaults can run as-is. A non-empty path that does NOT
+// exist is a misconfiguration (typo, renamed file, missing deploy), so we
+// return the os.ErrNotExist wrapped with context. Silently defaulting to
+// an empty body in that case would launch the agent with no role prompt
+// and let BVV-DSP-04 mark the task complete on a normal exit — by the time
+// the mistake surfaces the terminal state is irreversible.
 //
 // BVV change from fork: the signature takes the full instructionFile path
 // directly (from RoleConfig.InstructionFile), not a (pluginDir, agentID)
@@ -89,9 +93,6 @@ func ReadAgentPrompt(instructionFile string) (body, model string, err error) {
 	}
 	data, err := os.ReadFile(instructionFile)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", "", nil
-		}
 		return "", "", fmt.Errorf("read agent prompt %s: %w", instructionFile, err)
 	}
 

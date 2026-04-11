@@ -176,7 +176,7 @@ type LifecycleConfig struct {
 	MaxRetries   int                   // BVV-ERR-01
 	MaxHandoffs  int                   // BVV-DSP-14, BVV-L-04
 	BaseTimeout  time.Duration         // BVV-ERR-02a
-	Lock         LockConfig            // per-branch exclusive lifecycle lock; see lock.go (Phase 3)
+	Lock         LockConfig            // per-branch exclusive lifecycle lock; see lock.go
 	Roles        map[string]RoleConfig // role tag → binding
 }
 

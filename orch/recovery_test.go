@@ -130,9 +130,9 @@ func TestBVV_ERR04_GapToleranceOne(t *testing.T) {
 	assert.True(t, gt.IncrementAndCheck("t1"), "tolerance=1 should abort on first gap")
 }
 
-// TestBVV_S7_GapBoundInvariant verifies S7: gaps < tolerance while the
-// lifecycle is running.
-func TestBVV_S7_GapBoundInvariant(t *testing.T) {
+// TestBVV_S07_GapBoundInvariant verifies BVV-S-07 (Bounded Degradation):
+// gaps < tolerance while the lifecycle is running.
+func TestBVV_S07_GapBoundInvariant(t *testing.T) {
 	gt := orch.NewGapTracker(3)
 
 	gt.IncrementAndCheck("t1")
@@ -146,12 +146,19 @@ func TestBVV_S7_GapBoundInvariant(t *testing.T) {
 }
 
 // TestBVV_ERR05_GapTrackerSetGaps verifies SetGaps restores state from a
-// prior session's event log (Phase 5 Resume path).
+// prior session's event log. The gap count is derived from the slice
+// length — the single-source-of-truth contract — and the caller's slice
+// is cloned so post-Resume IncrementAndCheck can't alias into it.
 func TestBVV_ERR05_GapTrackerSetGaps(t *testing.T) {
 	gt := orch.NewGapTracker(5)
-	gt.SetGaps(3, []string{"t1", "t2", "t3"})
+	callerSlice := []string{"t1", "t2", "t3"}
+	gt.SetGaps(callerSlice)
 	assert.Equal(t, 3, gt.Count())
 	assert.Equal(t, []string{"t1", "t2", "t3"}, gt.TaskIDs())
+
+	// Mutating the caller's slice after SetGaps must not affect the tracker.
+	callerSlice[0] = "mutated"
+	assert.Equal(t, "t1", gt.TaskIDs()[0], "SetGaps must clone the caller's slice")
 
 	// Next gap should make it 4 (not reset).
 	abort := gt.IncrementAndCheck("t4")
@@ -167,9 +174,9 @@ func TestBVV_L04_HandoffStateCanHandoff(t *testing.T) {
 	h := orch.NewHandoffState(2)
 
 	assert.True(t, h.CanHandoff("task-1"))
-	h.RecordHandoff("task-1")
+	h.RecordHandoffUnchecked("task-1")
 	assert.True(t, h.CanHandoff("task-1"))
-	h.RecordHandoff("task-1")
+	h.RecordHandoffUnchecked("task-1")
 	assert.False(t, h.CanHandoff("task-1"), "at limit, further handoffs must be rejected")
 }
 
@@ -181,9 +188,9 @@ func TestBVV_L04_HandoffStateCanHandoff(t *testing.T) {
 func TestBVV_L04_HandoffStateTryRecord(t *testing.T) {
 	h := orch.NewHandoffState(10)
 
-	h.RecordHandoff("task-a")
-	h.RecordHandoff("task-a")
-	h.RecordHandoff("task-b")
+	h.RecordHandoffUnchecked("task-a")
+	h.RecordHandoffUnchecked("task-a")
+	h.RecordHandoffUnchecked("task-b")
 
 	assert.Equal(t, 2, h.Count("task-a"))
 	assert.Equal(t, 1, h.Count("task-b"))
@@ -271,10 +278,13 @@ func TestBVV_L04_HandoffStateZeroLimit(t *testing.T) {
 }
 
 // TestBVV_L04_HandoffStateConcurrentWrites stress-tests the mutex contract:
-// two goroutines each call RecordHandoff N times on the same task ID. The
-// final count must be exactly 2N. This test is load-bearing for the BVV
-// ownership contract that dispatcher (exit-3 tick) and watchdog (dead-session
-// tick) are both writers — running under -race catches mutex regressions.
+// two goroutines each call RecordHandoffUnchecked N times on the same task
+// ID. The final count must be exactly 2N. This test is load-bearing for
+// the BVV ownership contract that dispatcher (exit-3 tick) and watchdog
+// (dead-session tick) are both writers — running under -race catches mutex
+// regressions. We exercise RecordHandoffUnchecked directly because
+// TryRecord would stop at the configured maxLimit; this test specifically
+// targets the mutex, not the budget check.
 func TestBVV_L04_HandoffStateConcurrentWrites(t *testing.T) {
 	h := orch.NewHandoffState(10000)
 	const n = 500
@@ -285,14 +295,14 @@ func TestBVV_L04_HandoffStateConcurrentWrites(t *testing.T) {
 	worker := func() {
 		defer wg.Done()
 		for range n {
-			h.RecordHandoff("task-hot")
+			h.RecordHandoffUnchecked("task-hot")
 		}
 	}
 	go worker()
 	go worker()
 	wg.Wait()
 
-	assert.Equal(t, 2*n, h.Count("task-hot"), "concurrent RecordHandoff must not lose increments")
+	assert.Equal(t, 2*n, h.Count("task-hot"), "concurrent RecordHandoffUnchecked must not lose increments")
 }
 
 // TestBVV_S02a_HandoffStateReset verifies BVV-S-02a: human re-opening a
@@ -301,9 +311,9 @@ func TestBVV_L04_HandoffStateConcurrentWrites(t *testing.T) {
 func TestBVV_S02a_HandoffStateReset(t *testing.T) {
 	h := orch.NewHandoffState(3)
 
-	h.RecordHandoff("task-reopened")
-	h.RecordHandoff("task-reopened")
-	h.RecordHandoff("task-untouched")
+	h.RecordHandoffUnchecked("task-reopened")
+	h.RecordHandoffUnchecked("task-reopened")
+	h.RecordHandoffUnchecked("task-untouched")
 	require.Equal(t, 2, h.Count("task-reopened"))
 	require.Equal(t, 1, h.Count("task-untouched"))
 
@@ -315,18 +325,18 @@ func TestBVV_S02a_HandoffStateReset(t *testing.T) {
 }
 
 // TestBVV_ERR11a_HandoffStateSetCountsNil verifies that SetCounts(nil) is
-// safe: the internal map is normalised to empty (not left nil), so the next
-// RecordHandoff call doesn't panic on a nil-map write. This covers the
+// safe: the internal map is normalised to empty (not left nil), so the
+// next mutation call doesn't panic on a nil-map write. This covers the
 // normalisation branch introduced when SetCounts was refactored to use
 // maps.Clone (which returns nil on nil input).
 func TestBVV_ERR11a_HandoffStateSetCountsNil(t *testing.T) {
 	h := orch.NewHandoffState(5)
 	h.SetCounts(nil)
 
-	// Internal map must be non-nil — a subsequent RecordHandoff must not
-	// panic. Assertion is by behavior, not by inspection.
+	// Internal map must be non-nil — a subsequent RecordHandoffUnchecked
+	// must not panic. Assertion is by behavior, not by inspection.
 	assert.NotPanics(t, func() {
-		h.RecordHandoff("task-after-nil-reset")
+		h.RecordHandoffUnchecked("task-after-nil-reset")
 	})
 	assert.Equal(t, 1, h.Count("task-after-nil-reset"))
 }
@@ -347,6 +357,6 @@ func TestBVV_ERR11a_HandoffStateSetCounts(t *testing.T) {
 	assert.True(t, h.CanHandoff("task-b"), "exactly at limit-1 after replay")
 
 	// Next handoff on task-b hits the limit.
-	h.RecordHandoff("task-b")
+	h.RecordHandoffUnchecked("task-b")
 	assert.False(t, h.CanHandoff("task-b"), "replayed count + new increment hit limit")
 }

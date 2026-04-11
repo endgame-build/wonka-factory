@@ -220,8 +220,8 @@ func NewHandoffState(maxHandoffs int) *HandoffState
 // TryRecord is the ONLY mutation API safe for production writers. It
 // collapses the budget check and counter increment into one lock
 // acquisition. Dispatcher (exit-3) and watchdog (dead-session) are the
-// two writers; using separate CanHandoff + RecordHandoff calls under
-// two locks lets both pass the check and both increment, violating
+// two writers; using separate CanHandoff + RecordHandoffUnchecked calls
+// under two locks lets both pass the check and both increment, violating
 // BVV-L-04. TryRecord closes that race.
 //
 // Returns (post-increment count, true) on success; (current count, false)
@@ -232,10 +232,11 @@ func (h *HandoffState) TryRecord(taskID string) (count int, ok bool)
 // Never use it in a check-then-mutate sequence — use TryRecord instead.
 func (h *HandoffState) CanHandoff(taskID string) bool
 
-// RecordHandoff is a bypass-the-limit increment used ONLY by Resume
-// replay and by test fixtures that pre-seed state. Production paths
-// must use TryRecord.
-func (h *HandoffState) RecordHandoff(taskID string)
+// RecordHandoffUnchecked is a bypass-the-limit increment used ONLY by
+// Resume replay and by test fixtures that pre-seed state. The "Unchecked"
+// suffix is a signal at every call site — production paths must use
+// TryRecord.
+func (h *HandoffState) RecordHandoffUnchecked(taskID string)
 
 func (h *HandoffState) Count(taskID string) int
 func (h *HandoffState) Reset(taskID string) // for human re-open (BVV-S-02a)
@@ -398,10 +399,11 @@ processOutcome(o):
 
   case Handoff:  // exit code 3
     // BVV-L-04: atomic check-and-increment. Do NOT split into
-    // CanHandoff + RecordHandoff — the watchdog is the other writer
-    // to HandoffState, and two separate lock acquisitions let both
-    // goroutines pass the budget check and both increment, exceeding
-    // maxLimit. TryRecord enforces the invariant under a single lock.
+    // CanHandoff + RecordHandoffUnchecked — the watchdog is the other
+    // writer to HandoffState, and two separate lock acquisitions let
+    // both goroutines pass the budget check and both increment,
+    // exceeding maxLimit. TryRecord enforces the invariant under a
+    // single lock.
     count, ok := handoffs.TryRecord(task.ID)
     if ok:
       pool.RestartSession(worker, task, roleCfg)

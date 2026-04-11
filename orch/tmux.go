@@ -184,9 +184,9 @@ func BuildShellCommand(cmd []string, env map[string]string, logPath, textFilter 
 // Returns -1 if the file does not exist (agent was killed before bash wrote it).
 // Callers must treat -1 as "unknown" — distinct from exit 0 (success).
 //
-// BVV-DSP-04: the orchestrator determines agent outcome solely from the exit
-// code. An unknown exit code (-1) is treated as failure by the dispatcher
-// (conservative default; Phase 4 will wire this into the outcome switch).
+// BVV-DSP-04: the orchestrator determines agent outcome solely from the
+// exit code. -1 must never be treated as success — it is indistinguishable
+// from a killed agent, so the dispatcher conservatively maps it to failure.
 func ReadExitCode(logPath string) (int, error) {
 	data, err := os.ReadFile(logPath + ".exitcode")
 	if err != nil {

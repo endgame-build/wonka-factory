@@ -3,6 +3,7 @@ package orch
 import (
 	"maps"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 )
@@ -14,7 +15,9 @@ type RetryConfig struct {
 }
 
 // DefaultRetryConfig returns sensible defaults for CLI flag binding.
-// MaxRetries=2 and BaseTimeout=30m match the wonka defaults in Taskfile/CLI.
+// BaseTimeout = 30m matches the BVV-ERR-02a RECOMMENDED default.
+// MaxRetries = 2 reflects the BVV-ERR-01 expectation of bounded retries
+// without runaway reassignment loops.
 func DefaultRetryConfig() RetryConfig {
 	return RetryConfig{
 		MaxRetries:  2,
@@ -80,7 +83,7 @@ func RetryJitter(d time.Duration) time.Duration {
 }
 
 // GapTracker tracks non-critical task failures and enforces the gap tolerance
-// bound (BVV-ERR-03, BVV-ERR-04, BVV-ERR-05, S7).
+// bound (BVV-ERR-03, BVV-ERR-04, BVV-ERR-05, BVV-S-07).
 //
 // NOT thread-safe — the dispatcher's outcome-processing step is the sole
 // writer, and that runs serially on the dispatch goroutine via the outcomes
@@ -115,12 +118,15 @@ func (gt *GapTracker) TaskIDs() []string {
 	return gt.taskIDs
 }
 
-// SetGaps sets the gap count and task-ID list directly. Used by Phase 5
-// Resume to restore state from a prior session's event log
-// (BVV-ERR-05 monotonic across sessions).
-func (gt *GapTracker) SetGaps(count int, taskIDs []string) {
-	gt.gaps = count
-	gt.taskIDs = taskIDs
+// SetGaps restores the tracker from a prior session's event-log replay
+// (BVV-ERR-05 monotonic across sessions). The gap count is derived from
+// len(taskIDs) — a single source of truth eliminates the class of replay
+// bugs where count and the slice disagree. The caller's slice is cloned
+// so a post-Resume IncrementAndCheck append cannot alias into memory the
+// caller still holds.
+func (gt *GapTracker) SetGaps(taskIDs []string) {
+	gt.taskIDs = slices.Clone(taskIDs)
+	gt.gaps = len(taskIDs)
 }
 
 // HandoffState tracks per-task handoff counters for BVV-L-04 (max handoffs)
@@ -163,11 +169,12 @@ func (h *HandoffState) CanHandoff(taskID string) bool {
 	return h.counts[taskID] < h.maxLimit
 }
 
-// RecordHandoff increments the handoff counter for the given task without
-// enforcing the limit. Intended for test fixtures and the Phase 5 Resume
-// replay path. Production writers (dispatcher exit-3 / watchdog dead-session)
-// MUST use TryRecord to enforce BVV-L-04 atomically.
-func (h *HandoffState) RecordHandoff(taskID string) {
+// RecordHandoffUnchecked increments without enforcing BVV-L-04. The
+// "Unchecked" suffix flags every call site: production writers (dispatcher
+// exit-3, watchdog dead-session) MUST use TryRecord so the check and
+// increment happen atomically. Only Resume replay and test fixtures may
+// bypass the budget.
+func (h *HandoffState) RecordHandoffUnchecked(taskID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.counts[taskID]++
@@ -217,8 +224,8 @@ func (h *HandoffState) Reset(taskID string) {
 // insurance against contract drift rather than as a correctness requirement.
 // The lock cost is negligible on the one-shot init path.
 //
-// A nil input is normalised to an empty map so subsequent RecordHandoff
-// calls (which mutate the map in place) don't panic.
+// A nil input is normalised to an empty map so subsequent in-place
+// mutation calls (TryRecord, RecordHandoffUnchecked) don't panic.
 func (h *HandoffState) SetCounts(counts map[string]int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

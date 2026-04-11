@@ -43,10 +43,15 @@ func SetupSignalHandler() (context.Context, context.CancelFunc) {
 //
 // BVV-ERR-10a interaction: this is the INVOLUNTARY release path. The lock
 // is released unconditionally, without the "all sessions drained" check
-// that the dispatcher enforces via a Phase 5 runtime invariant. A signal
-// mid-run legitimately leaves sessions alive, and the caller's
-// responsibility is to cancel the dispatch context first so goroutines can
-// exit cleanly before Cleanup runs.
+// that the dispatcher enforces (AssertLifecycleReleaseDrained at the
+// voluntary release site, under build tag verify). A signal mid-run
+// legitimately leaves sessions alive, and the caller's responsibility is
+// to cancel the dispatch context first so goroutines can exit cleanly
+// before Cleanup runs.
+//
+// Every shutdown action is best-effort and logged to stderr: a silent
+// KillServer failure can leave zombie tmux sessions that race the next
+// run and double-commit against the ledger.
 //
 // No shutdown event is emitted. BVV's 17 event kinds don't include one —
 // the last entry in the log is whatever the dispatcher emitted before the
@@ -54,13 +59,19 @@ func SetupSignalHandler() (context.Context, context.CancelFunc) {
 // complete; it was interrupted).
 func Cleanup(tmux *TmuxClient, lock *LifecycleLock, log *EventLog, store Store) {
 	if tmux != nil {
-		_ = tmux.KillServer()
+		if err := tmux.KillServer(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: tmux.KillServer failed (sessions may be leaked): %v\n", err)
+		}
 	}
 	if lock != nil {
-		_ = lock.Release()
+		if err := lock.Release(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: lock.Release failed (stale lock may remain): %v\n", err)
+		}
 	}
 	if log != nil {
-		_ = log.Close()
+		if err := log.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: event log Close failed: %v\n", err)
+		}
 	}
 	if store != nil {
 		if err := store.Close(); err != nil {
