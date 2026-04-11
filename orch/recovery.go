@@ -126,17 +126,13 @@ func (gt *GapTracker) SetGaps(count int, taskIDs []string) {
 // HandoffState tracks per-task handoff counters for BVV-L-04 (max handoffs)
 // and BVV-ERR-11a (watchdog-triggered handoff). Thread-safe via sync.Mutex —
 // concurrent writers are the dispatcher tick (exit-code-3 handoff processing)
-// and the watchdog goroutine (dead-session restart). Both paths increment the
-// same counter; BVV-L-04's limit applies to the combined count.
+// and the watchdog goroutine (dead-session restart). Both paths must use
+// TryRecord so the BVV-L-04 limit applies to the combined count atomically.
 //
 // Counters are NOT reset on retry (BVV-L-04: handoff counter monotonic within
 // lifecycle). They reset only on human re-open, detected by Phase 5 Resume
 // scanning the event log for terminal-then-open task transitions and calling
 // Reset(taskID) during the single-goroutine Resume phase.
-//
-// SetCounts is called once by Phase 5 Resume before the dispatcher and
-// watchdog goroutines start, so it doesn't need to hold the mutex (no
-// concurrent access at init time).
 type HandoffState struct {
 	mu       sync.Mutex
 	counts   map[string]int
@@ -144,8 +140,8 @@ type HandoffState struct {
 }
 
 // NewHandoffState creates a handoff tracker with the given per-task limit.
-// A limit of 0 means "no handoffs allowed" — CanHandoff returns false on the
-// first call.
+// A limit of 0 means "no handoffs allowed" — TryRecord refuses on the first
+// call and CanHandoff returns false.
 func NewHandoffState(maxHandoffs int) *HandoffState {
 	return &HandoffState{
 		counts:   make(map[string]int),
@@ -155,28 +151,47 @@ func NewHandoffState(maxHandoffs int) *HandoffState {
 
 // CanHandoff reports whether the given task has handoff budget remaining.
 // Returns true when the current count is strictly less than maxLimit.
+//
+// WARNING: this is a non-atomic read. Callers that intend to act on the
+// result (i.e. record a handoff) MUST use TryRecord instead — otherwise
+// two writers can both observe budget remaining and both increment,
+// overshooting maxLimit and violating BVV-L-04. CanHandoff is safe only
+// for diagnostic/tests and for purely read-only query paths.
 func (h *HandoffState) CanHandoff(taskID string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.counts[taskID] < h.maxLimit
 }
 
-// RecordHandoff increments the handoff counter for the given task. Called by
-// both the dispatcher (exit-code-3 handoff processing) and the watchdog
-// (dead-session restart) — both paths burn the same budget.
+// RecordHandoff increments the handoff counter for the given task without
+// enforcing the limit. Intended for test fixtures and the Phase 5 Resume
+// replay path. Production writers (dispatcher exit-3 / watchdog dead-session)
+// MUST use TryRecord to enforce BVV-L-04 atomically.
 func (h *HandoffState) RecordHandoff(taskID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.counts[taskID]++
 }
 
-// RecordAndCount atomically increments the handoff counter and returns the
-// post-increment value under a single lock acquisition.
-func (h *HandoffState) RecordAndCount(taskID string) int {
+// TryRecord atomically checks the handoff budget and, if budget remains,
+// increments the counter under a single mutex acquisition. This is the
+// only handoff-mutation API safe to call from the two production writers
+// (dispatcher exit-3 + watchdog dead-session) — splitting the check and
+// the increment across two lock acquisitions lets both writers pass the
+// check and both increment, violating BVV-L-04.
+//
+// Returns (post-increment count, true) on success; (current count
+// unchanged, false) when count >= maxLimit. On false, callers must not
+// proceed with a restart — per BVV-ERR-11a the watchdog emits
+// EventHandoffLimitReached and the dispatcher fails the task next tick.
+func (h *HandoffState) TryRecord(taskID string) (count int, ok bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.counts[taskID] >= h.maxLimit {
+		return h.counts[taskID], false
+	}
 	h.counts[taskID]++
-	return h.counts[taskID]
+	return h.counts[taskID], true
 }
 
 // Count returns the current handoff count for a task. Safe to call from any

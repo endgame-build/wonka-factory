@@ -5,6 +5,7 @@ package orch_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -37,7 +38,17 @@ func TestBVV_ERR09_SignalCancelsContext(t *testing.T) {
 // real SIGTERM delivered to this process cancels the returned context.
 // SIGTERM (not SIGINT) to avoid interfering with `go test`'s own SIGINT
 // handling on some CI configurations.
+//
+// Skipped on Windows: SIGTERM is not reliably deliverable to a Go test
+// process on Windows (os.Process.Signal rejects non-Kill signals on that
+// platform), so this end-to-end path is POSIX-only. The programmatic-
+// cancel path in TestBVV_ERR09_SignalCancelsContext still runs everywhere
+// and exercises SetupSignalHandler's context plumbing.
 func TestBVV_ERR09_RealSignalCancelsContext(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("SIGTERM-via-os.Process.Signal is POSIX-only; programmatic cancel is covered elsewhere")
+	}
+
 	ctx, cancel := orch.SetupSignalHandler()
 	defer cancel()
 

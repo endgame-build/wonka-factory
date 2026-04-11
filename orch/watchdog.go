@@ -12,11 +12,21 @@ import (
 // CircuitBreaker tracks rapid failures and trips when the threshold is
 // reached (BVV SUP-05, SUP-06). Thread-safe — written by the watchdog
 // goroutine, read by the dispatch loop when it checks CBTripped.
+//
+// "Rapid failure" semantics (SUP-06): a failure counts when the session
+// lived strictly less than `window`. Once the global count of such
+// failures within the window reaches `threshold`, the breaker trips.
+//
+// Per-worker failure history is retained purely so that expired samples
+// can be pruned from the map on each recorded failure; the threshold
+// itself applies to the TOTAL across all workers in the window, not to
+// a per-worker consecutive streak. A single unhealthy worker can trip
+// the breaker by itself, and a mix of worker failures aggregates.
 type CircuitBreaker struct {
 	mu        sync.Mutex
-	threshold int                    // consecutive rapid failures before trip (SUP-05: 3)
+	threshold int                    // total rapid failures in window before trip (SUP-05: 3)
 	window    time.Duration          // rapid failure window (SUP-06: 60s)
-	failures  map[string][]time.Time // workerName → failure timestamps
+	failures  map[string][]time.Time // workerName → failure timestamps (pruned to window)
 	tripped   bool
 }
 
@@ -234,8 +244,10 @@ func (w *Watchdog) CheckOnce() error {
 			continue
 		}
 
-		// BVV-L-04: check handoff budget BEFORE any mutation or event.
-		if !w.handoffs.CanHandoff(task.ID) {
+		// BVV-L-04 / BVV-S-10: atomic check-and-increment against the
+		// dispatcher's exit-3 path; see TryRecord docstring.
+		count, ok := w.handoffs.TryRecord(task.ID)
+		if !ok {
 			// Budget exhausted. Emit the signal event and leave the task in
 			// place. The dispatcher will observe EventHandoffLimitReached on
 			// its next tick and convert the task to a failure (BVV-ERR-11a).
@@ -253,9 +265,6 @@ func (w *Watchdog) CheckOnce() error {
 			})
 			continue
 		}
-
-		// BVV-S-10: burn handoff budget, not retry budget.
-		count := w.handoffs.RecordAndCount(task.ID)
 
 		_ = emitAndNotify(w.log, w.progress, Event{
 			Kind:    EventTaskHandoff,

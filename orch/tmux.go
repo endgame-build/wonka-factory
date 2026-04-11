@@ -149,7 +149,18 @@ func BuildShellCommand(cmd []string, env map[string]string, logPath, textFilter 
 			// Stream-json mode: tee raw JSONL to .stdout, pipe through jq to .txt.
 			// PIPESTATUS[0] captures the agent's exit code, not jq's.
 			// Note: PIPESTATUS is bash-specific; this works because CreateSession uses "bash -c".
+			//
+			// The agent's stderr is redirected to a .stderr sidecar BEFORE
+			// the stdout pipeline. Without this, JSONL-emitting agents would
+			// silently drop diagnostics (stack traces, auth errors, rate
+			// limits) because only stdout feeds tee/jq. The non-filter branch
+			// below already captures stderr via 2>&1; this restores parity.
+			// jq's own stderr is still routed to /dev/null so parse errors
+			// don't pollute the tmux pane.
 			textPath := strings.TrimSuffix(logPath, ".stdout") + ".txt"
+			stderrPath := strings.TrimSuffix(logPath, ".stdout") + ".stderr"
+			sb.WriteString(" 2> ")
+			sb.WriteString(shellQuote(stderrPath))
 			sb.WriteString(" | tee ")
 			sb.WriteString(shellQuote(logPath))
 			sb.WriteString(" | jq -r --unbuffered ")
