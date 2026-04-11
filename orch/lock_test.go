@@ -3,6 +3,7 @@
 package orch_test
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -134,16 +135,27 @@ func TestBVV_L02_RefreshPreventsStaleness(t *testing.T) {
 	defer lock.Release() //nolint:errcheck // test cleanup
 
 	time.Sleep(10 * time.Millisecond)
+
+	// Capture the refresh boundary. The file's Timestamp MUST be at or
+	// after this instant, proving Refresh actually re-wrote it instead of
+	// silently leaving the stale Acquire timestamp in place.
+	beforeRefresh := time.Now()
 	require.NoError(t, lock.Refresh("feature-x"))
 
 	data, err := os.ReadFile(lock.Path())
 	require.NoError(t, err)
-	assert.Contains(t, string(data), "feature-x")
-	assert.Contains(t, string(data), "holder")
-	// Timestamp must be within the last second (fresh).
+
+	// A silent no-op Refresh would leave Timestamp at the Acquire value
+	// (10ms+ earlier than beforeRefresh), failing the first assertion.
 	var c orch.LockContent
-	require.NoError(t, (func() error { return nil })()) // linter placeholder
-	_ = c
+	require.NoError(t, json.Unmarshal(data, &c))
+	assert.Equal(t, "holder", c.Holder)
+	assert.Equal(t, "feature-x", c.Branch)
+	assert.False(t, c.Timestamp.Before(beforeRefresh),
+		"Refresh must advance Timestamp to at least the call instant; got %s, wanted >= %s",
+		c.Timestamp, beforeRefresh)
+	assert.Less(t, time.Since(c.Timestamp), 1*time.Second,
+		"Refresh Timestamp must be within 1s of now; got age %s", time.Since(c.Timestamp))
 }
 
 // TestBVV_ERR06_StaleLockRemoveErrorSurfaces verifies that a real filesystem

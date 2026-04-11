@@ -126,10 +126,10 @@ func (r *recordingStore) GetDeps(taskID string) ([]string, error) {
 func (r *recordingStore) Close() error { return r.inner.Close() }
 
 // newWatchdogFixture builds a WorkerPool + recording Store + HandoffState +
-// mock EventLog, all wired to a single test lifecycle. Returns the watchdog,
-// the recording store (for assertion), the worker pool (for direct manipulation),
-// and the event log path (for reading back emitted events).
-func newWatchdogFixture(t *testing.T, maxHandoffs int) (*orch.Watchdog, *recordingStore, *orch.WorkerPool, string) {
+// mock EventLog, all wired to a single test lifecycle. restartScript is the
+// mock agent the watchdog's role map points at — tests that need to witness
+// a live restart session pass "sleep.sh"; the rest pass "ok.sh".
+func newWatchdogFixture(t *testing.T, maxHandoffs int, restartScript string) (*orch.Watchdog, *recordingStore, *orch.WorkerPool, string) {
 	t.Helper()
 	skipIfNoTmux(t)
 
@@ -166,7 +166,7 @@ func newWatchdogFixture(t *testing.T, maxHandoffs int) (*orch.Watchdog, *recordi
 		recStore,
 		eventLog,
 		map[string]orch.RoleConfig{
-			"builder": mockRoleConfig(t, "ok.sh"),
+			"builder": mockRoleConfig(t, restartScript),
 		},
 		handoffs,
 		"feature-x",
@@ -215,44 +215,53 @@ func setupDeadSessionTask(t *testing.T, rec *recordingStore, pool *orch.WorkerPo
 	return fresh
 }
 
-func waitForSessionDead(t *testing.T, pool *orch.WorkerPool, workerName string, timeout time.Duration) {
+func waitForSessionLiveness(t *testing.T, pool *orch.WorkerPool, workerName string, want bool, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		alive, err := pool.IsAlive(workerName)
-		if err == nil && !alive {
+		if err == nil && alive == want {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("session for worker %s did not die within %s", workerName, timeout)
+	t.Fatalf("session for worker %s did not reach alive=%v within %s", workerName, want, timeout)
+}
+
+func waitForSessionDead(t *testing.T, pool *orch.WorkerPool, workerName string, timeout time.Duration) {
+	t.Helper()
+	waitForSessionLiveness(t, pool, workerName, false, timeout)
+}
+
+func waitForSessionAlive(t *testing.T, pool *orch.WorkerPool, workerName string, timeout time.Duration) {
+	t.Helper()
+	waitForSessionLiveness(t, pool, workerName, true, timeout)
 }
 
 // TestBVV_ERR11_WatchdogDetectsDeadSession verifies the watchdog detects a
-// dead tmux session and calls RestartSession through the pool. Success is
-// measured by a new tmux session appearing after CheckOnce.
+// dead tmux session and calls RestartSession. The tmux session name is
+// stable across restarts, so proof-of-restart requires witnessing IsAlive
+// flip to true during the sleep.sh lifetime — a dead→dead observation
+// would pass vacuously.
 func TestBVV_ERR11_WatchdogDetectsDeadSession(t *testing.T) {
-	wd, rec, pool, _ := newWatchdogFixture(t, 3)
-	task := setupDeadSessionTask(t, rec, pool, "task-dead", "w-01")
-	_ = task
+	wd, rec, pool, _ := newWatchdogFixture(t, 3, "sleep.sh")
+	setupDeadSessionTask(t, rec, pool, "task-dead", "w-01")
 
-	// Tighten BVV-S-02 enforcement: any UpdateTask/Assign call from here on
-	// is a test failure.
 	rec.mu.Lock()
 	rec.enforceS02 = true
 	rec.mu.Unlock()
 
 	require.NoError(t, wd.CheckOnce())
 
-	// A new tmux session should have been created by the restart.
-	waitForSessionDead(t, pool, "w-01", 3*time.Second) // and it exits again since ok.sh is instant
+	waitForSessionAlive(t, pool, "w-01", 2*time.Second)
+	waitForSessionDead(t, pool, "w-01", 3*time.Second)
 }
 
 // TestBVV_ERR11a_WatchdogEmitsTaskHandoff verifies the watchdog emits an
 // EventTaskHandoff with the current handoff count when it restarts a dead
 // session.
 func TestBVV_ERR11a_WatchdogEmitsTaskHandoff(t *testing.T) {
-	wd, rec, pool, logPath := newWatchdogFixture(t, 3)
+	wd, rec, pool, logPath := newWatchdogFixture(t, 3, "ok.sh")
 	setupDeadSessionTask(t, rec, pool, "task-handoff", "w-01")
 
 	rec.mu.Lock()
@@ -279,7 +288,7 @@ func TestBVV_ERR11a_WatchdogEmitsTaskHandoff(t *testing.T) {
 // Detail payload must carry the branch, role, and handoff count so Phase 4
 // dispatch and Phase 5 Resume can replay it.
 func TestBVV_ERR11a_WatchdogTaskHandoffPayload(t *testing.T) {
-	wd, rec, pool, logPath := newWatchdogFixture(t, 3)
+	wd, rec, pool, logPath := newWatchdogFixture(t, 3, "ok.sh")
 	setupDeadSessionTask(t, rec, pool, "task-payload", "w-01")
 
 	rec.mu.Lock()
@@ -316,7 +325,7 @@ func TestBVV_ERR11a_WatchdogTaskHandoffPayload(t *testing.T) {
 // This closes the gap in the original test which only checked (2) and would
 // have silently passed if the watchdog had erroneously restarted on tick 2.
 func TestBVV_L04_WatchdogStopsAtHandoffLimit(t *testing.T) {
-	wd, rec, pool, logPath := newWatchdogFixture(t, 1) // limit = 1 handoff
+	wd, rec, pool, logPath := newWatchdogFixture(t, 1, "ok.sh") // limit = 1 handoff
 	setupDeadSessionTask(t, rec, pool, "task-limit", "w-01")
 
 	rec.mu.Lock()
@@ -364,7 +373,7 @@ func TestBVV_L04_WatchdogStopsAtHandoffLimit(t *testing.T) {
 // is allowed because RestartSession re-asserts StatusInProgress via
 // SpawnSession.
 func TestBVV_S02_WatchdogNeverMutatesTaskStatus(t *testing.T) {
-	wd, rec, pool, _ := newWatchdogFixture(t, 3)
+	wd, rec, pool, _ := newWatchdogFixture(t, 3, "ok.sh")
 	setupDeadSessionTask(t, rec, pool, "task-s02", "w-01")
 
 	rec.mu.Lock()
@@ -415,7 +424,7 @@ func readEvents(t *testing.T, logPath string) []orch.Event {
 // no tmux session causes IsAlive to return (false, nil) via the
 // isSessionNotFound path, so the GetTask error path is reached.
 func TestWatchdogCheckOnceAccumulatesGetTaskErrors(t *testing.T) {
-	wd, rec, _, _ := newWatchdogFixture(t, 3)
+	wd, rec, _, _ := newWatchdogFixture(t, 3, "ok.sh")
 
 	ghost := &orch.Worker{
 		Name:          "w-ghost",
@@ -442,7 +451,7 @@ func TestWatchdogCheckOnceAccumulatesGetTaskErrors(t *testing.T) {
 // returns when ctx is cancelled. The fixture has no active workers so
 // CheckOnce is a no-op per tick — this test exercises the loop structure.
 func TestWatchdogRunExitsOnContextCancel(t *testing.T) {
-	wd, _, _, _ := newWatchdogFixture(t, 3)
+	wd, _, _, _ := newWatchdogFixture(t, 3, "ok.sh")
 
 	ctx, cancel := context.WithCancel(context.Background())
 

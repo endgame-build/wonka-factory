@@ -145,12 +145,16 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 	}
 	priorWorker = &snap
 
-	// 7. LDG-14a: task → in_progress.
-	task.Status = StatusInProgress
-	task.UpdatedAt = time.Now()
-	if err := wp.store.UpdateTask(task); err != nil {
+	// 7. LDG-14a: task → in_progress. Stage the transition on a copy so
+	// the caller's *task stays consistent with the store if UpdateTask
+	// fails and the deferred rollback fires.
+	updatedTask := *task
+	updatedTask.Status = StatusInProgress
+	updatedTask.UpdatedAt = time.Now()
+	if err := wp.store.UpdateTask(&updatedTask); err != nil {
 		return fmt.Errorf("spawn: update task: %w", err)
 	}
+	*task = updatedTask
 
 	success = true
 	return nil

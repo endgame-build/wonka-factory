@@ -211,12 +211,32 @@ Change socket prefix from `"orch-"` to `"wonka-"`. Otherwise identical.
 **Add `HandoffState`:**
 ```go
 type HandoffState struct {
+    mu       sync.Mutex     // two writers: dispatcher exit-3 + watchdog dead-session
     counts   map[string]int // taskID → handoff count
     maxLimit int
 }
 func NewHandoffState(maxHandoffs int) *HandoffState
+
+// TryRecord is the ONLY mutation API safe for production writers. It
+// collapses the budget check and counter increment into one lock
+// acquisition. Dispatcher (exit-3) and watchdog (dead-session) are the
+// two writers; using separate CanHandoff + RecordHandoff calls under
+// two locks lets both pass the check and both increment, violating
+// BVV-L-04. TryRecord closes that race.
+//
+// Returns (post-increment count, true) on success; (current count, false)
+// when the task is already at maxLimit.
+func (h *HandoffState) TryRecord(taskID string) (count int, ok bool)
+
+// CanHandoff is a non-atomic READ for diagnostics/tests/resume replay.
+// Never use it in a check-then-mutate sequence — use TryRecord instead.
 func (h *HandoffState) CanHandoff(taskID string) bool
+
+// RecordHandoff is a bypass-the-limit increment used ONLY by Resume
+// replay and by test fixtures that pre-seed state. Production paths
+// must use TryRecord.
 func (h *HandoffState) RecordHandoff(taskID string)
+
 func (h *HandoffState) Count(taskID string) int
 func (h *HandoffState) Reset(taskID string) // for human re-open (BVV-S-02a)
 func (h *HandoffState) SetCounts(counts map[string]int) // for resume recovery
@@ -377,9 +397,15 @@ processOutcome(o):
     handleTerminalFailure(task)
 
   case Handoff:  // exit code 3
-    if handoffs.CanHandoff(task.ID):
-      handoffs.RecordHandoff(task.ID)
-      pool.RestartSession(worker, task, roleCfg); emit(EventTaskHandoff)
+    // BVV-L-04: atomic check-and-increment. Do NOT split into
+    // CanHandoff + RecordHandoff — the watchdog is the other writer
+    // to HandoffState, and two separate lock acquisitions let both
+    // goroutines pass the budget check and both increment, exceeding
+    // maxLimit. TryRecord enforces the invariant under a single lock.
+    count, ok := handoffs.TryRecord(task.ID)
+    if ok:
+      pool.RestartSession(worker, task, roleCfg)
+      emit(EventTaskHandoff{count: count})
     else:
       emit(EventHandoffLimitReached)
       // Convert to Failed path (same as exit 1)

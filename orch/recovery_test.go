@@ -4,6 +4,7 @@ package orch_test
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -172,10 +173,12 @@ func TestBVV_L04_HandoffStateCanHandoff(t *testing.T) {
 	assert.False(t, h.CanHandoff("task-1"), "at limit, further handoffs must be rejected")
 }
 
-// TestBVV_L04_HandoffStateRecordAndCount verifies both the split
-// RecordHandoff + Count API and the atomic RecordAndCount method.
-// Counts are keyed independently per task.
-func TestBVV_L04_HandoffStateRecordAndCount(t *testing.T) {
+// TestBVV_L04_HandoffStateTryRecord verifies the atomic check-and-increment
+// primitive. TryRecord replaced the earlier CanHandoff + RecordAndCount pair
+// because the two-lock variant exposed a race between dispatcher and
+// watchdog: both writers could observe budget remaining and both increment,
+// overshooting maxLimit and violating BVV-L-04.
+func TestBVV_L04_HandoffStateTryRecord(t *testing.T) {
 	h := orch.NewHandoffState(10)
 
 	h.RecordHandoff("task-a")
@@ -186,11 +189,78 @@ func TestBVV_L04_HandoffStateRecordAndCount(t *testing.T) {
 	assert.Equal(t, 1, h.Count("task-b"))
 	assert.Equal(t, 0, h.Count("task-c"), "untouched task should be 0")
 
-	// Atomic RecordAndCount returns the post-increment value.
-	assert.Equal(t, 3, h.RecordAndCount("task-a"), "post-increment count")
-	assert.Equal(t, 1, h.RecordAndCount("task-c"), "first increment → 1")
-	assert.Equal(t, 3, h.Count("task-a"), "Count reflects RecordAndCount")
+	// TryRecord on a task with budget returns (post-increment, true).
+	count, ok := h.TryRecord("task-a")
+	assert.True(t, ok, "task-a has budget remaining")
+	assert.Equal(t, 3, count, "post-increment count")
+
+	// TryRecord first-increment on a fresh task returns (1, true).
+	count, ok = h.TryRecord("task-c")
+	assert.True(t, ok)
+	assert.Equal(t, 1, count)
 	assert.Equal(t, 1, h.Count("task-c"))
+}
+
+// TestBVV_L04_HandoffStateTryRecordExhausted verifies TryRecord refuses to
+// increment past the limit and leaves the counter unchanged. This is the
+// load-bearing property that makes TryRecord safe for concurrent writers:
+// the failure return path must NOT mutate state.
+func TestBVV_L04_HandoffStateTryRecordExhausted(t *testing.T) {
+	h := orch.NewHandoffState(2)
+
+	// Consume the budget.
+	count, ok := h.TryRecord("task-x")
+	require.True(t, ok)
+	require.Equal(t, 1, count)
+
+	count, ok = h.TryRecord("task-x")
+	require.True(t, ok)
+	require.Equal(t, 2, count)
+
+	// At limit — TryRecord must refuse AND must not increment.
+	count, ok = h.TryRecord("task-x")
+	assert.False(t, ok, "TryRecord must refuse when budget exhausted")
+	assert.Equal(t, 2, count, "refused TryRecord must return current count, not increment")
+	assert.Equal(t, 2, h.Count("task-x"), "refused TryRecord must not mutate state")
+
+	// Limit stays locked for subsequent attempts.
+	_, ok = h.TryRecord("task-x")
+	assert.False(t, ok, "TryRecord must remain refused")
+	assert.Equal(t, 2, h.Count("task-x"))
+}
+
+// TestBVV_L04_HandoffStateTryRecordConcurrent stress-tests the atomicity
+// guarantee: M goroutines racing TryRecord on the same task with a maxLimit
+// of N must produce EXACTLY N successful increments and zero overshoots.
+// Under the prior CanHandoff + RecordAndCount API this test would fail
+// because the check and the increment used separate lock acquisitions.
+func TestBVV_L04_HandoffStateTryRecordConcurrent(t *testing.T) {
+	const limit = 50
+	const racers = 8
+	const attemptsEach = 100
+
+	h := orch.NewHandoffState(limit)
+
+	var wg sync.WaitGroup
+	wg.Add(racers)
+
+	var successes atomic.Int64
+	for range racers {
+		go func() {
+			defer wg.Done()
+			for range attemptsEach {
+				if _, ok := h.TryRecord("task-race"); ok {
+					successes.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, int64(limit), successes.Load(),
+		"exactly `limit` TryRecord calls must succeed, no overshoot")
+	assert.Equal(t, limit, h.Count("task-race"),
+		"final count must equal limit")
 }
 
 // TestBVV_L04_HandoffStateZeroLimit verifies edge case: limit 0 means "no

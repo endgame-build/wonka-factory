@@ -58,6 +58,46 @@ func TestBuildShellCommand_Deterministic(t *testing.T) {
 	}
 }
 
+// TestBuildShellCommand_StreamJSONCapturesStderr locks in the BVV
+// diagnostic-capture fix for stream-json mode: when textFilter is non-empty,
+// the agent's stderr MUST be redirected to a .stderr sidecar. Without the
+// redirect, JSONL-emitting agents silently drop stack traces and auth/rate
+// errors because only stdout feeds tee/jq. The non-filter branch captures
+// stderr via 2>&1; this test ensures parity on the stream-json branch.
+func TestBuildShellCommand_StreamJSONCapturesStderr(t *testing.T) {
+	out, err := BuildShellCommand(
+		[]string{"agent", "--stream-json"},
+		map[string]string{"ORCH_TASK_ID": "t1"},
+		"/tmp/task-x.stdout",
+		".message.content", // any non-empty jq filter triggers stream-json mode
+	)
+	if err != nil {
+		t.Fatalf("BuildShellCommand: %v", err)
+	}
+
+	// The stderr redirect must appear BEFORE the stdout pipe into tee/jq —
+	// otherwise bash applies the redirect after the pipeline's first stage
+	// and the agent's stderr still leaks to the tmux pane.
+	stderrIdx := strings.Index(out, "2> '/tmp/task-x.stderr'")
+	pipeIdx := strings.Index(out, " | tee ")
+	if stderrIdx < 0 {
+		t.Errorf("stream-json mode must redirect agent stderr to .stderr sidecar; command was:\n%s", out)
+	}
+	if pipeIdx < 0 || stderrIdx >= pipeIdx {
+		t.Errorf("stderr redirect must precede the tee pipe; stderrIdx=%d pipeIdx=%d command was:\n%s", stderrIdx, pipeIdx, out)
+	}
+	// Sanity: the .txt pipeline is still wired up.
+	if !strings.Contains(out, "/tmp/task-x.txt") {
+		t.Errorf("stream-json mode must still pipe filtered text to .txt; command was:\n%s", out)
+	}
+	// The PIPESTATUS[0] exit-code capture must remain — it's the agent's
+	// exit code, not jq's. Regression here would silently mark failing
+	// agents as successful on stream-json presets.
+	if !strings.Contains(out, "${PIPESTATUS[0]} > '/tmp/task-x.stdout.exitcode'") {
+		t.Errorf("stream-json mode must capture PIPESTATUS[0] into exitcode sidecar; command was:\n%s", out)
+	}
+}
+
 // TestBuildShellCommand_InvalidEnvKey verifies that the env-key validator
 // rejects non-POSIX identifiers and returns ErrInvalidEnvKey via errors.Is.
 func TestBuildShellCommand_InvalidEnvKey(t *testing.T) {
