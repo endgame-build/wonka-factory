@@ -152,12 +152,15 @@ func TestReadAgentPrompt_NoFrontmatter(t *testing.T) {
 	assert.Equal(t, "# Plain instruction\n\nDo the thing.", body)
 }
 
-// TestReadAgentPrompt_MissingFile verifies that a missing instruction file
-// returns empty body+model with nil error. This lets generic presets run
-// without a role file (their own system prompt takes over).
+// TestReadAgentPrompt_MissingFile verifies that a non-empty path to a
+// missing instruction file surfaces os.ErrNotExist. Silently returning
+// empty strings here would let a typo or missing deploy launch an agent
+// with no role prompt — BVV-DSP-04 would then mark the task complete on
+// a normal exit, and terminal irreversibility would prevent recovery.
 func TestReadAgentPrompt_MissingFile(t *testing.T) {
 	body, model, err := orch.ReadAgentPrompt("/nonexistent/path/file.md")
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, os.ErrNotExist)
 	assert.Empty(t, body)
 	assert.Empty(t, model)
 }

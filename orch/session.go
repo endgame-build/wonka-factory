@@ -125,9 +125,20 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 		if success {
 			return
 		}
-		_ = wp.tmux.KillSession(sessionName)
+		// Rollback is best-effort; we're already returning the step error.
+		// Surface rollback failures to stderr so operators can see what
+		// leaked — a silent UpdateWorker failure strands the worker record
+		// as Active until Resume reconciles it. KillSessionIfExists
+		// swallows "session already gone" so a fast-exiting mock agent
+		// doesn't spam warnings; a genuine tmux infra failure still
+		// surfaces here.
+		if err := wp.tmux.KillSessionIfExists(sessionName); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: spawn rollback: kill session %s failed: %v\n", sessionName, err)
+		}
 		if priorWorker != nil {
-			_ = wp.store.UpdateWorker(priorWorker)
+			if err := wp.store.UpdateWorker(priorWorker); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: spawn rollback: restore worker %s failed: %v\n", workerName, err)
+			}
 		}
 	}()
 
@@ -171,7 +182,8 @@ func (wp *WorkerPool) IsAlive(workerName string) (bool, error) {
 // Release transitions a worker from active to idle (WKR-04). Kills the
 // worker's tmux session to prevent orphans, clears session state and
 // CurrentTaskID. The task's Assignee field is NOT modified here — the
-// dispatcher is the sole owner of task status transitions per BVV-S-02.
+// dispatcher owns all task status transitions (BVV-DSP-15). BVV-S-02
+// governs terminal-state irreversibility, which is a separate concern.
 func (wp *WorkerPool) Release(workerName string) error {
 	worker, err := wp.store.GetWorker(workerName)
 	if err != nil {

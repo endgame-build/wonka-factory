@@ -9,22 +9,24 @@ import (
 	"time"
 )
 
-// CircuitBreaker tracks rapid failures and trips when the threshold is
-// reached (BVV SUP-05, SUP-06). Thread-safe — written by the watchdog
-// goroutine, read by the dispatch loop when it checks CBTripped.
+// CircuitBreaker tracks rapid failures and trips when any single worker
+// reaches the threshold (BVV SUP-05, SUP-06). Thread-safe — written by
+// the watchdog goroutine, read by the dispatch loop when it checks
+// CBTripped.
 //
 // "Rapid failure" semantics (SUP-06): a failure counts when the session
-// lived strictly less than `window`. Once the global count of such
-// failures within the window reaches `threshold`, the breaker trips.
+// lived strictly less than `window`. Per SUP-05, the threshold applies
+// per-worker: the breaker trips when any single worker has accumulated
+// `threshold` rapid failures inside the rolling window. Two workers each
+// contributing 2 rapid failures (below threshold=3) do NOT trip the
+// breaker — only a single worker hitting its own threshold does.
 //
-// Per-worker failure history is retained purely so that expired samples
-// can be pruned from the map on each recorded failure; the threshold
-// itself applies to the TOTAL across all workers in the window, not to
-// a per-worker consecutive streak. A single unhealthy worker can trip
-// the breaker by itself, and a mix of worker failures aggregates.
+// Per-worker failure histories are all pruned on every Record so the map
+// stays bounded by the live-worker count, not by total historical
+// failures; workers with no in-window failures are removed entirely.
 type CircuitBreaker struct {
 	mu        sync.Mutex
-	threshold int                    // total rapid failures in window before trip (SUP-05: 3)
+	threshold int                    // per-worker rapid failures in window before trip (SUP-05: 3)
 	window    time.Duration          // rapid failure window (SUP-06: 60s)
 	failures  map[string][]time.Time // workerName → failure timestamps (pruned to window)
 	tripped   bool
@@ -39,9 +41,11 @@ func NewCircuitBreaker(threshold int, window time.Duration) *CircuitBreaker {
 	}
 }
 
-// RecordFailure records a rapid failure for a worker. A failure is "rapid" if
-// the session lived less than the window duration (SUP-06). Returns true if
-// the circuit breaker has tripped (SUP-05).
+// RecordFailure records a rapid failure for a worker. A failure is "rapid"
+// if the session lived less than the window duration (SUP-06). Returns
+// true if the circuit breaker has tripped (SUP-05): the threshold is
+// applied per-worker, so a single worker hitting its own threshold is
+// sufficient — cross-worker sums do NOT trip.
 func (cb *CircuitBreaker) RecordFailure(workerName string, sessionStart time.Time) bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -53,8 +57,8 @@ func (cb *CircuitBreaker) RecordFailure(workerName string, sessionStart time.Tim
 
 	cb.failures[workerName] = append(cb.failures[workerName], now)
 
-	// Count recent rapid failures across all workers.
-	total := 0
+	// Prune every worker's history to the window so expired entries don't
+	// linger indefinitely. Drop empty slices entirely to bound the map.
 	cutoff := now.Add(-cb.window)
 	for name, times := range cb.failures {
 		var recent []time.Time
@@ -63,12 +67,19 @@ func (cb *CircuitBreaker) RecordFailure(workerName string, sessionStart time.Tim
 				recent = append(recent, t)
 			}
 		}
+		if len(recent) == 0 {
+			delete(cb.failures, name)
+			continue
+		}
 		cb.failures[name] = recent
-		total += len(recent)
 	}
 
-	if total >= cb.threshold {
-		cb.tripped = true
+	// SUP-05 per-worker threshold: trip if ANY worker hit its own limit.
+	for _, times := range cb.failures {
+		if len(times) >= cb.threshold {
+			cb.tripped = true
+			break
+		}
 	}
 	return cb.tripped
 }
@@ -114,10 +125,11 @@ func DefaultWatchdogConfig() WatchdogConfig {
 //     (BVV-ERR-11a, BVV-L-04), or emit EventHandoffLimitReached and skip
 //     restart if the handoff budget is exhausted.
 //   - Track rapid failures via CircuitBreaker (SUP-05, SUP-06)
-//   - **Never change task status** (BVV-S-02, Terminal Status Irreversibility
-//     §12.2). The dispatcher is the sole owner of task status transitions.
-//     The watchdog signals via events and HandoffState mutations; the
-//     dispatcher observes those and transitions tasks on its next tick.
+//   - **Never change task status** (BVV-S-02 Terminal Status Irreversibility
+//     §12.1 + BVV-S-10 Watchdog-Retry Non-Interference §12.10). The
+//     dispatcher is the sole owner of task status transitions. The watchdog
+//     signals via events and HandoffState mutations; the dispatcher observes
+//     those and transitions tasks on its next tick.
 //   - Burn **handoff budget**, not retry budget, for dead-session restarts
 //     (BVV-S-10, Watchdog-Retry Non-Interference §12.10). The retry counter
 //     is owned exclusively by the dispatcher on exit-code-1 outcomes.
@@ -138,6 +150,11 @@ type Watchdog struct {
 // via the task's role label, not a pipeline-derived agent index. HandoffState
 // tracks per-task handoff budget; the watchdog is one of its two writers
 // (the dispatcher is the other, on exit-code-3 processing).
+//
+// progress is the only nilable dependency; everything else must be non-nil
+// or the constructor errors out. A nil roles map is rejected even though an
+// empty map is valid — the watchdog treats unknown roles as the dispatcher's
+// problem (BVV-DSP-03a escalation), but nil is a wiring bug, not a choice.
 func NewWatchdog(
 	pool *WorkerPool,
 	store Store,
@@ -147,7 +164,27 @@ func NewWatchdog(
 	branch string,
 	cfg WatchdogConfig,
 	progress ProgressReporter,
-) *Watchdog {
+) (*Watchdog, error) {
+	switch {
+	case pool == nil:
+		return nil, fmt.Errorf("watchdog: pool is required")
+	case store == nil:
+		return nil, fmt.Errorf("watchdog: store is required")
+	case log == nil:
+		return nil, fmt.Errorf("watchdog: event log is required")
+	case handoffs == nil:
+		return nil, fmt.Errorf("watchdog: handoff state is required")
+	case roles == nil:
+		return nil, fmt.Errorf("watchdog: roles map is required (empty map is acceptable)")
+	case branch == "":
+		return nil, fmt.Errorf("watchdog: branch must be non-empty")
+	case cfg.Interval <= 0:
+		return nil, fmt.Errorf("watchdog: cfg.Interval must be > 0")
+	case cfg.CBThreshold <= 0:
+		return nil, fmt.Errorf("watchdog: cfg.CBThreshold must be > 0")
+	case cfg.CBWindow <= 0:
+		return nil, fmt.Errorf("watchdog: cfg.CBWindow must be > 0")
+	}
 	return &Watchdog{
 		pool:     pool,
 		store:    store,
@@ -158,7 +195,7 @@ func NewWatchdog(
 		handoffs: handoffs,
 		branch:   branch,
 		progress: progress,
-	}
+	}, nil
 }
 
 // Run starts the watchdog loop. Blocks until ctx is cancelled. Tick errors
@@ -248,31 +285,37 @@ func (w *Watchdog) CheckOnce() error {
 		// dispatcher's exit-3 path; see TryRecord docstring.
 		count, ok := w.handoffs.TryRecord(task.ID)
 		if !ok {
-			// Budget exhausted. Emit the signal event and leave the task in
-			// place. The dispatcher will observe EventHandoffLimitReached on
-			// its next tick and convert the task to a failure (BVV-ERR-11a).
+			// Budget exhausted. Emit EventHandoffLimitReached and leave the
+			// task in place; the dispatcher observes the event on its next
+			// tick and converts the task to a failure (BVV-ERR-11a).
 			//
-			// Emit errors are best-effort here: a failed write means disk
-			// full or log closed, which the dispatcher's next tick will
-			// surface through other code paths. The BVV-S-02 invariant is
-			// still respected — no task status mutation happens in this arm.
-			_ = emitAndNotify(w.log, w.progress, Event{
+			// Emit failures here are load-bearing: if the dispatcher never
+			// sees this event, the task stays in_progress forever (the
+			// watchdog will skip it next tick because budget is exhausted).
+			// Accumulate the error into tickErrs so Run() surfaces it via
+			// stderr — BVV-S-02/BVV-S-10 are still respected because we
+			// never touch task status.
+			if err := emitAndNotify(w.log, w.progress, Event{
 				Kind:    EventHandoffLimitReached,
 				TaskID:  task.ID,
 				Worker:  worker.Name,
 				Summary: "watchdog handoff limit reached",
 				Detail:  fmt.Sprintf("branch=%s role=%s", w.branch, role),
-			})
+			}); err != nil {
+				tickErrs = append(tickErrs, fmt.Errorf("emit handoff_limit_reached %s: %w", task.ID, err))
+			}
 			continue
 		}
 
-		_ = emitAndNotify(w.log, w.progress, Event{
+		if err := emitAndNotify(w.log, w.progress, Event{
 			Kind:    EventTaskHandoff,
 			TaskID:  task.ID,
 			Worker:  worker.Name,
 			Summary: fmt.Sprintf("watchdog restart (handoff %d)", count),
 			Detail:  fmt.Sprintf("reason=session_dead branch=%s role=%s count=%d", w.branch, role, count),
-		})
+		}); err != nil {
+			tickErrs = append(tickErrs, fmt.Errorf("emit task_handoff %s: %w", task.ID, err))
+		}
 
 		// Track rapid failures for circuit-breaker purposes. A tripped CB
 		// does NOT skip the restart — the watchdog still attempts to recover.
@@ -280,10 +323,16 @@ func (w *Watchdog) CheckOnce() error {
 		// system is unhealthy; the dispatcher decides whether to halt.
 		_ = w.cb.RecordFailure(worker.Name, worker.SessionStartedAt)
 
-		// Best-effort restart. A restart failure is tracked by the circuit
-		// breaker on the next tick when IsAlive returns false again. We do
-		// NOT touch task status here — BVV-S-02 forbids it.
-		_ = w.pool.RestartSession(worker.Name, task, roleCfg, w.branch)
+		// Attempt the restart. A failure here leaves handoff budget already
+		// burned (TryRecord above is monotonic) and the session still dead,
+		// so the next tick will re-observe (false, nil) from IsAlive and
+		// attempt another restart — burning budget again. Surface the error
+		// so the operator can intervene before maxHandoffs is exhausted by
+		// infrastructure failures rather than genuine agent misbehavior.
+		// BVV-S-10 still holds — we never touch task status, only events.
+		if err := w.pool.RestartSession(worker.Name, task, roleCfg, w.branch); err != nil {
+			tickErrs = append(tickErrs, fmt.Errorf("restart %s (task %s): %w", worker.Name, task.ID, err))
+		}
 	}
 
 	return errors.Join(tickErrs...)

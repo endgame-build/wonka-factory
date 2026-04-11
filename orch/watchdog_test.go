@@ -47,6 +47,29 @@ func TestBVV_SUP06_CircuitBreakerIgnoresSlowFailures(t *testing.T) {
 	assert.False(t, cb.Tripped(), "slow failures must not trip the CB")
 }
 
+// TestBVV_SUP05_CircuitBreakerPerWorkerThreshold verifies the SUP-05
+// "same worker" semantic: two workers each contributing failures below
+// the per-worker threshold must NOT trip the breaker; only a single
+// worker hitting its own threshold does. A regression back to
+// cross-worker aggregation (which an earlier version shipped) would
+// trip this test on the second worker's second failure.
+func TestBVV_SUP05_CircuitBreakerPerWorkerThreshold(t *testing.T) {
+	cb := orch.NewCircuitBreaker(3, 60*time.Second)
+	rapid := time.Now().Add(-1 * time.Second)
+
+	// Two failures on w-01, two on w-02. Cross-worker sum = 4 (above 3),
+	// but per-worker max = 2 (below 3). Must NOT trip.
+	assert.False(t, cb.RecordFailure("w-01", rapid))
+	assert.False(t, cb.RecordFailure("w-02", rapid))
+	assert.False(t, cb.RecordFailure("w-01", rapid))
+	assert.False(t, cb.RecordFailure("w-02", rapid))
+	assert.False(t, cb.Tripped(), "4 failures split 2+2 across workers must NOT trip per SUP-05")
+
+	// Third failure on w-01 pushes that single worker to threshold. Trip.
+	assert.True(t, cb.RecordFailure("w-01", rapid))
+	assert.True(t, cb.Tripped(), "single worker hitting its own threshold must trip")
+}
+
 // TestBVV_SUP05_CircuitBreakerReset verifies Reset clears the tripped state.
 func TestBVV_SUP05_CircuitBreakerReset(t *testing.T) {
 	cb := orch.NewCircuitBreaker(1, 60*time.Second)
@@ -60,7 +83,7 @@ func TestBVV_SUP05_CircuitBreakerReset(t *testing.T) {
 // --- Watchdog CheckOnce tests ---
 
 // recordingStore wraps an orch.Store and enforces BVV-S-02 (Terminal Status
-// Irreversibility, spec §12.2) during watchdog ticks: the watchdog must never
+// Irreversibility, spec §12.1) during watchdog ticks: the watchdog must never
 // transition a task to a TERMINAL status, and must never call Assign.
 // Non-terminal UpdateTask calls are allowed because the watchdog's
 // RestartSession path legitimately re-asserts StatusInProgress via
@@ -161,7 +184,7 @@ func newWatchdogFixture(t *testing.T, maxHandoffs int, restartScript string) (*o
 
 	handoffs := orch.NewHandoffState(maxHandoffs)
 
-	wd := orch.NewWatchdog(
+	wd, err := orch.NewWatchdog(
 		pool,
 		recStore,
 		eventLog,
@@ -177,6 +200,7 @@ func newWatchdogFixture(t *testing.T, maxHandoffs int, restartScript string) (*o
 		},
 		nil, // no ProgressReporter
 	)
+	require.NoError(t, err)
 	return wd, recStore, pool, logPath
 }
 
@@ -473,5 +497,87 @@ func TestWatchdogRunExitsOnContextCancel(t *testing.T) {
 		// Run returned as expected.
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Watchdog.Run did not exit within 500ms of context cancellation")
+	}
+}
+
+// TestNewWatchdogRejectsInvalidDeps verifies the constructor rejects nil
+// dependencies and zero-valued config fields up-front rather than letting
+// the watchdog crash inside CheckOnce at arbitrary lines. Each missing
+// requirement produces a distinct error message so operators can diagnose
+// wiring bugs without reading source.
+func TestNewWatchdogRejectsInvalidDeps(t *testing.T) {
+	dir := t.TempDir()
+	fsStore, err := orch.NewFSStore(filepath.Join(dir, "ledger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fsStore.Close() })
+
+	runID := "wd-validate"
+	tmuxClient := orch.NewTmuxClient(runID)
+	require.NoError(t, tmuxClient.StartServer())
+	t.Cleanup(func() { _ = tmuxClient.KillServer() })
+
+	pool := orch.NewWorkerPool(fsStore, tmuxClient, 4, runID, "/repo", dir)
+	eventLog, err := orch.NewEventLog(filepath.Join(dir, "events.jsonl"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = eventLog.Close() })
+
+	handoffs := orch.NewHandoffState(3)
+	roles := map[string]orch.RoleConfig{}
+	cfg := orch.DefaultWatchdogConfig()
+
+	// Happy path: everything valid → no error.
+	wd, err := orch.NewWatchdog(pool, fsStore, eventLog, roles, handoffs, "feature-x", cfg, nil)
+	require.NoError(t, err)
+	require.NotNil(t, wd)
+
+	// Each case mutates a single argument away from the valid baseline and
+	// asserts the constructor rejects it with the expected message.
+	cases := []struct {
+		name    string
+		call    func() (*orch.Watchdog, error)
+		wantSub string
+	}{
+		{"nil pool", func() (*orch.Watchdog, error) {
+			return orch.NewWatchdog(nil, fsStore, eventLog, roles, handoffs, "feature-x", cfg, nil)
+		}, "pool is required"},
+		{"nil store", func() (*orch.Watchdog, error) {
+			return orch.NewWatchdog(pool, nil, eventLog, roles, handoffs, "feature-x", cfg, nil)
+		}, "store is required"},
+		{"nil log", func() (*orch.Watchdog, error) {
+			return orch.NewWatchdog(pool, fsStore, nil, roles, handoffs, "feature-x", cfg, nil)
+		}, "event log is required"},
+		{"nil handoffs", func() (*orch.Watchdog, error) {
+			return orch.NewWatchdog(pool, fsStore, eventLog, roles, nil, "feature-x", cfg, nil)
+		}, "handoff state is required"},
+		{"nil roles", func() (*orch.Watchdog, error) {
+			return orch.NewWatchdog(pool, fsStore, eventLog, nil, handoffs, "feature-x", cfg, nil)
+		}, "roles map is required"},
+		{"empty branch", func() (*orch.Watchdog, error) {
+			return orch.NewWatchdog(pool, fsStore, eventLog, roles, handoffs, "", cfg, nil)
+		}, "branch must be non-empty"},
+		{"zero Interval", func() (*orch.Watchdog, error) {
+			bad := cfg
+			bad.Interval = 0
+			return orch.NewWatchdog(pool, fsStore, eventLog, roles, handoffs, "feature-x", bad, nil)
+		}, "cfg.Interval must be > 0"},
+		{"zero CBThreshold", func() (*orch.Watchdog, error) {
+			bad := cfg
+			bad.CBThreshold = 0
+			return orch.NewWatchdog(pool, fsStore, eventLog, roles, handoffs, "feature-x", bad, nil)
+		}, "cfg.CBThreshold must be > 0"},
+		{"zero CBWindow", func() (*orch.Watchdog, error) {
+			bad := cfg
+			bad.CBWindow = 0
+			return orch.NewWatchdog(pool, fsStore, eventLog, roles, handoffs, "feature-x", bad, nil)
+		}, "cfg.CBWindow must be > 0"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.call()
+			require.Error(t, err)
+			require.Nil(t, got)
+			assert.Contains(t, err.Error(), tc.wantSub)
+		})
 	}
 }
