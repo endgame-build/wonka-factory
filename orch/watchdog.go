@@ -2,7 +2,9 @@ package orch
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 )
@@ -102,10 +104,13 @@ func DefaultWatchdogConfig() WatchdogConfig {
 //     (BVV-ERR-11a, BVV-L-04), or emit EventHandoffLimitReached and skip
 //     restart if the handoff budget is exhausted.
 //   - Track rapid failures via CircuitBreaker (SUP-05, SUP-06)
-//   - **Never change task status** (BVV-S-10). The dispatcher is the sole
-//     owner of task status transitions. The watchdog signals via events
-//     and HandoffState mutations; the dispatcher observes those and
-//     transitions tasks on its next tick.
+//   - **Never change task status** (BVV-S-02, Terminal Status Irreversibility
+//     §12.2). The dispatcher is the sole owner of task status transitions.
+//     The watchdog signals via events and HandoffState mutations; the
+//     dispatcher observes those and transitions tasks on its next tick.
+//   - Burn **handoff budget**, not retry budget, for dead-session restarts
+//     (BVV-S-10, Watchdog-Retry Non-Interference §12.10). The retry counter
+//     is owned exclusively by the dispatcher on exit-code-1 outcomes.
 type Watchdog struct {
 	pool     *WorkerPool
 	store    Store
@@ -146,7 +151,9 @@ func NewWatchdog(
 	}
 }
 
-// Run starts the watchdog loop. Blocks until ctx is cancelled.
+// Run starts the watchdog loop. Blocks until ctx is cancelled. Tick errors
+// are logged to stderr — BVV's 17 event kinds (§10.3) have no diagnostic
+// category, so stderr is the approved sink for watchdog infra failures.
 func (w *Watchdog) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.cfg.Interval)
 	defer ticker.Stop()
@@ -156,7 +163,9 @@ func (w *Watchdog) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = w.CheckOnce()
+			if err := w.CheckOnce(); err != nil {
+				fmt.Fprintf(os.Stderr, "watchdog tick error: %v\n", err)
+			}
 		}
 	}
 }
@@ -166,17 +175,21 @@ func (w *Watchdog) Run(ctx context.Context) {
 // For each active worker with a dead tmux session:
 //  1. Skip if the task is already terminal (dispatcher handled it).
 //  2. If handoff budget is exhausted → emit EventHandoffLimitReached and
-//     leave the task in place. The dispatcher will observe the event on
-//     its next tick, fetch the task, and transition it to Failed.
+//     leave the task in place. The dispatcher observes the event on its
+//     next tick and transitions the task to Failed.
 //  3. Otherwise increment HandoffState, emit EventTaskHandoff, and call
-//     RestartSession. BVV-S-10: the watchdog never mutates task status
-//     directly; only events and counters change.
+//     RestartSession.
+//
+// Per-worker infrastructure errors (IsAlive/GetTask) are accumulated via
+// errors.Join and returned at end-of-tick so Run can surface them; other
+// workers in the same tick are still checked.
 func (w *Watchdog) CheckOnce() error {
 	workers, err := w.store.ListWorkers()
 	if err != nil {
 		return fmt.Errorf("watchdog: list workers: %w", err)
 	}
 
+	var tickErrs []error
 	for _, worker := range workers {
 		if worker.Status != WorkerActive {
 			continue
@@ -184,24 +197,33 @@ func (w *Watchdog) CheckOnce() error {
 
 		alive, err := w.pool.IsAlive(worker.Name)
 		if err != nil {
-			continue // tmux infra error, skip this worker
+			// tmux infrastructure error — accumulate and skip this worker
+			// (the others may still be reachable). A persistently-broken
+			// tmux will surface one stderr line per tick via Run.
+			tickErrs = append(tickErrs, fmt.Errorf("is_alive %s: %w", worker.Name, err))
+			continue
 		}
 		if alive {
 			continue
 		}
 
-		// Skip if the agent goroutine (dispatcher) already handled the death
-		// and the task is terminal — avoids double-counting a normal completion
-		// as a watchdog-triggered handoff.
+		// Worker is Active but has no task assignment — degenerate state
+		// (possible during Resume between worker load and task load).
+		// Nothing to restart.
 		if worker.CurrentTaskID == "" {
 			continue
 		}
 		task, err := w.store.GetTask(worker.CurrentTaskID)
 		if err != nil {
+			// Store error — accumulate. ErrNotFound is still worth surfacing
+			// because it means the worker/task invariant was violated (the
+			// dispatcher or a human deleted the task without clearing
+			// worker.CurrentTaskID), which is a real operational bug.
+			tickErrs = append(tickErrs, fmt.Errorf("get_task %s (worker %s): %w", worker.CurrentTaskID, worker.Name, err))
 			continue
 		}
 		if task.Status.Terminal() {
-			continue // BVV-S-10: never touch terminal tasks
+			continue // BVV-S-02: never touch terminal tasks
 		}
 
 		// Resolve role → RoleConfig. Unknown role is the dispatcher's problem
@@ -220,7 +242,7 @@ func (w *Watchdog) CheckOnce() error {
 			//
 			// Emit errors are best-effort here: a failed write means disk
 			// full or log closed, which the dispatcher's next tick will
-			// surface through other code paths. The BVV-S-10 invariant is
+			// surface through other code paths. The BVV-S-02 invariant is
 			// still respected — no task status mutation happens in this arm.
 			_ = emitAndNotify(w.log, w.progress, Event{
 				Kind:    EventHandoffLimitReached,
@@ -232,11 +254,8 @@ func (w *Watchdog) CheckOnce() error {
 			continue
 		}
 
-		// Record the handoff FIRST so the emitted count reflects the new
-		// state. The dispatcher's exit-3 path uses the same order for
-		// consistency.
-		w.handoffs.RecordHandoff(task.ID)
-		count := w.handoffs.Count(task.ID)
+		// BVV-S-10: burn handoff budget, not retry budget.
+		count := w.handoffs.RecordAndCount(task.ID)
 
 		_ = emitAndNotify(w.log, w.progress, Event{
 			Kind:    EventTaskHandoff,
@@ -254,11 +273,11 @@ func (w *Watchdog) CheckOnce() error {
 
 		// Best-effort restart. A restart failure is tracked by the circuit
 		// breaker on the next tick when IsAlive returns false again. We do
-		// NOT touch task status here — BVV-S-10 forbids it.
+		// NOT touch task status here — BVV-S-02 forbids it.
 		_ = w.pool.RestartSession(worker.Name, task, roleCfg, w.branch)
 	}
 
-	return nil
+	return errors.Join(tickErrs...)
 }
 
 // CBTripped returns whether the circuit breaker is tripped.

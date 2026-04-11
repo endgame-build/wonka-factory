@@ -5,17 +5,17 @@ package orch_test
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/endgame/wonka-factory/orch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// TestBVV_ERR09_SignalCancelsContext verifies BVV-ERR-09: the signal handler
-// returns a context that is cancellable, and programmatic cancel works.
-// The real signal path (SIGINT/SIGTERM) is exercised end-to-end by the
-// integration suite; this unit test locks in the cancellation API.
+// TestBVV_ERR09_SignalCancelsContext verifies BVV-ERR-09 programmatic
+// cancel. The real-signal path is exercised separately below.
 func TestBVV_ERR09_SignalCancelsContext(t *testing.T) {
 	ctx, cancel := orch.SetupSignalHandler()
 	defer cancel()
@@ -31,6 +31,26 @@ func TestBVV_ERR09_SignalCancelsContext(t *testing.T) {
 	cancel()
 	<-ctx.Done()
 	assert.Error(t, ctx.Err())
+}
+
+// TestBVV_ERR09_RealSignalCancelsContext verifies BVV-ERR-09 end-to-end: a
+// real SIGTERM delivered to this process cancels the returned context.
+// SIGTERM (not SIGINT) to avoid interfering with `go test`'s own SIGINT
+// handling on some CI configurations.
+func TestBVV_ERR09_RealSignalCancelsContext(t *testing.T) {
+	ctx, cancel := orch.SetupSignalHandler()
+	defer cancel()
+
+	proc, err := os.FindProcess(syscall.Getpid())
+	require.NoError(t, err)
+	require.NoError(t, proc.Signal(syscall.SIGTERM))
+
+	select {
+	case <-ctx.Done():
+		assert.Error(t, ctx.Err(), "context should carry an error after cancel")
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("context was not cancelled within 500ms of SIGTERM")
+	}
 }
 
 // TestBVV_ERR10a_CleanupIdempotent verifies that Cleanup is idempotent —

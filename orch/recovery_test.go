@@ -172,8 +172,9 @@ func TestBVV_L04_HandoffStateCanHandoff(t *testing.T) {
 	assert.False(t, h.CanHandoff("task-1"), "at limit, further handoffs must be rejected")
 }
 
-// TestBVV_L04_HandoffStateRecordAndCount verifies RecordHandoff + Count
-// produce the expected counter, and counts are keyed independently per task.
+// TestBVV_L04_HandoffStateRecordAndCount verifies both the split
+// RecordHandoff + Count API and the atomic RecordAndCount method.
+// Counts are keyed independently per task.
 func TestBVV_L04_HandoffStateRecordAndCount(t *testing.T) {
 	h := orch.NewHandoffState(10)
 
@@ -184,6 +185,12 @@ func TestBVV_L04_HandoffStateRecordAndCount(t *testing.T) {
 	assert.Equal(t, 2, h.Count("task-a"))
 	assert.Equal(t, 1, h.Count("task-b"))
 	assert.Equal(t, 0, h.Count("task-c"), "untouched task should be 0")
+
+	// Atomic RecordAndCount returns the post-increment value.
+	assert.Equal(t, 3, h.RecordAndCount("task-a"), "post-increment count")
+	assert.Equal(t, 1, h.RecordAndCount("task-c"), "first increment → 1")
+	assert.Equal(t, 3, h.Count("task-a"), "Count reflects RecordAndCount")
+	assert.Equal(t, 1, h.Count("task-c"))
 }
 
 // TestBVV_L04_HandoffStateZeroLimit verifies edge case: limit 0 means "no

@@ -137,3 +137,26 @@ func TestReadExitCode_WhitespaceOnlySidecar(t *testing.T) {
 		t.Errorf("whitespace sidecar: got exit code %d, want -1", code)
 	}
 }
+
+// TestReadExitCode_CorruptedSidecar verifies that non-integer sidecar
+// content returns (-1, err), not (0, err). BVV-DSP-04: 0 means success, so
+// returning 0 with a parse error is a foot-gun for log-and-continue callers.
+func TestReadExitCode_CorruptedSidecar(t *testing.T) {
+	for _, payload := range []string{"banana", "0xff", "true", "42 and more"} {
+		t.Run(payload, func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "task-corrupt.stdout")
+			if err := os.WriteFile(logPath+".exitcode", []byte(payload), 0o644); err != nil {
+				t.Fatalf("write corrupt sidecar: %v", err)
+			}
+
+			code, err := ReadExitCode(logPath)
+			if err == nil {
+				t.Fatalf("expected parse error for payload %q, got nil", payload)
+			}
+			if code != -1 {
+				t.Errorf("corrupted sidecar %q: got exit code %d, want -1 (success=0 is a foot-gun)", payload, code)
+			}
+		})
+	}
+}

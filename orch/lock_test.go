@@ -5,6 +5,7 @@ package orch_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -143,6 +144,49 @@ func TestBVV_L02_RefreshPreventsStaleness(t *testing.T) {
 	var c orch.LockContent
 	require.NoError(t, (func() error { return nil })()) // linter placeholder
 	_ = c
+}
+
+// TestBVV_ERR06_StaleLockRemoveErrorSurfaces verifies that a real filesystem
+// failure during stale-lock removal is not silently reported as generic
+// lock contention. A chmod'd parent directory forces os.Remove → EACCES;
+// Acquire must surface the underlying FS error.
+//
+// Skipped as root because root bypasses directory write permissions on POSIX.
+func TestBVV_ERR06_StaleLockRemoveErrorSurfaces(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod-based permission test is POSIX-only")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory write permissions; test cannot trigger EACCES")
+	}
+
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, ".wonka-test.lock")
+
+	// Write a stale lock file.
+	staleContent := `{"holder":"dead-process","branch":"feature-x","timestamp":"2000-01-01T00:00:00Z"}`
+	require.NoError(t, os.WriteFile(lockPath, []byte(staleContent+"\n"), 0o644))
+
+	// Drop write permission on the parent dir so os.Remove on the lock
+	// file fails with EACCES. Restore in t.Cleanup so the tempdir cleanup
+	// can actually run.
+	require.NoError(t, os.Chmod(dir, 0o555))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	cfg := orch.LockConfig{
+		Path:               lockPath,
+		StalenessThreshold: 1 * time.Millisecond, // lock is definitely stale
+		RetryCount:         1,
+		RetryDelay:         1 * time.Millisecond,
+	}
+	lock := orch.NewLifecycleLock(cfg)
+
+	err := lock.Acquire("new-holder", "feature-x")
+	require.Error(t, err, "stale-lock Remove must surface FS errors, not succeed")
+	assert.NotErrorIs(t, err, orch.ErrLockContention,
+		"real FS failure must not masquerade as lock contention")
+	assert.Contains(t, err.Error(), "remove stale lock",
+		"error must identify the failing operation")
 }
 
 // TestBVV_L02_RefreshRejectsWrongHolder verifies that Refresh guards against

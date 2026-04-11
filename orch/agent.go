@@ -14,22 +14,24 @@ import (
 // these static inputs — no content-derived or content-predicated arguments
 // (BVV-DSN-04 phase-agnostic, BVV-DSP-04 exit-code-only outcome).
 //
-// instructionPath is the full path to the role's .md file, passed via
-// preset.SystemPromptFlag when set. model overrides the preset default via
-// preset.ModelFlag. maxTurns appends --max-turns when > 0; zero means
-// "preset default".
+// instructionBody is the frontmatter-stripped content of the role's .md file
+// (returned by ReadAgentPrompt). It is passed as the literal argument to
+// preset.SystemPromptFlag — matching the Claude/codex/goose CLI contract
+// where --append-system-prompt takes a prompt string, not a file path.
+// model overrides the preset default via preset.ModelFlag. maxTurns appends
+// --max-turns when > 0; zero means "preset default".
 //
 // Per the BVV plan, agent identity no longer flows through a dedicated CLI
 // flag — the task's role label is resolved to a RoleConfig by the dispatcher,
-// and the instruction file for that role is injected directly via the
+// and the instruction body for that role is injected directly via the
 // system-prompt flag. Agents discover their task via the ORCH_TASK_ID env
 // var (see BuildEnv) and read the task body from the ledger.
-func BuildCommand(preset *Preset, instructionPath, model string, maxTurns int) []string {
+func BuildCommand(preset *Preset, instructionBody, model string, maxTurns int) []string {
 	cmd := []string{preset.Command}
 	cmd = append(cmd, preset.Args...)
 
-	if preset.SystemPromptFlag != "" && instructionPath != "" {
-		cmd = append(cmd, preset.SystemPromptFlag, instructionPath)
+	if preset.SystemPromptFlag != "" && instructionBody != "" {
+		cmd = append(cmd, preset.SystemPromptFlag, instructionBody)
 	}
 	if preset.ModelFlag != "" && model != "" {
 		cmd = append(cmd, preset.ModelFlag, model)
