@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -53,16 +54,16 @@ func ExecuteGate(ctx context.Context, store Store, log *EventLog, taskID, repoPa
 
 	emitGate(log, EventGateCreated, taskID, fmt.Sprintf("gate: creating PR %s → %s", sourceBranch, targetBranch))
 
-	// 2. Create PR.
-	prArgs := []string{"pr", "create",
-		"--base", targetBranch,
-		"--head", sourceBranch,
-		"--title", fmt.Sprintf("feat: %s", sourceBranch),
-		"--body", "Automated PR created by wonka-factory gate handler.",
-	}
-	if err := runGH(ctx, repoPath, prArgs...); err != nil {
-		// PR may already exist — treat as non-fatal and continue to CI check.
-		if !strings.Contains(err.Error(), "already exists") {
+	// 2. Create PR (skip if one already exists for this branch).
+	if err := runGH(ctx, repoPath, "pr", "view", sourceBranch); err != nil {
+		// No existing PR — create one.
+		prArgs := []string{"pr", "create",
+			"--base", targetBranch,
+			"--head", sourceBranch,
+			"--title", fmt.Sprintf("feat: %s", sourceBranch),
+			"--body", "Automated PR created by wonka-factory gate handler.",
+		}
+		if err := runGH(ctx, repoPath, prArgs...); err != nil {
 			emitGate(log, EventGateFailed, taskID, fmt.Sprintf("gate: gh pr create: %v", err))
 			return 1
 		}
@@ -101,5 +102,7 @@ func emitGate(log *EventLog, kind EventKind, taskID, summary string) {
 	if log == nil {
 		return
 	}
-	_ = log.Emit(Event{Kind: kind, TaskID: taskID, Summary: summary})
+	if err := log.Emit(Event{Kind: kind, TaskID: taskID, Summary: summary}); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: gate emit %s (task %s): %v\n", kind, taskID, err)
+	}
 }

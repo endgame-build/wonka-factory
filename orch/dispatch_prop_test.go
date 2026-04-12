@@ -22,7 +22,7 @@ func TestProp_TerminalCountNeverDecreases(t *testing.T) {
 
 		lifecycle := testutil.MockLifecycleConfig(branch, "builder", "verifier")
 		pool := orch.NewWorkerPool(store, nil, 5, "prop-run", "/repo", t.TempDir())
-		d := orch.NewDispatcher(
+		d, dErr := orch.NewDispatcher(
 			store, pool, nil, nil, nil,
 			orch.NewGapTracker(100), orch.NewRetryState(), orch.NewHandoffState(3),
 			orch.RetryConfig{MaxRetries: 0},
@@ -30,6 +30,9 @@ func TestProp_TerminalCountNeverDecreases(t *testing.T) {
 			orch.DispatchConfig{Interval: time.Millisecond, AgentPollInterval: time.Millisecond},
 			nil,
 		)
+		if dErr != nil {
+			rt.Fatal(dErr)
+		}
 		d.SetSpawnFunc(testutil.ImmediateSpawnFunc(0))
 
 		prevTerminal := 0
@@ -67,7 +70,7 @@ func TestProp_NoDepsDispatchedBeforeTerminal(t *testing.T) {
 
 		lifecycle := testutil.MockLifecycleConfig(branch, "builder", "verifier")
 		pool := orch.NewWorkerPool(store, nil, 5, "prop-run", "/repo", t.TempDir())
-		d := orch.NewDispatcher(
+		d, dErr := orch.NewDispatcher(
 			store, pool, nil, nil, nil,
 			orch.NewGapTracker(100), orch.NewRetryState(), orch.NewHandoffState(3),
 			orch.RetryConfig{MaxRetries: 0},
@@ -75,6 +78,9 @@ func TestProp_NoDepsDispatchedBeforeTerminal(t *testing.T) {
 			orch.DispatchConfig{Interval: time.Millisecond, AgentPollInterval: time.Millisecond},
 			nil,
 		)
+		if dErr != nil {
+			rt.Fatal(dErr)
+		}
 		d.SetSpawnFunc(testutil.ImmediateSpawnFunc(0))
 
 		ctx := context.Background()
@@ -126,7 +132,7 @@ func TestProp_SingleWorkerPerTask(t *testing.T) {
 
 		lifecycle := testutil.MockLifecycleConfig(branch, "builder", "verifier")
 		pool := orch.NewWorkerPool(store, nil, 5, "prop-run", "/repo", t.TempDir())
-		d := orch.NewDispatcher(
+		d, dErr := orch.NewDispatcher(
 			store, pool, nil, nil, nil,
 			orch.NewGapTracker(100), orch.NewRetryState(), orch.NewHandoffState(3),
 			orch.RetryConfig{MaxRetries: 0},
@@ -134,6 +140,9 @@ func TestProp_SingleWorkerPerTask(t *testing.T) {
 			orch.DispatchConfig{Interval: time.Millisecond, AgentPollInterval: time.Millisecond},
 			nil,
 		)
+		if dErr != nil {
+			rt.Fatal(dErr)
+		}
 		d.SetSpawnFunc(testutil.ImmediateSpawnFunc(0))
 
 		ctx := context.Background()
@@ -199,7 +208,7 @@ func TestProp_GapBoundedOvershoot(t *testing.T) {
 		lifecycle.GapTolerance = tolerance
 		pool := orch.NewWorkerPool(store, nil, maxWorkers, "prop-run", "/repo", t.TempDir())
 		gaps := orch.NewGapTracker(tolerance)
-		d := orch.NewDispatcher(
+		d, dErr := orch.NewDispatcher(
 			store, pool, nil, nil, nil,
 			gaps, orch.NewRetryState(), orch.NewHandoffState(3),
 			orch.RetryConfig{MaxRetries: 0},
@@ -207,6 +216,9 @@ func TestProp_GapBoundedOvershoot(t *testing.T) {
 			orch.DispatchConfig{Interval: time.Millisecond, AgentPollInterval: time.Millisecond},
 			nil,
 		)
+		if dErr != nil {
+			rt.Fatal(dErr)
+		}
 		d.SetSpawnFunc(testutil.ImmediateSpawnFunc(1)) // all fail
 
 		ctx := context.Background()

@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -44,6 +45,8 @@ func NewTaskOutcome(task *Task, worker *Worker, outcome AgentOutcome, exitCode i
 type SpawnFunc func(ctx context.Context, task *Task, worker *Worker, roleCfg RoleConfig, outcomes chan<- TaskOutcome)
 
 // DispatchResult reports the outcome of a single Tick.
+// Invariant: LifecycleDone, GapAbort, and Error are mutually exclusive —
+// at most one is set per Tick return. Run() switches on them in that order.
 type DispatchResult struct {
 	Dispatched    int  // tasks dispatched this tick
 	OrphansFailed int  // tasks failed by CB orphan handling
@@ -80,6 +83,10 @@ type Dispatcher struct {
 
 // NewDispatcher creates a dispatcher wired to all subsystems. The spawnFunc
 // defaults to d.runAgent; call SetSpawnFunc to override for tests.
+//
+// Required dependencies: store, pool, lifecycle. Optional (nil-safe): lock,
+// log, watchdog, progress. Zero-value DispatchConfig fields are replaced with
+// DefaultDispatchConfig() values.
 func NewDispatcher(
 	store Store,
 	pool *WorkerPool,
@@ -93,13 +100,28 @@ func NewDispatcher(
 	lifecycle *LifecycleConfig,
 	cfg DispatchConfig,
 	progress ProgressReporter,
-) *Dispatcher {
-	bufSize := 4 // minimum buffer
-	if pool != nil {
-		bufSize = pool.MaxWorkers()
-		if bufSize < 1 {
-			bufSize = 4
-		}
+) (*Dispatcher, error) {
+	switch {
+	case store == nil:
+		return nil, fmt.Errorf("dispatcher: store is required")
+	case pool == nil:
+		return nil, fmt.Errorf("dispatcher: pool is required")
+	case lifecycle == nil:
+		return nil, fmt.Errorf("dispatcher: lifecycle is required")
+	}
+
+	// Apply defaults for zero-value config fields.
+	defaults := DefaultDispatchConfig()
+	if cfg.Interval == 0 {
+		cfg.Interval = defaults.Interval
+	}
+	if cfg.AgentPollInterval == 0 {
+		cfg.AgentPollInterval = defaults.AgentPollInterval
+	}
+
+	bufSize := pool.MaxWorkers()
+	if bufSize < 4 {
+		bufSize = 4
 	}
 	d := &Dispatcher{
 		store:       store,
@@ -118,7 +140,7 @@ func NewDispatcher(
 		progress:    progress,
 	}
 	d.spawnFunc = d.runAgent
-	return d
+	return d, nil
 }
 
 // SetSpawnFunc overrides the agent launch function and enables test mode.
@@ -137,7 +159,9 @@ func (d *Dispatcher) Wait() {
 // emit forwards an event to both the EventLog and the ProgressReporter.
 // Best-effort: dispatch decisions are never blocked by event logging failures.
 func (d *Dispatcher) emit(e Event) {
-	_ = emitAndNotify(d.log, d.progress, e)
+	if err := emitAndNotify(d.log, d.progress, e); err != nil {
+		d.warnf("emit event %s (task %s): %v", e.Kind, e.TaskID, err)
+	}
 }
 
 // warnf writes a diagnostic warning to stderr.
@@ -159,23 +183,36 @@ func (d *Dispatcher) processOutcome(o TaskOutcome) {
 		d.handleBlocked(o)
 	case OutcomeHandoff:
 		d.handleHandoff(o)
+	default:
+		d.warnf("unknown outcome %q for task %s — treating as failure", o.Outcome, o.Task.ID)
+		d.handleFailure(o)
 	}
 }
 
 // terminateAndRelease is the shared path for all terminal outcomes: set status,
-// assert irreversibility, persist, release worker, emit event.
-func (d *Dispatcher) terminateAndRelease(task *Task, workerName string, newStatus TaskStatus, event Event) {
+// assert irreversibility, persist, release worker, emit event. Returns true if
+// the store write succeeded; callers should skip downstream logic (gap/abort)
+// on false to avoid acting on state the store doesn't reflect.
+func (d *Dispatcher) terminateAndRelease(task *Task, workerName string, newStatus TaskStatus, event Event) bool {
 	prev := task.Status
 	task.Status = newStatus
 	task.UpdatedAt = time.Now()
 	AssertTerminalIrreversibility(prev, task.Status)
 	if err := d.store.UpdateTask(task); err != nil {
 		d.warnf("update task %s: %v", task.ID, err)
+		// Still release worker and emit event for observability, but signal
+		// callers that persisted state is inconsistent.
+		if releaseErr := d.pool.Release(workerName); releaseErr != nil {
+			d.warnf("release worker %s: %v", workerName, releaseErr)
+		}
+		d.emit(event)
+		return false
 	}
 	if err := d.pool.Release(workerName); err != nil {
 		d.warnf("release worker %s: %v", workerName, err)
 	}
 	d.emit(event)
+	return true
 }
 
 func (d *Dispatcher) handleSuccess(o TaskOutcome) {
@@ -202,19 +239,23 @@ func (d *Dispatcher) handleFailure(o TaskOutcome) {
 		return
 	}
 
-	d.terminateAndRelease(o.Task, o.Worker.Name, StatusFailed, Event{
+	persisted := d.terminateAndRelease(o.Task, o.Worker.Name, StatusFailed, Event{
 		Kind: EventTaskFailed, TaskID: o.Task.ID, Worker: o.Worker.Name,
 		Outcome: OutcomeFailure, Summary: fmt.Sprintf("task %s failed (exit %d)", o.Task.ID, o.ExitCode),
 	})
-	d.handleTerminalFailure(o.Task)
+	if persisted {
+		d.handleTerminalFailure(o.Task)
+	}
 }
 
 func (d *Dispatcher) handleBlocked(o TaskOutcome) {
-	d.terminateAndRelease(o.Task, o.Worker.Name, StatusBlocked, Event{
+	persisted := d.terminateAndRelease(o.Task, o.Worker.Name, StatusBlocked, Event{
 		Kind: EventTaskBlocked, TaskID: o.Task.ID, Worker: o.Worker.Name,
 		Outcome: OutcomeBlocked, Summary: fmt.Sprintf("task %s blocked (exit 2)", o.Task.ID),
 	})
-	d.handleTerminalFailure(o.Task)
+	if persisted {
+		d.handleTerminalFailure(o.Task)
+	}
 }
 
 func (d *Dispatcher) handleHandoff(o TaskOutcome) {
@@ -315,6 +356,7 @@ func (d *Dispatcher) orphanCk() int {
 	}
 	workers, err := d.store.ListWorkers()
 	if err != nil {
+		d.warnf("orphanCk list workers: %v", err)
 		return 0
 	}
 	failed := 0
@@ -323,13 +365,18 @@ func (d *Dispatcher) orphanCk() int {
 			continue
 		}
 		task, err := d.store.GetTask(w.CurrentTaskID)
-		if err != nil || task.Status.Terminal() {
+		if err != nil {
+			d.warnf("orphanCk get task %s: %v", w.CurrentTaskID, err)
+			continue
+		}
+		if task.Status.Terminal() {
 			continue
 		}
 		// Fail one task per tick.
 		task.Status = StatusFailed
 		task.UpdatedAt = time.Now()
 		if err := d.store.UpdateTask(task); err != nil {
+			d.warnf("orphanCk update task %s: %v", task.ID, err)
 			continue
 		}
 		if err := d.pool.Release(w.Name); err != nil {
@@ -379,15 +426,21 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 
 		// BVV-S-03: atomic assignment (at most one worker per task).
 		if err := d.store.Assign(task.ID, worker.Name); err != nil {
-			// Assignment failed (race, already assigned, etc.) — skip this task.
+			// Assignment failed (race, already assigned, etc.) — release worker, skip task.
+			if releaseErr := d.pool.Release(worker.Name); releaseErr != nil {
+				d.warnf("release worker %s after assign failure: %v", worker.Name, releaseErr)
+			}
 			continue
 		}
 		AssertSingleAssignment(d.store, task.ID)
 		AssertDependencyOrdering(d.store, task.ID)
 
 		// Re-read task after Assign (status now assigned).
-		task, err = d.store.GetTask(task.ID)
+		taskID := task.ID
+		task, err = d.store.GetTask(taskID)
 		if err != nil {
+			// task may be nil — use a synthetic task with the known ID for cleanup.
+			d.failTaskAndRelease(&Task{ID: taskID}, worker.Name, fmt.Errorf("re-read after assign: %w", err))
 			continue
 		}
 
@@ -396,10 +449,14 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 			// without tmux. The test SpawnFunc handles the "session".
 			task.Status = StatusInProgress
 			task.UpdatedAt = time.Now()
-			_ = d.store.UpdateTask(task)
+			if err := d.store.UpdateTask(task); err != nil {
+				d.warnf("test mode update task %s: %v", task.ID, err)
+			}
 			worker.Status = WorkerActive
 			worker.CurrentTaskID = task.ID
-			_ = d.store.UpdateWorker(worker)
+			if err := d.store.UpdateWorker(worker); err != nil {
+				d.warnf("test mode update worker %s: %v", worker.Name, err)
+			}
 		} else {
 			// Production: spawn tmux session.
 			if err := d.pool.SpawnSession(worker.Name, task, roleCfg, d.lifecycle.Branch); err != nil {
@@ -407,9 +464,13 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 				continue
 			}
 			// Re-read worker for SessionStartedAt (set by SpawnSession).
-			worker, err = d.store.GetWorker(worker.Name)
+			// Failure here means circuit breaker would use a zero SessionStartedAt,
+			// silently disabling rapid-failure detection — treat as spawn failure.
+			workerName := worker.Name
+			worker, err = d.store.GetWorker(workerName)
 			if err != nil {
-				d.warnf("re-read worker %s: %v", worker.Name, err)
+				d.failTaskAndRelease(task, workerName, fmt.Errorf("re-read worker after spawn: %w", err))
+				continue
 			}
 		}
 
@@ -445,7 +506,9 @@ func (d *Dispatcher) createEscalation(task *Task, role string) {
 		Priority: 0,
 	}
 	// Best-effort: escalation task may already exist from a prior tick.
-	_ = d.store.CreateTask(escTask)
+	if err := d.store.CreateTask(escTask); err != nil && !errors.Is(err, ErrTaskExists) {
+		d.warnf("create escalation task for %s: %v", task.ID, err)
+	}
 
 	// Block the original task so it stops appearing in ReadyTasks.
 	task.Status = StatusBlocked
@@ -461,8 +524,12 @@ func (d *Dispatcher) createEscalation(task *Task, role string) {
 func (d *Dispatcher) failTaskAndRelease(task *Task, workerName string, reason error) {
 	task.Status = StatusFailed
 	task.UpdatedAt = time.Now()
-	_ = d.store.UpdateTask(task)
-	_ = d.pool.Release(workerName)
+	if err := d.store.UpdateTask(task); err != nil {
+		d.warnf("failTaskAndRelease update task %s: %v", task.ID, err)
+	}
+	if err := d.pool.Release(workerName); err != nil {
+		d.warnf("failTaskAndRelease release worker %s: %v", workerName, err)
+	}
 	d.emit(Event{Kind: EventTaskFailed, TaskID: task.ID, Worker: workerName,
 		Summary: fmt.Sprintf("spawn failed: %v", reason)})
 }
@@ -472,6 +539,7 @@ func (d *Dispatcher) failTaskAndRelease(task *Task, workerName string, reason er
 func (d *Dispatcher) checkTermination() bool {
 	tasks, err := d.store.ListTasks(d.branchLabel)
 	if err != nil {
+		d.warnf("checkTermination list tasks: %v", err)
 		return false
 	}
 	for _, t := range tasks {
@@ -481,6 +549,7 @@ func (d *Dispatcher) checkTermination() bool {
 	}
 	workers, err := d.store.ListWorkers()
 	if err != nil {
+		d.warnf("checkTermination list workers: %v", err)
 		return false
 	}
 	for _, w := range workers {
@@ -566,7 +635,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 // channel. BVV-ERR-02/02a: timer-based session timeout with escalation.
 func (d *Dispatcher) runAgent(ctx context.Context, task *Task, worker *Worker, roleCfg RoleConfig, outcomes chan<- TaskOutcome) {
 	timeout := ScaledTimeout(d.retryCfg.BaseTimeout, d.retries.AttemptCount(task.ID))
-	timeout += RetryJitter(timeout)
+	timeout = RetryJitter(timeout)
 	deadline := time.After(timeout)
 
 	ticker := time.NewTicker(d.cfg.AgentPollInterval)
@@ -595,7 +664,10 @@ func (d *Dispatcher) runAgent(ctx context.Context, task *Task, worker *Worker, r
 	}
 
 done:
-	exitCode, _ := ReadExitCode(LogPath(d.pool.OutputDir(), task.ID))
+	exitCode, exitErr := ReadExitCode(LogPath(d.pool.OutputDir(), task.ID))
+	if exitErr != nil {
+		d.warnf("read exit code for task %s (worker %s): %v", task.ID, worker.Name, exitErr)
+	}
 
 	if timedOut || exitCode < 0 {
 		exitCode = 1

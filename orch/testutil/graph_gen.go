@@ -53,10 +53,3 @@ func RandomDAG(t *rapid.T, store orch.Store, branch string) []*orch.Task {
 
 	return tasks
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

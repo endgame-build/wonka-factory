@@ -114,8 +114,9 @@ func (gt *GapTracker) Count() int {
 }
 
 // TaskIDs returns the list of task IDs that contributed gaps.
+// The returned slice is a clone; callers cannot corrupt internal state.
 func (gt *GapTracker) TaskIDs() []string {
-	return gt.taskIDs
+	return slices.Clone(gt.taskIDs)
 }
 
 // SetGaps restores the tracker from a prior session's event-log replay

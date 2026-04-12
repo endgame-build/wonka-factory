@@ -29,7 +29,7 @@ func newTestDispatcher(t *testing.T, branch string, maxWorkers int, roles ...str
 	gaps := orch.NewGapTracker(lifecycle.GapTolerance)
 	handoffs := orch.NewHandoffState(lifecycle.MaxHandoffs)
 
-	d := orch.NewDispatcher(
+	d, err := orch.NewDispatcher(
 		store, pool, nil, nil, nil,
 		gaps, retries, handoffs,
 		orch.RetryConfig{MaxRetries: lifecycle.MaxRetries, BaseTimeout: 30 * time.Minute},
@@ -37,6 +37,7 @@ func newTestDispatcher(t *testing.T, branch string, maxWorkers int, roles ...str
 		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
 		nil, // no progress reporter
 	)
+	require.NoError(t, err)
 	return d, store, lifecycle
 }
 
@@ -256,7 +257,7 @@ func TestBVV_ERR03_CriticalTaskAbort(t *testing.T) {
 	pool := orch.NewWorkerPool(store, nil, 3, "test-run", "/repo", t.TempDir())
 
 	// No retries — failures are immediately terminal.
-	d := orch.NewDispatcher(
+	d, err := orch.NewDispatcher(
 		store, pool, nil, nil, nil,
 		orch.NewGapTracker(10), orch.NewRetryState(), orch.NewHandoffState(3),
 		orch.RetryConfig{MaxRetries: 0},
@@ -264,6 +265,7 @@ func TestBVV_ERR03_CriticalTaskAbort(t *testing.T) {
 		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
 		nil,
 	)
+	require.NoError(t, err)
 
 	// Create one critical task that will fail.
 	require.NoError(t, store.CreateTask(&orch.Task{
@@ -309,12 +311,14 @@ func TestBVV_DSP12_ConcurrentLifecycles(t *testing.T) {
 	poolA := orch.NewWorkerPool(store, nil, 2, "run-a", "/repo", t.TempDir())
 	poolB := orch.NewWorkerPool(store, nil, 2, "run-b", "/repo", t.TempDir())
 
-	dA := orch.NewDispatcher(store, poolA, nil, nil, nil,
+	dA, err := orch.NewDispatcher(store, poolA, nil, nil, nil,
 		orch.NewGapTracker(3), orch.NewRetryState(), orch.NewHandoffState(3),
 		orch.DefaultRetryConfig(), lcA, cfg, nil)
-	dB := orch.NewDispatcher(store, poolB, nil, nil, nil,
+	require.NoError(t, err)
+	dB, err := orch.NewDispatcher(store, poolB, nil, nil, nil,
 		orch.NewGapTracker(3), orch.NewRetryState(), orch.NewHandoffState(3),
 		orch.DefaultRetryConfig(), lcB, cfg, nil)
+	require.NoError(t, err)
 
 	var mu sync.Mutex
 	var aDispatched, bDispatched []string
@@ -360,7 +364,7 @@ func TestBVV_DSP04_ExitCodeOutcome(t *testing.T) {
 			lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
 			pool := orch.NewWorkerPool(store, nil, 1, "test-run", "/repo", t.TempDir())
 			// No retries so failures are immediately terminal.
-			d := orch.NewDispatcher(
+			d, err := orch.NewDispatcher(
 				store, pool, nil, nil, nil,
 				orch.NewGapTracker(10), orch.NewRetryState(), orch.NewHandoffState(3),
 				orch.RetryConfig{MaxRetries: 0},
@@ -368,6 +372,7 @@ func TestBVV_DSP04_ExitCodeOutcome(t *testing.T) {
 				orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
 				nil,
 			)
+			require.NoError(t, err)
 			require.NoError(t, store.CreateTask(&orch.Task{
 				ID: "task-1", Status: orch.StatusOpen, Priority: 0,
 				Labels: map[string]string{"branch": "feat/x", "role": "builder", "criticality": "non_critical"},
@@ -467,7 +472,7 @@ func TestBVV_ERR04_DispatchGapAbort(t *testing.T) {
 	lifecycle.GapTolerance = 2 // low tolerance for testing
 
 	pool := orch.NewWorkerPool(store, nil, 3, "test-run", "/repo", t.TempDir())
-	d := orch.NewDispatcher(
+	d, err := orch.NewDispatcher(
 		store, pool, nil, nil, nil,
 		orch.NewGapTracker(2), orch.NewRetryState(), orch.NewHandoffState(3),
 		orch.RetryConfig{MaxRetries: 0}, // no retries — failures go straight to gap
@@ -475,6 +480,7 @@ func TestBVV_ERR04_DispatchGapAbort(t *testing.T) {
 		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
 		nil,
 	)
+	require.NoError(t, err)
 
 	// Create 3 non-critical tasks that all fail.
 	testutil.ParallelGraph(t, store, "feat/x", "builder", 3)
