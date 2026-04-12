@@ -41,6 +41,9 @@ type LifecycleLock struct {
 // Path returns the lock file path.
 func (l *LifecycleLock) Path() string { return l.path }
 
+// IsHeld reports whether this lock instance has successfully acquired the lock.
+func (l *LifecycleLock) IsHeld() bool { return l.holderID != "" }
+
 // NewLifecycleLock creates a lock from a LockConfig.
 func NewLifecycleLock(cfg LockConfig) *LifecycleLock {
 	return &LifecycleLock{
