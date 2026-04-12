@@ -181,3 +181,26 @@ func TestLogPath_Canonical(t *testing.T) {
 	want := filepath.Join("/run/abc", "logs", "task-001.stdout")
 	assert.Equal(t, want, got)
 }
+
+// TestBVV_DSP04_DetermineOutcome verifies the exit-code-to-outcome mapping
+// (BVV-DSP-04). The orchestrator MUST determine task outcome from the exit
+// code alone — no output content inspection.
+func TestBVV_DSP04_DetermineOutcome(t *testing.T) {
+	cases := []struct {
+		exitCode int
+		want     orch.AgentOutcome
+	}{
+		{0, orch.OutcomeSuccess},
+		{1, orch.OutcomeFailure},
+		{2, orch.OutcomeBlocked},
+		{3, orch.OutcomeHandoff},
+		{-1, orch.OutcomeFailure},  // missing sidecar
+		{99, orch.OutcomeFailure},  // unknown code
+		{127, orch.OutcomeFailure}, // command not found
+		{255, orch.OutcomeFailure}, // signal death
+	}
+	for _, c := range cases {
+		got := orch.DetermineOutcome(c.exitCode)
+		assert.Equal(t, c.want, got, "DetermineOutcome(%d)", c.exitCode)
+	}
+}

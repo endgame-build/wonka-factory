@@ -39,6 +39,17 @@ func NewWorkerPool(store Store, tmux *TmuxClient, maxWorkers int, runID, repoPat
 	}
 }
 
+// OutputDir returns the run directory that holds logs and sidecar files.
+// Used by the dispatcher's runAgent to compute LogPath for exit-code reading.
+func (wp *WorkerPool) OutputDir() string { return wp.outputDir }
+
+// RunID returns the run identifier for session naming.
+func (wp *WorkerPool) RunID() string { return wp.runID }
+
+// MaxWorkers returns the pool capacity. Used by the dispatcher to size the
+// outcomes channel buffer.
+func (wp *WorkerPool) MaxWorkers() int { return wp.maxWorkers }
+
 // Allocate returns an idle worker, or creates a new one if capacity allows.
 // Worker names are w-01, w-02, etc. Returns ErrPoolExhausted if all workers
 // are active (BVV WKR-04..07).
@@ -190,8 +201,10 @@ func (wp *WorkerPool) Release(workerName string) error {
 		return fmt.Errorf("release: %w", err)
 	}
 
-	if err := wp.tmux.KillSessionIfExists(SessionName(wp.runID, workerName)); err != nil {
-		return fmt.Errorf("release: kill session: %w", err)
+	if wp.tmux != nil {
+		if err := wp.tmux.KillSessionIfExists(SessionName(wp.runID, workerName)); err != nil {
+			return fmt.Errorf("release: kill session: %w", err)
+		}
 	}
 
 	worker.Status = WorkerIdle
@@ -215,8 +228,10 @@ func (wp *WorkerPool) Deallocate(workerName string) error {
 		return ErrWorkerBusy
 	}
 
-	if err := wp.tmux.KillSessionIfExists(SessionName(wp.runID, workerName)); err != nil {
-		return fmt.Errorf("deallocate: %w", err)
+	if wp.tmux != nil {
+		if err := wp.tmux.KillSessionIfExists(SessionName(wp.runID, workerName)); err != nil {
+			return fmt.Errorf("deallocate: %w", err)
+		}
 	}
 	return nil
 }
@@ -237,8 +252,10 @@ func (wp *WorkerPool) ensureLogDir() error {
 // The HandoffState counter is NOT modified here — the caller (watchdog or
 // dispatcher) owns that accounting per the BVV-L-04 budget contract.
 func (wp *WorkerPool) RestartSession(workerName string, task *Task, roleCfg RoleConfig, branch string) error {
-	if err := wp.tmux.KillSessionIfExists(SessionName(wp.runID, workerName)); err != nil {
-		return fmt.Errorf("restart: kill: %w", err)
+	if wp.tmux != nil {
+		if err := wp.tmux.KillSessionIfExists(SessionName(wp.runID, workerName)); err != nil {
+			return fmt.Errorf("restart: kill: %w", err)
+		}
 	}
 	return wp.SpawnSession(workerName, task, roleCfg, branch)
 }
