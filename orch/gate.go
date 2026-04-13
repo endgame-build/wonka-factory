@@ -34,6 +34,10 @@ func DefaultGateConfig() GateConfig {
 // BVV-GT-01: the gate MUST NOT merge the PR. PR creation is the terminal action.
 // BVV-GT-02: gate failure does not block other lifecycles (enforced by lifecycle scoping).
 func ExecuteGate(ctx context.Context, store Store, log *EventLog, taskID, repoPath, targetBranch, sourceBranch string, cfg GateConfig) int {
+	if cfg.CITimeout == 0 {
+		cfg.CITimeout = DefaultGateConfig().CITimeout
+	}
+
 	// 1. Check predecessor statuses (BVV-GT-03).
 	deps, err := store.GetDeps(taskID)
 	if err != nil {
@@ -56,7 +60,13 @@ func ExecuteGate(ctx context.Context, store Store, log *EventLog, taskID, repoPa
 	emitGate(log, EventGateCreated, taskID, fmt.Sprintf("gate: creating PR %s → %s", sourceBranch, targetBranch))
 
 	// 2. Create PR (skip if one already exists for this branch).
-	if err := runGH(ctx, repoPath, "pr", "view", sourceBranch); err != nil {
+	prViewErr := runGH(ctx, repoPath, "pr", "view", sourceBranch)
+	if prViewErr != nil && !isGHNotFound(prViewErr) {
+		// Unexpected error (auth, network, misconfigured repo) — fail fast.
+		emitGate(log, EventGateFailed, taskID, fmt.Sprintf("gate: gh pr view: %v", prViewErr))
+		return 1
+	}
+	if prViewErr != nil {
 		// No existing PR — create one.
 		prArgs := []string{"pr", "create",
 			"--base", targetBranch,
@@ -95,6 +105,19 @@ func runGH(ctx context.Context, dir string, args ...string) error {
 		return fmt.Errorf("%s: %w (stderr: %s)", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+// isGHNotFound returns true when the error from runGH indicates the PR was
+// not found (gh stderr contains "no pull requests found" or "could not find
+// pull request"). Other failures (auth, network, repo misconfiguration)
+// return false so callers can fail fast instead of masking real problems.
+func isGHNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no pull requests found") ||
+		strings.Contains(msg, "could not find pull request")
 }
 
 // emitGate writes a gate event to the log. The gate runs inside a tmux

@@ -11,6 +11,7 @@ import (
 
 	"github.com/endgame/wonka-factory/orch"
 	"github.com/endgame/wonka-factory/orch/testutil"
+	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 )
 
@@ -194,7 +195,7 @@ func TestProp_GapBoundedOvershoot(t *testing.T) {
 		// Create parallel non-critical tasks that all fail.
 		n := rapid.IntRange(tolerance+1, tolerance+maxWorkers+3).Draw(rt, "numTasks")
 		for i := 0; i < n; i++ {
-			_ = store.CreateTask(&orch.Task{
+			err := store.CreateTask(&orch.Task{
 				ID:       rapid.StringMatching(`[a-z]{3}-[0-9]{2}`).Draw(rt, "id_"+string(rune('0'+i))),
 				Status:   orch.StatusOpen,
 				Priority: 0,
@@ -204,6 +205,7 @@ func TestProp_GapBoundedOvershoot(t *testing.T) {
 					orch.LabelCriticality: string(orch.NonCritical),
 				},
 			})
+			require.NoError(rt, err, "CreateTask must succeed for property test soundness")
 		}
 
 		lifecycle := testutil.MockLifecycleConfig(branch, "builder")

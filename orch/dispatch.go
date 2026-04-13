@@ -653,6 +653,15 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 // channel. BVV-ERR-02/02a: scaled session timeout (base * attempt multiplier),
 // treated as exit-code-1 on expiry.
 func (d *Dispatcher) runAgent(ctx context.Context, task *Task, worker *Worker, roleCfg RoleConfig, attemptCount int, outcomes chan<- TaskOutcome) {
+	if d.pool.tmux == nil {
+		d.warnf("runAgent: tmux client is nil, cannot monitor session for task %s", task.ID)
+		outcomes <- TaskOutcome{
+			Task: task, Worker: worker, Outcome: OutcomeBlocked,
+			ExitCode: 2, RoleCfg: roleCfg,
+		}
+		return
+	}
+
 	timeout := ScaledTimeout(d.retryCfg.BaseTimeout, attemptCount)
 	timeout = RetryJitter(timeout)
 	deadline := time.After(timeout)
