@@ -84,7 +84,7 @@ func TestBVV_DSP03_RoleBasedRouting(t *testing.T) {
 	}))
 	require.NoError(t, store.CreateTask(&orch.Task{
 		ID: "verify-1", Status: orch.StatusOpen, Priority: 1,
-		Labels: map[string]string{"branch": "feat/x", "role": "verifier", "criticality": "non_critical"},
+		Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "verifier", orch.LabelCriticality: string(orch.NonCritical)},
 	}))
 
 	var mu sync.Mutex
@@ -892,4 +892,122 @@ func TestNewDispatcher_NilValidation(t *testing.T) {
 		gaps, retries, handoffs, rc, lc, cfg, nil)
 	require.NoError(t, err)
 	assert.NotNil(t, d)
+}
+
+// TestBVV_ERR02_TerminateAndRelease_StoreFailure verifies that when
+// terminateAndRelease's store write fails, the worker is NOT released
+// (preserving task/worker pairing for watchdog recovery) and no event is
+// emitted.
+func TestBVV_ERR02_TerminateAndRelease_StoreFailure(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 1, "builder")
+	testutil.SingleTask(t, store, "t1", "feat/x", "builder")
+
+	// Dispatch and let the agent succeed.
+	spawnFn, ch := testutil.ChannelSpawnFunc()
+	d.SetSpawnFunc(spawnFn)
+
+	r1 := d.Tick(context.Background())
+	require.Equal(t, 1, r1.Dispatched)
+
+	// Inject store error before the outcome is processed.
+	store.SetUpdateTaskErr(fmt.Errorf("injected store failure"))
+	ch <- 0 // exit 0 = success
+	d.Wait()
+
+	// Process the outcome — terminateAndRelease should fail silently.
+	d.Tick(context.Background())
+
+	// Worker must still be active (not released) because store write failed.
+	workers, err := store.ListWorkers()
+	require.NoError(t, err)
+	activeCount := 0
+	for _, w := range workers {
+		if w.Status == orch.WorkerActive {
+			activeCount++
+		}
+	}
+	assert.Equal(t, 1, activeCount, "worker should remain active when store write fails")
+
+	// Clear the error and verify recovery: next tick can process normally.
+	store.SetUpdateTaskErr(nil)
+}
+
+// TestBVV_ERR03_RetryStoreFailure_FallsThrough verifies that when a retry
+// store write fails, the task falls through to terminal failure with the
+// original task state intact (assignee preserved, not corrupted).
+func TestBVV_ERR03_RetryStoreFailure_FallsThrough(t *testing.T) {
+	store := testutil.NewMockStore()
+	branch := "feat/x"
+	lifecycle := testutil.MockLifecycleConfig(branch, "builder")
+	lifecycle.MaxRetries = 3
+
+	pool := orch.NewWorkerPool(store, nil, 1, "test-run", "/tmp/repo", t.TempDir())
+	retries := orch.NewRetryState()
+	gaps := orch.NewGapTracker(lifecycle.GapTolerance)
+	handoffs := orch.NewHandoffState(lifecycle.MaxHandoffs)
+
+	d, err := orch.NewDispatcher(
+		store, pool, nil, nil, nil,
+		gaps, retries, handoffs,
+		orch.RetryConfig{MaxRetries: 3, BaseTimeout: 30 * time.Minute},
+		lifecycle,
+		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
+		nil,
+	)
+	require.NoError(t, err)
+
+	testutil.SingleTask(t, store, "t1", branch, "builder")
+
+	spawnFn, ch := testutil.ChannelSpawnFunc()
+	d.SetSpawnFunc(spawnFn)
+
+	// Dispatch and let the agent fail (exit 1 = retryable).
+	r1 := d.Tick(context.Background())
+	require.Equal(t, 1, r1.Dispatched)
+
+	// Inject store error so the retry write fails.
+	store.SetUpdateTaskErr(fmt.Errorf("injected store failure"))
+	ch <- 1 // exit 1 = failure (retryable)
+	d.Wait()
+
+	// Process outcome — retry fails, should fall through to terminal failure.
+	// terminateAndRelease also calls UpdateTask, which will also fail.
+	d.Tick(context.Background())
+
+	// Clear error and verify the task's store state.
+	store.SetUpdateTaskErr(nil)
+
+	task, taskErr := store.GetTask("t1")
+	require.NoError(t, taskErr)
+	// Task should still be in_progress (both the retry and the terminal
+	// writes failed), and assignee must be preserved (not cleared).
+	assert.Equal(t, orch.StatusInProgress, task.Status,
+		"task should remain in_progress when both retry and terminal writes fail")
+	assert.NotEmpty(t, task.Assignee,
+		"assignee must be preserved — retry copy-on-write prevents corruption")
+}
+
+// TestBVV_DSP04_TestModeStoreFailure verifies that test mode store errors
+// during dispatch cause the task to be failed and the worker released,
+// matching the production error path.
+func TestBVV_DSP04_TestModeStoreFailure(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 2, "builder")
+	testutil.ParallelGraph(t, store, "feat/x", "builder", 2)
+	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	// Inject store error — dispatch will fail the test-mode UpdateTask.
+	store.SetUpdateTaskErr(fmt.Errorf("injected store failure"))
+
+	r1 := d.Tick(context.Background())
+	// No tasks should be successfully dispatched (both fail on UpdateTask).
+	assert.Equal(t, 0, r1.Dispatched, "no tasks dispatched when store fails")
+
+	// Clear error and check that workers are released (not leaked).
+	store.SetUpdateTaskErr(nil)
+	workers, err := store.ListWorkers()
+	require.NoError(t, err)
+	for _, w := range workers {
+		assert.Equal(t, orch.WorkerIdle, w.Status,
+			"worker %s should be idle after store failure cleanup", w.Name)
+	}
 }

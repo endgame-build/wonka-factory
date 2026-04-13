@@ -15,7 +15,8 @@ import (
 
 // MockStore implements orch.Store using in-memory maps. It mirrors FSStore's
 // semantics (validateID, Assign atomicity, ReadyTasks filtering, sort order)
-// so it passes RunStoreContractTests — minus LDG01 (durability).
+// so it passes RunStoreContractTests — LDG01 (durability) is satisfied by
+// the test's closure-based reopen returning the same in-memory instance.
 //
 // Thread-safe via mutex: tests may spawn concurrent goroutines (LDG10, S03).
 type MockStore struct {
@@ -23,6 +24,10 @@ type MockStore struct {
 	tasks   map[string]*orch.Task
 	workers map[string]*orch.Worker
 	deps    map[string][]string // taskID → []dependsOn
+
+	// Error injection for testing store-failure paths.
+	// When non-nil, UpdateTask returns this error. Thread-safe: guarded by mu.
+	UpdateTaskErr error
 }
 
 // Compile-time interface compliance check.
@@ -35,6 +40,14 @@ func NewMockStore() *MockStore {
 		workers: make(map[string]*orch.Worker),
 		deps:    make(map[string][]string),
 	}
+}
+
+// SetUpdateTaskErr sets (or clears) the error returned by UpdateTask.
+// Thread-safe: acquires the store mutex.
+func (s *MockStore) SetUpdateTaskErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.UpdateTaskErr = err
 }
 
 // clone helpers — return copies so callers can't mutate internal state.
@@ -96,6 +109,9 @@ func (s *MockStore) UpdateTask(t *orch.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.UpdateTaskErr != nil {
+		return s.UpdateTaskErr
+	}
 	if _, ok := s.tasks[t.ID]; !ok {
 		return fmt.Errorf("task %q: %w", t.ID, orch.ErrNotFound)
 	}

@@ -121,7 +121,7 @@ func ReadAgentPrompt(instructionFile string) (body, model string, err error) {
 
 // DetermineOutcome maps a process exit code to an AgentOutcome (BVV-DSP-04).
 // The orchestrator MUST determine task outcome from the exit code alone — no
-// output content inspection (BVV-DSN-01..03, BVV-S-05).
+// output content inspection (BVV-DSN-04, BVV-S-05).
 //
 // BVV simplification from fork: the fork's DetermineOutcome took (exitCode,
 // outputErr, criticality) and mixed outcome determination with retry/gap

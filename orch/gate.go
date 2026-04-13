@@ -24,8 +24,7 @@ func DefaultGateConfig() GateConfig {
 
 // ExecuteGate implements the PR gate handler (BVV spec §8.3).
 //
-// The gate handler is implemented as a deterministic script (one of the two
-// options allowed by BVV-AI-02). It:
+// The gate handler is a deterministic script (BVV-GT-01..03). It:
 //  1. Checks predecessor statuses (BVV-GT-03) — skips PR if any dep failed/blocked
 //  2. Creates a PR via `gh pr create`
 //  3. Polls CI via `gh pr checks --watch` with timeout
@@ -120,10 +119,14 @@ func isGHNotFound(err error) bool {
 		strings.Contains(msg, "could not find pull request")
 }
 
-// emitGate writes a gate event to the log. The gate runs inside a tmux
-// session without access to ProgressReporter — only the EventLog is available.
+// emitGate writes a gate event to the log. ExecuteGate receives only an
+// EventLog (no ProgressReporter) because the gate handler is a standalone
+// script entry point, not wired through the Dispatcher's event pipeline.
+// When log is nil, events are written to stderr as a fallback so gate
+// operations are never completely unobservable.
 func emitGate(log *EventLog, kind EventKind, taskID, summary string) {
 	if log == nil {
+		fmt.Fprintf(os.Stderr, "gate %s (task %s): %s\n", kind, taskID, summary)
 		return
 	}
 	if err := log.Emit(Event{Kind: kind, TaskID: taskID, Summary: summary}); err != nil {

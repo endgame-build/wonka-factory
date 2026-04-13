@@ -196,7 +196,7 @@ func TestProp_GapBoundedOvershoot(t *testing.T) {
 		n := rapid.IntRange(tolerance+1, tolerance+maxWorkers+3).Draw(rt, "numTasks")
 		for i := 0; i < n; i++ {
 			err := store.CreateTask(&orch.Task{
-				ID:       rapid.StringMatching(`[a-z]{3}-[0-9]{2}`).Draw(rt, "id_"+string(rune('0'+i))),
+				ID:       fmt.Sprintf("gap-%d", i),
 				Status:   orch.StatusOpen,
 				Priority: 0,
 				Labels: map[string]string{

@@ -8,6 +8,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// SingleTask creates one open task with the given ID, branch, and role.
+func SingleTask(t *testing.T, store orch.Store, id, branch, role string) *orch.Task {
+	t.Helper()
+	task := &orch.Task{
+		ID:       id,
+		Title:    "task " + id,
+		Status:   orch.StatusOpen,
+		Priority: 0,
+		Labels: map[string]string{
+			orch.LabelBranch:      branch,
+			orch.LabelRole:        role,
+			orch.LabelCriticality: string(orch.NonCritical),
+		},
+	}
+	require.NoError(t, store.CreateTask(task))
+	return task
+}
+
 // LinearGraph creates a chain of n tasks: t-0 → t-1 → ... → t-(n-1).
 // Each task depends on the previous one. All tasks share the given branch and role.
 func LinearGraph(t *testing.T, store orch.Store, branch, role string, n int) []*orch.Task {

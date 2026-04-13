@@ -48,7 +48,8 @@ type SpawnFunc func(ctx context.Context, task *Task, worker *Worker, roleCfg Rol
 
 // DispatchResult reports the outcome of a single Tick.
 // Invariant: LifecycleDone, GapAbort, and Error are mutually exclusive —
-// at most one is set per Tick return. Run() switches on them in that order.
+// at most one of these three signal fields is true/non-nil per Tick return.
+// Dispatched and OrphansFailed are always populated alongside them.
 type DispatchResult struct {
 	Dispatched    int  // tasks dispatched this tick
 	OrphansFailed int  // tasks failed by CB orphan handling
@@ -57,7 +58,7 @@ type DispatchResult struct {
 	Error         error
 }
 
-// Dispatcher implements the DAG-driven dispatch loop (BVV-DSP-01..15).
+// Dispatcher implements the DAG-driven dispatch loop (BVV-DSP-01..14).
 // It queries ReadyTasks, assigns them to idle workers, spawns agent sessions,
 // and processes outcomes via a channel to keep state machines single-threaded.
 type Dispatcher struct {
@@ -232,15 +233,21 @@ func (d *Dispatcher) handleSuccess(o TaskOutcome) {
 
 func (d *Dispatcher) handleFailure(o TaskOutcome) {
 	if d.retries.CanRetry(o.Task.ID, d.retryCfg) {
-		o.Task.Status = StatusOpen
-		o.Task.Assignee = ""
-		o.Task.UpdatedAt = time.Now()
-		if err := d.store.UpdateTask(o.Task); err != nil {
+		// Work on a copy so the original task is untouched if the store write
+		// fails. Without this, falling through to terminateAndRelease would
+		// receive a task with Status=Open and Assignee="" — corrupting the
+		// terminal-fail store record and losing the worker attribution.
+		retryTask := *o.Task
+		retryTask.Status = StatusOpen
+		retryTask.Assignee = ""
+		retryTask.UpdatedAt = time.Now()
+		if err := d.store.UpdateTask(&retryTask); err != nil {
 			// Store write failed — retry cannot be persisted. Fall through to
 			// terminal failure so the task reaches a terminal state rather than
 			// being permanently orphaned as in_progress.
 			d.warnf("update task %s for retry: %v — failing task instead", o.Task.ID, err)
 		} else {
+			*o.Task = retryTask
 			d.retries.RecordAttempt(o.Task.ID)
 			if err := d.pool.Release(o.Worker.Name); err != nil {
 				d.warnf("release worker %s: %v", o.Worker.Name, err)
@@ -317,7 +324,8 @@ func (d *Dispatcher) handleTerminalFailure(task *Task) {
 	abort := d.gaps.IncrementAndCheck(task.ID)
 	// Note: AssertBoundedDegradation is NOT called here because gap count
 	// can overshoot tolerance by up to MaxWorkers-1 (concurrent in-flight
-	// outcomes processed after threshold). Property test verifies the bound.
+	// outcomes processed after threshold). TestProp_GapBoundedOvershoot
+	// verifies the bound.
 	d.emit(Event{Kind: EventGapRecorded, TaskID: task.ID,
 		Summary: fmt.Sprintf("gap %d/%d recorded for task %s", d.gaps.Count(), d.lifecycle.GapTolerance, task.ID)})
 	if abort {
@@ -361,6 +369,28 @@ func (d *Dispatcher) drainOutcomes(ctx context.Context) {
 	}
 }
 
+// failOrphanedTask fails a non-terminal in-progress task and releases its
+// worker. Shared by orphanCk (CB-tripped) and failStuckTasks (watchdog
+// budget-exhausted). Returns true if the task was successfully failed.
+func (d *Dispatcher) failOrphanedTask(taskID, workerName, summary string) bool {
+	task, err := d.store.GetTask(taskID)
+	if err != nil {
+		d.warnf("failOrphanedTask get task %s: %v", taskID, err)
+		return false
+	}
+	if task.Status.Terminal() {
+		return false
+	}
+	persisted := d.terminateAndRelease(task, workerName, StatusFailed, Event{
+		Kind: EventTaskFailed, TaskID: taskID, Worker: workerName,
+		Summary: summary,
+	})
+	if persisted {
+		d.handleTerminalFailure(task)
+	}
+	return persisted
+}
+
 // orphanCk handles circuit-breaker-tripped workers (SUP-05/06). When the CB
 // trips, one in-progress task per tick is failed to prevent thundering herd.
 func (d *Dispatcher) orphanCk() int {
@@ -377,32 +407,30 @@ func (d *Dispatcher) orphanCk() int {
 		if w.Status != WorkerActive || w.CurrentTaskID == "" {
 			continue
 		}
-		task, err := d.store.GetTask(w.CurrentTaskID)
-		if err != nil {
-			d.warnf("orphanCk get task %s: %v", w.CurrentTaskID, err)
-			continue
+		if d.failOrphanedTask(w.CurrentTaskID, w.Name, "circuit breaker tripped") {
+			failed++
+			break // one per tick
 		}
-		if task.Status.Terminal() {
-			continue
-		}
-		// Fail one task per tick.
-		task.Status = StatusFailed
-		task.UpdatedAt = time.Now()
-		if err := d.store.UpdateTask(task); err != nil {
-			d.warnf("orphanCk update task %s: %v", task.ID, err)
-			continue
-		}
-		if err := d.pool.Release(w.Name); err != nil {
-			d.warnf("orphanCk release %s: %v", w.Name, err)
-		}
-		d.emit(Event{Kind: EventTaskFailed, TaskID: task.ID, Worker: w.Name,
-			Summary: "circuit breaker tripped"})
-		d.handleTerminalFailure(task)
-		failed++
-		break // one per tick
 	}
 	if failed > 0 {
 		d.watchdog.ResetCB()
+	}
+	return failed
+}
+
+// failStuckTasks drains tasks that the watchdog identified as stuck (dead
+// session + exhausted handoff budget) and fails them. This closes the
+// liveness gap where such tasks would stay in_progress forever.
+func (d *Dispatcher) failStuckTasks() int {
+	if d.watchdog == nil {
+		return 0
+	}
+	stuck := d.watchdog.drainStuckTasks()
+	failed := 0
+	for _, s := range stuck {
+		if d.failOrphanedTask(s.taskID, s.workerName, "watchdog: session dead, handoff budget exhausted") {
+			failed++
+		}
 	}
 	return failed
 }
@@ -466,12 +494,14 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 			task.Status = StatusInProgress
 			task.UpdatedAt = time.Now()
 			if err := d.store.UpdateTask(task); err != nil {
-				d.warnf("test mode update task %s: %v", task.ID, err)
+				d.failTaskAndRelease(task, worker.Name, fmt.Errorf("test mode update task: %w", err))
+				continue
 			}
 			worker.Status = WorkerActive
 			worker.CurrentTaskID = task.ID
 			if err := d.store.UpdateWorker(worker); err != nil {
-				d.warnf("test mode update worker %s: %v", worker.Name, err)
+				d.failTaskAndRelease(task, worker.Name, fmt.Errorf("test mode update worker: %w", err))
+				continue
 			}
 		} else {
 			// Production: spawn tmux session.
@@ -589,6 +619,12 @@ func (d *Dispatcher) Tick(ctx context.Context) DispatchResult {
 	// 2. Handle CB-tripped orphans.
 	orphans := d.orphanCk()
 
+	// 2a. Fail tasks that the watchdog identified as stuck (dead session,
+	// handoff budget exhausted). Without this, such tasks stay in_progress
+	// forever since the watchdog skips them and the dispatcher never sees
+	// an outcome. BVV-S-02/S-10: the dispatcher owns the status transition.
+	orphans += d.failStuckTasks()
+
 	// 3. Check abort state.
 	if d.aborted {
 		return DispatchResult{OrphansFailed: orphans, GapAbort: true}
@@ -697,7 +733,8 @@ func (d *Dispatcher) runAgent(ctx context.Context, task *Task, worker *Worker, r
 		case <-ticker.C:
 			alive, err := d.pool.IsAlive(worker.Name)
 			if err != nil {
-				continue // tmux infra error — retry next tick
+				d.warnf("IsAlive check for %s (task %s): %v", worker.Name, task.ID, err)
+				continue // tmux infra error — retry next poll
 			}
 			if !alive {
 				goto done
