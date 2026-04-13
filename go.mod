@@ -6,6 +6,7 @@ require (
 	github.com/gofrs/flock v0.13.0
 	github.com/steveyegge/beads v0.63.3
 	github.com/stretchr/testify v1.11.1
+	pgregory.net/rapid v1.2.0
 )
 
 require (

@@ -143,6 +143,18 @@ type Watchdog struct {
 	handoffs *HandoffState         // BVV-ERR-11a / BVV-L-04
 	branch   string                // lifecycle scoping for session naming
 	progress ProgressReporter
+
+	// stuckMu guards stuckTasks. Written by CheckOnce (watchdog goroutine),
+	// read-and-drained by drainStuckTasks (dispatch goroutine).
+	stuckMu    sync.Mutex
+	stuckTasks []stuckTask // tasks with dead sessions and exhausted handoff budget
+}
+
+// stuckTask identifies a task that the watchdog detected as stuck: session
+// dead, handoff budget exhausted. The dispatcher uses this to fail the task.
+type stuckTask struct {
+	taskID     string
+	workerName string
 }
 
 // NewWatchdog creates a watchdog with the given dependencies. The roles map
@@ -285,16 +297,11 @@ func (w *Watchdog) CheckOnce() error {
 		// dispatcher's exit-3 path; see TryRecord docstring.
 		count, ok := w.handoffs.TryRecord(task.ID)
 		if !ok {
-			// Budget exhausted. Emit EventHandoffLimitReached and leave the
-			// task in place; the dispatcher observes the event on its next
-			// tick and converts the task to a failure (BVV-ERR-11a).
-			//
-			// Emit failures here are load-bearing: if the dispatcher never
-			// sees this event, the task stays in_progress forever (the
-			// watchdog will skip it next tick because budget is exhausted).
-			// Accumulate the error into tickErrs so Run() surfaces it via
-			// stderr — BVV-S-02/BVV-S-10 are still respected because we
-			// never touch task status.
+			// Budget exhausted. Emit EventHandoffLimitReached and record
+			// the task as stuck so the dispatcher can fail it on its next
+			// tick (BVV-ERR-11a). BVV-S-02/BVV-S-10 are respected because
+			// the watchdog never touches task status — drainStuckTasks lets
+			// the dispatcher do the transition.
 			if err := emitAndNotify(w.log, w.progress, Event{
 				Kind:    EventHandoffLimitReached,
 				TaskID:  task.ID,
@@ -304,6 +311,9 @@ func (w *Watchdog) CheckOnce() error {
 			}); err != nil {
 				tickErrs = append(tickErrs, fmt.Errorf("emit handoff_limit_reached %s: %w", task.ID, err))
 			}
+			w.stuckMu.Lock()
+			w.stuckTasks = append(w.stuckTasks, stuckTask{taskID: task.ID, workerName: worker.Name})
+			w.stuckMu.Unlock()
 			continue
 		}
 
@@ -356,4 +366,21 @@ func (w *Watchdog) RecordAgentFailure(workerName string, sessionStart time.Time)
 // successfully processing orphaned tasks.
 func (w *Watchdog) ResetCB() {
 	w.cb.Reset()
+}
+
+// drainStuckTasks returns and clears the list of tasks with dead sessions
+// and exhausted handoff budgets. The dispatcher calls this on each tick and
+// fails the returned tasks, closing the liveness gap where such tasks would
+// otherwise stay in_progress forever.
+// Thread-safe: called from the dispatch goroutine while CheckOnce runs on
+// the watchdog goroutine.
+func (w *Watchdog) drainStuckTasks() []stuckTask {
+	w.stuckMu.Lock()
+	defer w.stuckMu.Unlock()
+	if len(w.stuckTasks) == 0 {
+		return nil
+	}
+	tasks := w.stuckTasks
+	w.stuckTasks = nil
+	return tasks
 }
