@@ -41,8 +41,10 @@ func NewTaskOutcome(task *Task, worker *Worker, outcome AgentOutcome, exitCode i
 
 // SpawnFunc is the function signature for launching an agent. Production uses
 // Dispatcher.runAgent; tests inject mock implementations that send outcomes
-// directly to the channel.
-type SpawnFunc func(ctx context.Context, task *Task, worker *Worker, roleCfg RoleConfig, outcomes chan<- TaskOutcome)
+// directly to the channel. The attemptCount parameter carries the retry
+// attempt count captured on the dispatch goroutine (single-threaded), avoiding
+// a data race on RetryState from the spawned goroutine.
+type SpawnFunc func(ctx context.Context, task *Task, worker *Worker, roleCfg RoleConfig, attemptCount int, outcomes chan<- TaskOutcome)
 
 // DispatchResult reports the outcome of a single Tick.
 // Invariant: LifecycleDone, GapAbort, and Error are mutually exclusive —
@@ -84,9 +86,9 @@ type Dispatcher struct {
 // NewDispatcher creates a dispatcher wired to all subsystems. The spawnFunc
 // defaults to d.runAgent; call SetSpawnFunc to override for tests.
 //
-// Required dependencies: store, pool, lifecycle. Optional (nil-safe): lock,
-// log, watchdog, progress. Zero-value DispatchConfig fields are replaced with
-// DefaultDispatchConfig() values.
+// Required dependencies: store, pool, lifecycle, gaps, retries, handoffs.
+// Optional (nil-safe): lock, log, watchdog, progress. Zero-value
+// DispatchConfig fields are replaced with DefaultDispatchConfig() values.
 func NewDispatcher(
 	store Store,
 	pool *WorkerPool,
@@ -108,6 +110,12 @@ func NewDispatcher(
 		return nil, fmt.Errorf("dispatcher: pool is required")
 	case lifecycle == nil:
 		return nil, fmt.Errorf("dispatcher: lifecycle is required")
+	case gaps == nil:
+		return nil, fmt.Errorf("dispatcher: gaps is required")
+	case retries == nil:
+		return nil, fmt.Errorf("dispatcher: retries is required")
+	case handoffs == nil:
+		return nil, fmt.Errorf("dispatcher: handoffs is required")
 	}
 
 	// Apply defaults for zero-value config fields.
@@ -173,7 +181,7 @@ func (d *Dispatcher) warnf(format string, args ...any) {
 
 // processOutcome routes a completed agent's exit code to the appropriate
 // state transition. BVV-DSP-09: the orchestrator is authoritative for status.
-func (d *Dispatcher) processOutcome(o TaskOutcome) {
+func (d *Dispatcher) processOutcome(ctx context.Context, o TaskOutcome) {
 	switch o.Outcome {
 	case OutcomeSuccess:
 		d.handleSuccess(o)
@@ -182,7 +190,7 @@ func (d *Dispatcher) processOutcome(o TaskOutcome) {
 	case OutcomeBlocked:
 		d.handleBlocked(o)
 	case OutcomeHandoff:
-		d.handleHandoff(o)
+		d.handleHandoff(ctx, o)
 	default:
 		d.warnf("unknown outcome %q for task %s — treating as failure", o.Outcome, o.Task.ID)
 		d.handleFailure(o)
@@ -190,7 +198,9 @@ func (d *Dispatcher) processOutcome(o TaskOutcome) {
 }
 
 // terminateAndRelease is the shared path for all terminal outcomes: set status,
-// assert irreversibility, persist, release worker, emit event. Returns true if
+// assert irreversibility, persist to store. On success, releases the worker and
+// emits the event. On store failure, neither release nor emit occurs — the
+// task/worker pairing stays consistent for watchdog recovery. Returns true if
 // the store write succeeded; callers should skip downstream logic (gap/abort)
 // on false to avoid acting on state the store doesn't reflect.
 func (d *Dispatcher) terminateAndRelease(task *Task, workerName string, newStatus TaskStatus, event Event) bool {
@@ -200,12 +210,10 @@ func (d *Dispatcher) terminateAndRelease(task *Task, workerName string, newStatu
 	AssertTerminalIrreversibility(prev, task.Status)
 	if err := d.store.UpdateTask(task); err != nil {
 		d.warnf("update task %s: %v", task.ID, err)
-		// Still release worker and emit event for observability, but signal
-		// callers that persisted state is inconsistent.
-		if releaseErr := d.pool.Release(workerName); releaseErr != nil {
-			d.warnf("release worker %s: %v", workerName, releaseErr)
-		}
-		d.emit(event)
+		// Do NOT release worker or emit event — the store still shows the task
+		// as in_progress with this worker assigned. Releasing the worker would
+		// create inconsistency (idle worker, orphaned task). The watchdog or a
+		// subsequent tick can retry once the store recovers.
 		return false
 	}
 	if err := d.pool.Release(workerName); err != nil {
@@ -224,19 +232,23 @@ func (d *Dispatcher) handleSuccess(o TaskOutcome) {
 
 func (d *Dispatcher) handleFailure(o TaskOutcome) {
 	if d.retries.CanRetry(o.Task.ID, d.retryCfg) {
-		d.retries.RecordAttempt(o.Task.ID)
 		o.Task.Status = StatusOpen
 		o.Task.Assignee = ""
 		o.Task.UpdatedAt = time.Now()
 		if err := d.store.UpdateTask(o.Task); err != nil {
-			d.warnf("update task %s for retry: %v", o.Task.ID, err)
+			// Store write failed — retry cannot be persisted. Fall through to
+			// terminal failure so the task reaches a terminal state rather than
+			// being permanently orphaned as in_progress.
+			d.warnf("update task %s for retry: %v — failing task instead", o.Task.ID, err)
+		} else {
+			d.retries.RecordAttempt(o.Task.ID)
+			if err := d.pool.Release(o.Worker.Name); err != nil {
+				d.warnf("release worker %s: %v", o.Worker.Name, err)
+			}
+			d.emit(Event{Kind: EventTaskRetried, TaskID: o.Task.ID, Worker: o.Worker.Name,
+				Summary: fmt.Sprintf("task %s retried (attempt %d)", o.Task.ID, d.retries.AttemptCount(o.Task.ID))})
+			return
 		}
-		if err := d.pool.Release(o.Worker.Name); err != nil {
-			d.warnf("release worker %s: %v", o.Worker.Name, err)
-		}
-		d.emit(Event{Kind: EventTaskRetried, TaskID: o.Task.ID, Worker: o.Worker.Name,
-			Summary: fmt.Sprintf("task %s retried (attempt %d)", o.Task.ID, d.retries.AttemptCount(o.Task.ID))})
-		return
 	}
 
 	persisted := d.terminateAndRelease(o.Task, o.Worker.Name, StatusFailed, Event{
@@ -258,7 +270,7 @@ func (d *Dispatcher) handleBlocked(o TaskOutcome) {
 	}
 }
 
-func (d *Dispatcher) handleHandoff(o TaskOutcome) {
+func (d *Dispatcher) handleHandoff(ctx context.Context, o TaskOutcome) {
 	count, ok := d.handoffs.TryRecord(o.Task.ID)
 	if ok {
 		// Handoff within budget — restart session (BVV-DSP-14: status stays in_progress).
@@ -274,11 +286,12 @@ func (d *Dispatcher) handleHandoff(o TaskOutcome) {
 
 		// In test mode, re-launch the SpawnFunc goroutine for the restarted session.
 		if d.testMode {
+			attempts := d.retries.AttemptCount(o.Task.ID)
 			d.agentWg.Add(1)
-			go func() {
+			go func(t *Task, w *Worker, rc RoleConfig, ac int) {
 				defer d.agentWg.Done()
-				d.spawnFunc(context.Background(), o.Task, o.Worker, o.RoleCfg, d.outcomes)
-			}()
+				d.spawnFunc(ctx, t, w, rc, ac, d.outcomes)
+			}(o.Task, o.Worker, o.RoleCfg, attempts)
 		}
 		return
 	}
@@ -337,11 +350,11 @@ func (d *Dispatcher) abortCleanup() {
 
 // drainOutcomes processes all completed agent outcomes from the channel.
 // Non-blocking: returns when the channel is empty.
-func (d *Dispatcher) drainOutcomes() {
+func (d *Dispatcher) drainOutcomes(ctx context.Context) {
 	for {
 		select {
 		case o := <-d.outcomes:
-			d.processOutcome(o)
+			d.processOutcome(ctx, o)
 		default:
 			return
 		}
@@ -421,12 +434,15 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 		// Allocate worker — ErrPoolExhausted means all slots busy, try next tick.
 		worker, err := d.pool.Allocate()
 		if err != nil {
-			break // pool exhausted
+			if !errors.Is(err, ErrPoolExhausted) {
+				d.warnf("allocate worker: %v", err)
+			}
+			break
 		}
 
 		// BVV-S-03: atomic assignment (at most one worker per task).
 		if err := d.store.Assign(task.ID, worker.Name); err != nil {
-			// Assignment failed (race, already assigned, etc.) — release worker, skip task.
+			d.warnf("assign task %s to %s: %v", task.ID, worker.Name, err)
 			if releaseErr := d.pool.Release(worker.Name); releaseErr != nil {
 				d.warnf("release worker %s after assign failure: %v", worker.Name, releaseErr)
 			}
@@ -477,12 +493,14 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 		d.emit(Event{Kind: EventTaskDispatched, TaskID: task.ID, Worker: worker.Name,
 			Summary: fmt.Sprintf("task %s dispatched to %s (role: %s)", task.ID, worker.Name, role)})
 
-		// Launch agent monitoring goroutine.
+		// Launch agent monitoring goroutine. Capture attemptCount here on the
+		// dispatch goroutine to avoid a data race on RetryState.
+		attempts := d.retries.AttemptCount(task.ID)
 		d.agentWg.Add(1)
-		go func(t *Task, w *Worker, rc RoleConfig) {
+		go func(t *Task, w *Worker, rc RoleConfig, ac int) {
 			defer d.agentWg.Done()
-			d.spawnFunc(ctx, t, w, rc, d.outcomes)
-		}(task, worker, roleCfg)
+			d.spawnFunc(ctx, t, w, rc, ac, d.outcomes)
+		}(task, worker, roleCfg, attempts)
 
 		dispatched++
 	}
@@ -566,7 +584,7 @@ func (d *Dispatcher) checkTermination() bool {
 // ready tasks, check termination, refresh lock.
 func (d *Dispatcher) Tick(ctx context.Context) DispatchResult {
 	// 1. Process completed agent outcomes.
-	d.drainOutcomes()
+	d.drainOutcomes(ctx)
 
 	// 2. Handle CB-tripped orphans.
 	orphans := d.orphanCk()
@@ -632,9 +650,10 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 
 // runAgent is the default SpawnFunc. It polls the tmux session for liveness,
 // reads the exit code from the sidecar file, and sends the outcome on the
-// channel. BVV-ERR-02/02a: timer-based session timeout with escalation.
-func (d *Dispatcher) runAgent(ctx context.Context, task *Task, worker *Worker, roleCfg RoleConfig, outcomes chan<- TaskOutcome) {
-	timeout := ScaledTimeout(d.retryCfg.BaseTimeout, d.retries.AttemptCount(task.ID))
+// channel. BVV-ERR-02/02a: scaled session timeout (base * attempt multiplier),
+// treated as exit-code-1 on expiry.
+func (d *Dispatcher) runAgent(ctx context.Context, task *Task, worker *Worker, roleCfg RoleConfig, attemptCount int, outcomes chan<- TaskOutcome) {
+	timeout := ScaledTimeout(d.retryCfg.BaseTimeout, attemptCount)
 	timeout = RetryJitter(timeout)
 	deadline := time.After(timeout)
 
@@ -645,11 +664,25 @@ func (d *Dispatcher) runAgent(ctx context.Context, task *Task, worker *Worker, r
 	for {
 		select {
 		case <-ctx.Done():
-			return // shutdown — don't send outcome
+			// Graceful shutdown — kill the tmux session to prevent zombies,
+			// then send a failure outcome so the dispatcher can release the
+			// worker cleanly. Without this, the worker stays Active in the
+			// store with no monitoring goroutine.
+			sessionName := SessionName(d.pool.RunID(), worker.Name)
+			if err := d.pool.tmux.KillSessionIfExists(sessionName); err != nil {
+				d.warnf("shutdown kill session %s: %v", sessionName, err)
+			}
+			outcomes <- TaskOutcome{
+				Task: task, Worker: worker, Outcome: OutcomeFailure,
+				ExitCode: 1, RoleCfg: roleCfg,
+			}
+			return
 		case <-deadline:
 			// BVV-ERR-02a: session timeout.
 			sessionName := SessionName(d.pool.RunID(), worker.Name)
-			d.pool.tmux.KillSessionIfExists(sessionName) //nolint:errcheck
+			if err := d.pool.tmux.KillSessionIfExists(sessionName); err != nil {
+				d.warnf("timeout kill session %s: %v", sessionName, err)
+			}
 			timedOut = true
 			goto done
 		case <-ticker.C:

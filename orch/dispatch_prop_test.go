@@ -4,6 +4,8 @@ package orch_test
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -237,6 +239,78 @@ func TestProp_GapBoundedOvershoot(t *testing.T) {
 			if r.GapAbort || r.LifecycleDone {
 				break
 			}
+		}
+	})
+}
+
+// TestProp_MixedOutcomeDAGTerminates verifies that random DAGs with random
+// exit codes (0/1/2) always terminate: every task reaches a terminal state
+// and no invariant is violated. This stress-tests the interaction between
+// failures, retries, gap accumulation, and dependency blocking.
+func TestProp_MixedOutcomeDAGTerminates(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		store := testutil.NewMockStore()
+		branch := "prop-mixed"
+		tasks := testutil.RandomDAG(rt, store, branch)
+
+		maxRetries := rapid.IntRange(0, 2).Draw(rt, "maxRetries")
+		tolerance := rapid.IntRange(1, len(tasks)+1).Draw(rt, "tolerance")
+		maxWorkers := rapid.IntRange(1, 5).Draw(rt, "maxWorkers")
+
+		lifecycle := testutil.MockLifecycleConfig(branch, "builder", "verifier")
+		lifecycle.GapTolerance = tolerance
+		lifecycle.MaxRetries = maxRetries
+
+		pool := orch.NewWorkerPool(store, nil, maxWorkers, "prop-run", "/repo", t.TempDir())
+		gaps := orch.NewGapTracker(tolerance)
+		d, dErr := orch.NewDispatcher(
+			store, pool, nil, nil, nil,
+			gaps, orch.NewRetryState(), orch.NewHandoffState(3),
+			orch.RetryConfig{MaxRetries: maxRetries},
+			lifecycle,
+			orch.DispatchConfig{Interval: time.Millisecond, AgentPollInterval: time.Millisecond},
+			nil,
+		)
+		if dErr != nil {
+			rt.Fatal(dErr)
+		}
+
+		// Pre-generate exit codes from rapid on the test goroutine (thread-safe).
+		// SpawnFunc goroutines pick from this pool via atomic index.
+		maxTicks := 200
+		exitCodes := []int{0, 1, 2}
+		codePoolSize := maxTicks * maxWorkers
+		if codePoolSize < 10 {
+			codePoolSize = 10
+		}
+		codePool := make([]int, codePoolSize)
+		for i := range codePool {
+			codePool[i] = rapid.SampledFrom(exitCodes).Draw(rt, fmt.Sprintf("code_%d", i))
+		}
+		var codeIdx atomic.Int64
+		d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+			idx := int(codeIdx.Add(1)-1) % codePoolSize
+			code := codePool[idx]
+			outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(code), code, roleCfg)
+		})
+
+		ctx := context.Background()
+		terminated := false
+		for tick := 0; tick < maxTicks; tick++ {
+			r := d.Tick(ctx)
+			d.Wait()
+			if r.LifecycleDone || r.GapAbort {
+				terminated = true
+				break
+			}
+			if r.Error != nil {
+				rt.Fatalf("unexpected dispatch error at tick %d: %v", tick, r.Error)
+			}
+		}
+
+		if !terminated {
+			rt.Fatalf("DAG with %d tasks did not terminate within %d ticks (tolerance=%d, retries=%d, workers=%d)",
+				len(tasks), maxTicks, tolerance, maxRetries, maxWorkers)
 		}
 	})
 }

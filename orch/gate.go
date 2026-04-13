@@ -24,7 +24,8 @@ func DefaultGateConfig() GateConfig {
 
 // ExecuteGate implements the PR gate handler (BVV spec §8.3).
 //
-// The gate is a deterministic script (BVV-AI-02), not an AI agent. It:
+// The gate handler is implemented as a deterministic script (one of the two
+// options allowed by BVV-AI-02). It:
 //  1. Checks predecessor statuses (BVV-GT-03) — skips PR if any dep failed/blocked
 //  2. Creates a PR via `gh pr create`
 //  3. Polls CI via `gh pr checks --watch` with timeout

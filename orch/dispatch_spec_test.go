@@ -5,6 +5,7 @@ package orch_test
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -79,7 +80,7 @@ func TestBVV_DSP03_RoleBasedRouting(t *testing.T) {
 	// Create tasks with different roles.
 	require.NoError(t, store.CreateTask(&orch.Task{
 		ID: "build-1", Status: orch.StatusOpen, Priority: 0,
-		Labels: map[string]string{"branch": "feat/x", "role": "builder", "criticality": "non_critical"},
+		Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "builder", orch.LabelCriticality: string(orch.NonCritical)},
 	}))
 	require.NoError(t, store.CreateTask(&orch.Task{
 		ID: "verify-1", Status: orch.StatusOpen, Priority: 1,
@@ -88,7 +89,7 @@ func TestBVV_DSP03_RoleBasedRouting(t *testing.T) {
 
 	var mu sync.Mutex
 	var dispatched []string
-	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, outcomes chan<- orch.TaskOutcome) {
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		mu.Lock()
 		dispatched = append(dispatched, task.ID+":"+task.Role())
 		mu.Unlock()
@@ -137,7 +138,7 @@ func TestBVV_DSP05_OneTaskPerSession(t *testing.T) {
 	testutil.ParallelGraph(t, store, "feat/x", "builder", 3)
 
 	var spawnCount atomic.Int32
-	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, outcomes chan<- orch.TaskOutcome) {
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		spawnCount.Add(1)
 		outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeSuccess, 0, roleCfg)
 	})
@@ -155,7 +156,7 @@ func TestBVV_DSP08_LifecycleScoping(t *testing.T) {
 	// Create tasks on two different branches.
 	require.NoError(t, store.CreateTask(&orch.Task{
 		ID: "on-branch", Status: orch.StatusOpen, Priority: 0,
-		Labels: map[string]string{"branch": "feat/x", "role": "builder", "criticality": "non_critical"},
+		Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "builder", orch.LabelCriticality: string(orch.NonCritical)},
 	}))
 	require.NoError(t, store.CreateTask(&orch.Task{
 		ID: "off-branch", Status: orch.StatusOpen, Priority: 0,
@@ -164,7 +165,7 @@ func TestBVV_DSP08_LifecycleScoping(t *testing.T) {
 
 	var mu sync.Mutex
 	var dispatched []string
-	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, outcomes chan<- orch.TaskOutcome) {
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		mu.Lock()
 		dispatched = append(dispatched, task.ID)
 		mu.Unlock()
@@ -184,7 +185,7 @@ func TestBVV_DSP09_OrchestratorAuthority(t *testing.T) {
 	d, store, _ := newTestDispatcher(t, "feat/x", 1, "builder")
 	testutil.ParallelGraph(t, store, "feat/x", "builder", 1)
 
-	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, outcomes chan<- orch.TaskOutcome) {
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		// Agent does NOT modify task status — it just exits.
 		outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeSuccess, 0, roleCfg)
 	})
@@ -210,7 +211,7 @@ func TestBVV_DSP14_HandoffNoStatusChange(t *testing.T) {
 	testutil.ParallelGraph(t, store, "feat/x", "builder", 1)
 
 	var callCount atomic.Int32
-	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, outcomes chan<- orch.TaskOutcome) {
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		n := callCount.Add(1)
 		if n == 1 {
 			outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeHandoff, 3, roleCfg)
@@ -270,7 +271,7 @@ func TestBVV_ERR03_CriticalTaskAbort(t *testing.T) {
 	// Create one critical task that will fail.
 	require.NoError(t, store.CreateTask(&orch.Task{
 		ID: "critical-1", Status: orch.StatusOpen, Priority: 0,
-		Labels: map[string]string{"branch": "feat/x", "role": "builder", "criticality": "critical"},
+		Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "builder", orch.LabelCriticality: string(orch.Critical)},
 	}))
 
 	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(1)) // task fails
@@ -322,13 +323,13 @@ func TestBVV_DSP12_ConcurrentLifecycles(t *testing.T) {
 
 	var mu sync.Mutex
 	var aDispatched, bDispatched []string
-	dA.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, outcomes chan<- orch.TaskOutcome) {
+	dA.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		mu.Lock()
 		aDispatched = append(aDispatched, task.ID)
 		mu.Unlock()
 		outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeSuccess, 0, roleCfg)
 	})
-	dB.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, outcomes chan<- orch.TaskOutcome) {
+	dB.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		mu.Lock()
 		bDispatched = append(bDispatched, task.ID)
 		mu.Unlock()
@@ -375,7 +376,7 @@ func TestBVV_DSP04_ExitCodeOutcome(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, store.CreateTask(&orch.Task{
 				ID: "task-1", Status: orch.StatusOpen, Priority: 0,
-				Labels: map[string]string{"branch": "feat/x", "role": "builder", "criticality": "non_critical"},
+				Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "builder", orch.LabelCriticality: string(orch.NonCritical)},
 			}))
 			d.SetSpawnFunc(testutil.ImmediateSpawnFunc(c.exitCode))
 
@@ -493,4 +494,402 @@ func TestBVV_ERR04_DispatchGapAbort(t *testing.T) {
 	r := d.Tick(context.Background())
 
 	assert.True(t, r.GapAbort, "gap tolerance reached → lifecycle aborted")
+}
+
+// TestBVV_ERR01_RetryBehavior verifies the retry protocol (BVV-ERR-01):
+// exit code 1 with retries remaining → task is re-dispatched (same ID, no
+// clones). After exhausting retries, the task transitions to StatusFailed.
+func TestBVV_ERR01_RetryBehavior(t *testing.T) {
+	store := testutil.NewMockStore()
+	lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
+	pool := orch.NewWorkerPool(store, nil, 1, "test-run", "/repo", t.TempDir())
+
+	gaps := orch.NewGapTracker(10)
+	retries := orch.NewRetryState()
+	d, err := orch.NewDispatcher(
+		store, pool, nil, nil, nil,
+		gaps, retries, orch.NewHandoffState(3),
+		orch.RetryConfig{MaxRetries: 2, BaseTimeout: 30 * time.Minute},
+		lifecycle,
+		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
+		nil,
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID: "retry-me", Status: orch.StatusOpen, Priority: 0,
+		Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "builder", orch.LabelCriticality: string(orch.NonCritical)},
+	}))
+
+	// Count how many times the SpawnFunc is invoked (= dispatch count).
+	var spawnCount atomic.Int32
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		spawnCount.Add(1)
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeFailure, 1, roleCfg)
+	})
+
+	ctx := context.Background()
+
+	// Run ticks until the task reaches a terminal state.
+	// MaxRetries=2 means 3 total attempts (1 initial + 2 retries).
+	for i := 0; i < 20; i++ {
+		d.Tick(ctx)
+		d.Wait()
+		task, _ := store.GetTask("retry-me")
+		if task.Status.Terminal() {
+			break
+		}
+	}
+
+	task, _ := store.GetTask("retry-me")
+	assert.Equal(t, orch.StatusFailed, task.Status,
+		"after exhausting retries: task should be failed")
+	assert.Equal(t, int32(3), spawnCount.Load(),
+		"task should be dispatched 3 times (1 initial + 2 retries)")
+
+	// Verify no retry-task clones were created (BVV retries reset the same task).
+	tasks, _ := store.ListTasks("branch:feat/x")
+	assert.Len(t, tasks, 1, "only the original task should exist — no clones")
+}
+
+// TestBVV_L04_HandoffBudgetExhaustion verifies that exceeding the handoff
+// limit transitions the task to failed (BVV-L-04).
+func TestBVV_L04_HandoffBudgetExhaustion(t *testing.T) {
+	store := testutil.NewMockStore()
+	lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
+	pool := orch.NewWorkerPool(store, nil, 1, "test-run", "/repo", t.TempDir())
+
+	// MaxHandoffs=1 means the first handoff succeeds, the second exhausts budget.
+	handoffs := orch.NewHandoffState(1)
+	d, err := orch.NewDispatcher(
+		store, pool, nil, nil, nil,
+		orch.NewGapTracker(10), orch.NewRetryState(), handoffs,
+		orch.RetryConfig{MaxRetries: 0, BaseTimeout: 30 * time.Minute},
+		lifecycle,
+		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
+		nil,
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID: "handoff-task", Status: orch.StatusOpen, Priority: 0,
+		Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "builder", orch.LabelCriticality: string(orch.NonCritical)},
+	}))
+
+	// Every invocation exits 3 (handoff).
+	var callCount atomic.Int32
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		callCount.Add(1)
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeHandoff, 3, roleCfg)
+	})
+
+	ctx := context.Background()
+
+	// Tick 1: dispatch → agent exits 3 (handoff #1, within budget).
+	d.Tick(ctx)
+	d.Wait()
+	// Tick 2: process handoff #1 → re-launch → agent exits 3 again (handoff #2).
+	d.Tick(ctx)
+	d.Wait()
+	// Tick 3: process handoff #2 → budget exhausted → treat as failure → task fails.
+	d.Tick(ctx)
+
+	task, err := store.GetTask("handoff-task")
+	require.NoError(t, err)
+	assert.Equal(t, orch.StatusFailed, task.Status,
+		"handoff budget exhausted → task should be failed")
+	assert.GreaterOrEqual(t, callCount.Load(), int32(2),
+		"SpawnFunc should have been called at least twice (initial + 1 handoff)")
+}
+
+// TestBVV_Run_LifecycleDone verifies that Run() returns nil when all tasks
+// complete normally.
+func TestBVV_Run_LifecycleDone(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 3, "builder")
+	testutil.ParallelGraph(t, store, "feat/x", "builder", 3)
+	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	err := d.Run(context.Background())
+	assert.NoError(t, err, "Run should return nil on lifecycle done")
+
+	// Verify all tasks completed.
+	for i := 0; i < 3; i++ {
+		task, _ := store.GetTask(fmt.Sprintf("p-%d", i))
+		assert.Equal(t, orch.StatusCompleted, task.Status)
+	}
+}
+
+// TestBVV_Run_GapAbort verifies that Run() returns ErrLifecycleAborted when
+// gap tolerance is reached.
+func TestBVV_Run_GapAbort(t *testing.T) {
+	store := testutil.NewMockStore()
+	lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
+	lifecycle.GapTolerance = 2
+	pool := orch.NewWorkerPool(store, nil, 3, "test-run", "/repo", t.TempDir())
+
+	d, err := orch.NewDispatcher(
+		store, pool, nil, nil, nil,
+		orch.NewGapTracker(2), orch.NewRetryState(), orch.NewHandoffState(3),
+		orch.RetryConfig{MaxRetries: 0},
+		lifecycle,
+		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
+		nil,
+	)
+	require.NoError(t, err)
+
+	testutil.ParallelGraph(t, store, "feat/x", "builder", 3)
+	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(1)) // all fail
+
+	err = d.Run(context.Background())
+	assert.ErrorIs(t, err, orch.ErrLifecycleAborted,
+		"Run should return ErrLifecycleAborted on gap abort")
+}
+
+// TestBVV_Run_ContextCancellation verifies that Run() returns ctx.Err() when
+// the context is cancelled.
+func TestBVV_Run_ContextCancellation(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 1, "builder")
+	testutil.LinearGraph(t, store, "feat/x", "builder", 100) // many tasks — won't finish
+
+	// SpawnFunc blocks until context done, then drops the outcome.
+	d.SetSpawnFunc(func(ctx context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		<-ctx.Done()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- d.Run(ctx)
+	}()
+
+	// Let the first tick dispatch, then cancel.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	err := <-done
+	assert.ErrorIs(t, err, context.Canceled,
+		"Run should return context.Canceled on cancel")
+}
+
+// TestBVV_ERR11_OrphanCBTripped verifies that when the circuit breaker trips,
+// the dispatcher fails exactly one in-progress task per tick and resets the CB
+// (BVV-ERR-11, SUP-05/06).
+func TestBVV_ERR11_OrphanCBTripped(t *testing.T) {
+	store := testutil.NewMockStore()
+	lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
+	pool := orch.NewWorkerPool(store, nil, 3, "test-run", "/repo", t.TempDir())
+
+	// Create a real watchdog so we can trip its CB.
+	logPath := filepath.Join(t.TempDir(), "events.jsonl")
+	eventLog, err := orch.NewEventLog(logPath)
+	require.NoError(t, err)
+
+	handoffs := orch.NewHandoffState(3)
+	watchdog, err := orch.NewWatchdog(
+		pool, store, eventLog,
+		map[string]orch.RoleConfig{"builder": testutil.MockRoleConfig()},
+		handoffs, "feat/x",
+		orch.WatchdogConfig{Interval: time.Second, CBThreshold: 3, CBWindow: time.Minute},
+		nil,
+	)
+	require.NoError(t, err)
+
+	gaps := orch.NewGapTracker(10)
+	d, err := orch.NewDispatcher(
+		store, pool, nil, eventLog, watchdog,
+		gaps, orch.NewRetryState(), handoffs,
+		orch.RetryConfig{MaxRetries: 0},
+		lifecycle,
+		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
+		nil,
+	)
+	require.NoError(t, err)
+
+	// Create 2 tasks and manually put them in_progress with active workers
+	// to simulate the state when the CB trips.
+	for i := 0; i < 2; i++ {
+		taskID := fmt.Sprintf("orphan-%d", i)
+		workerName := fmt.Sprintf("w-%02d", i+1)
+		require.NoError(t, store.CreateTask(&orch.Task{
+			ID: taskID, Status: orch.StatusInProgress, Priority: 0,
+			Assignee: workerName,
+			Labels: map[string]string{
+				orch.LabelBranch: "feat/x", orch.LabelRole: "builder", orch.LabelCriticality: string(orch.NonCritical),
+			},
+		}))
+		require.NoError(t, store.CreateWorker(&orch.Worker{
+			Name: workerName, Status: orch.WorkerActive, CurrentTaskID: taskID,
+		}))
+	}
+
+	// Trip the circuit breaker by recording 3 rapid failures.
+	recentStart := time.Now()
+	for i := 0; i < 3; i++ {
+		watchdog.RecordAgentFailure("w-01", recentStart)
+	}
+	require.True(t, watchdog.CBTripped(), "CB should be tripped after 3 rapid failures")
+
+	// Use a blocking SpawnFunc — we don't want dispatch to actually run.
+	d.SetSpawnFunc(func(ctx context.Context, _ *orch.Task, _ *orch.Worker, _ orch.RoleConfig, _ int, _ chan<- orch.TaskOutcome) {
+		<-ctx.Done()
+	})
+
+	// Tick 1: orphanCk should fail exactly 1 task and reset CB.
+	r1 := d.Tick(context.Background())
+	assert.Equal(t, 1, r1.OrphansFailed, "CB tripped: exactly 1 orphan failed per tick")
+	assert.False(t, watchdog.CBTripped(), "CB should be reset after processing orphan")
+
+	// Verify one task is failed, one is still in_progress.
+	t0, _ := store.GetTask("orphan-0")
+	t1, _ := store.GetTask("orphan-1")
+	failedCount := 0
+	if t0.Status == orch.StatusFailed {
+		failedCount++
+	}
+	if t1.Status == orch.StatusFailed {
+		failedCount++
+	}
+	assert.Equal(t, 1, failedCount, "exactly 1 of 2 in-progress tasks should be failed")
+}
+
+// TestBVV_DSP01_DiamondDAG verifies that a diamond DAG (A → {B,C} → D)
+// dispatches correctly: A first, then B and C in parallel, then D after
+// both B and C complete.
+func TestBVV_DSP01_DiamondDAG(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 3, "builder")
+	testutil.DiamondGraph(t, store, "feat/x", "builder")
+	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(0))
+	ctx := context.Background()
+
+	// Tick 1: only A is ready (no deps).
+	r1 := d.Tick(ctx)
+	assert.Equal(t, 1, r1.Dispatched, "tick 1: only A should be dispatched")
+	d.Wait()
+
+	// Tick 2: process A's completion → B and C become ready.
+	r2 := d.Tick(ctx)
+	assert.Equal(t, 2, r2.Dispatched, "tick 2: B and C should be dispatched")
+	d.Wait()
+
+	// Tick 3: process B and C → D becomes ready.
+	r3 := d.Tick(ctx)
+	assert.Equal(t, 1, r3.Dispatched, "tick 3: D should be dispatched")
+	d.Wait()
+
+	// Tick 4: process D → lifecycle done.
+	r4 := d.Tick(ctx)
+	assert.True(t, r4.LifecycleDone, "tick 4: all tasks done → lifecycle done")
+
+	for _, id := range []string{"A", "B", "C", "D"} {
+		task, _ := store.GetTask(id)
+		assert.Equal(t, orch.StatusCompleted, task.Status, "task %s should be completed", id)
+	}
+}
+
+// TestBVV_ERR04a_AbortBlocksOpenTasks verifies that when a terminal failure
+// triggers abort, all remaining open tasks are blocked (BVV-ERR-04a).
+func TestBVV_ERR04a_AbortBlocksOpenTasks(t *testing.T) {
+	store := testutil.NewMockStore()
+	lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
+	pool := orch.NewWorkerPool(store, nil, 1, "test-run", "/repo", t.TempDir())
+
+	d, err := orch.NewDispatcher(
+		store, pool, nil, nil, nil,
+		orch.NewGapTracker(10), orch.NewRetryState(), orch.NewHandoffState(3),
+		orch.RetryConfig{MaxRetries: 0},
+		lifecycle,
+		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
+		nil,
+	)
+	require.NoError(t, err)
+
+	// Create 1 critical task and 2 open non-critical tasks.
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID: "crit", Status: orch.StatusOpen, Priority: 0,
+		Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "builder", orch.LabelCriticality: string(orch.Critical)},
+	}))
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID: "nc-1", Status: orch.StatusOpen, Priority: 1,
+		Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "builder", orch.LabelCriticality: string(orch.NonCritical)},
+	}))
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID: "nc-2", Status: orch.StatusOpen, Priority: 2,
+		Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "builder", orch.LabelCriticality: string(orch.NonCritical)},
+	}))
+	// nc-1 and nc-2 depend on crit, so only crit dispatches first.
+	require.NoError(t, store.AddDep("nc-1", "crit"))
+	require.NoError(t, store.AddDep("nc-2", "crit"))
+
+	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(1)) // fail
+
+	ctx := context.Background()
+
+	// Tick 1: dispatch crit (only ready task).
+	d.Tick(ctx)
+	d.Wait()
+	// Tick 2: crit fails → abort → open tasks blocked.
+	r := d.Tick(ctx)
+	assert.True(t, r.GapAbort, "critical failure should trigger abort")
+
+	nc1, _ := store.GetTask("nc-1")
+	nc2, _ := store.GetTask("nc-2")
+	assert.Equal(t, orch.StatusBlocked, nc1.Status, "open task nc-1 should be blocked after abort")
+	assert.Equal(t, orch.StatusBlocked, nc2.Status, "open task nc-2 should be blocked after abort")
+}
+
+// TestBVV_L01_EmptyLedgerNotDone verifies that an empty ledger does not
+// trigger lifecycle completion.
+func TestBVV_L01_EmptyLedgerNotDone(t *testing.T) {
+	d, _, _ := newTestDispatcher(t, "feat/x", 1, "builder")
+	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	r := d.Tick(context.Background())
+	assert.False(t, r.LifecycleDone, "empty ledger should not be 'done'")
+}
+
+// TestNewDispatcher_NilValidation verifies that NewDispatcher rejects nil
+// required dependencies with clear error messages.
+func TestNewDispatcher_NilValidation(t *testing.T) {
+	store := testutil.NewMockStore()
+	pool := orch.NewWorkerPool(store, nil, 1, "run", "/repo", t.TempDir())
+	lc := testutil.MockLifecycleConfig("b", "builder")
+	gaps := orch.NewGapTracker(3)
+	retries := orch.NewRetryState()
+	handoffs := orch.NewHandoffState(3)
+	cfg := orch.DispatchConfig{Interval: time.Second, AgentPollInterval: 500 * time.Millisecond}
+	rc := orch.DefaultRetryConfig()
+
+	cases := []struct {
+		name    string
+		store   orch.Store
+		pool    *orch.WorkerPool
+		lc      *orch.LifecycleConfig
+		gaps    *orch.GapTracker
+		retries *orch.RetryState
+		hoffs   *orch.HandoffState
+		wantMsg string
+	}{
+		{"nil store", nil, pool, lc, gaps, retries, handoffs, "store is required"},
+		{"nil pool", store, nil, lc, gaps, retries, handoffs, "pool is required"},
+		{"nil lifecycle", store, pool, nil, gaps, retries, handoffs, "lifecycle is required"},
+		{"nil gaps", store, pool, lc, nil, retries, handoffs, "gaps is required"},
+		{"nil retries", store, pool, lc, gaps, nil, handoffs, "retries is required"},
+		{"nil handoffs", store, pool, lc, gaps, retries, nil, "handoffs is required"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := orch.NewDispatcher(c.store, c.pool, nil, nil, nil,
+				c.gaps, c.retries, c.hoffs, rc, c.lc, cfg, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), c.wantMsg)
+		})
+	}
+
+	// Positive case: all non-nil → success.
+	d, err := orch.NewDispatcher(store, pool, nil, nil, nil,
+		gaps, retries, handoffs, rc, lc, cfg, nil)
+	require.NoError(t, err)
+	assert.NotNil(t, d)
 }

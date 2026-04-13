@@ -42,7 +42,7 @@ func MockLifecycleConfig(branch string, roles ...string) *orch.LifecycleConfig {
 // ImmediateSpawnFunc returns a SpawnFunc that immediately sends an outcome
 // with the given exit code. Bypasses tmux entirely for unit tests.
 func ImmediateSpawnFunc(exitCode int) orch.SpawnFunc {
-	return func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, outcomes chan<- orch.TaskOutcome) {
+	return func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(exitCode), exitCode, roleCfg)
 	}
 }
@@ -52,7 +52,7 @@ func ImmediateSpawnFunc(exitCode int) orch.SpawnFunc {
 // of the SpawnFunc blocks independently.
 func ChannelSpawnFunc() (orch.SpawnFunc, chan<- int) {
 	ch := make(chan int, 10)
-	fn := func(ctx context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, outcomes chan<- orch.TaskOutcome) {
+	fn := func(ctx context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		select {
 		case <-ctx.Done():
 			return
@@ -67,7 +67,7 @@ func ChannelSpawnFunc() (orch.SpawnFunc, chan<- int) {
 // in order. After the slice is exhausted, subsequent calls return exit code 0.
 func SequenceSpawnFunc(codes []int) orch.SpawnFunc {
 	var idx atomic.Int64
-	return func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, outcomes chan<- orch.TaskOutcome) {
+	return func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		i := int(idx.Add(1) - 1)
 		code := 0
 		if i < len(codes) {
