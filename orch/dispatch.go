@@ -61,17 +61,17 @@ type DispatchResult struct {
 // It queries ReadyTasks, assigns them to idle workers, spawns agent sessions,
 // and processes outcomes via a channel to keep state machines single-threaded.
 type Dispatcher struct {
-	store    Store
-	pool     *WorkerPool
-	lock     *LifecycleLock
-	log      *EventLog
-	watchdog *Watchdog
-	gaps     *GapTracker
-	retries  *RetryState
-	handoffs *HandoffState
-	retryCfg RetryConfig
+	store     Store
+	pool      *WorkerPool
+	lock      *LifecycleLock
+	log       *EventLog
+	watchdog  *Watchdog
+	gaps      *GapTracker
+	retries   *RetryState
+	handoffs  *HandoffState
+	retryCfg  RetryConfig
 	lifecycle *LifecycleConfig
-	cfg      DispatchConfig
+	cfg       DispatchConfig
 
 	branchLabel string // "branch:<name>" for ReadyTasks filter
 	aborted     bool   // lifecycle abort flag
