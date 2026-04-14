@@ -28,6 +28,12 @@ tasks:
     cmds:
       - golangci-lint run --build-tags=verify --timeout=5m
 
+  coverage:
+    desc: Generate coverage profile and per-function report
+    cmds:
+      - go test -race -tags verify -coverprofile=coverage.out ./orch/... ./internal/...
+      - go tool cover -func=coverage.out
+
   check:
     desc: Local quality gate — lint + test + build
     cmds:

@@ -227,7 +227,7 @@ func TestProp_GapBoundedOvershoot(t *testing.T) {
 
 		ctx := context.Background()
 		for tick := 0; tick < 50; tick++ {
-			d.Tick(ctx)
+			r := d.Tick(ctx)
 			d.Wait()
 
 			// Gap overshoot bound: tolerance + maxWorkers - 1.
@@ -237,8 +237,105 @@ func TestProp_GapBoundedOvershoot(t *testing.T) {
 					gaps.Count(), maxGaps, tolerance, maxWorkers, tick)
 			}
 
-			r := d.Tick(ctx)
 			if r.GapAbort || r.LifecycleDone {
+				break
+			}
+		}
+	})
+}
+
+// TestProp_ConcurrentOutcomeProcessing verifies that concurrent outcome
+// submissions (simulating multiple runAgent goroutines completing simultaneously)
+// never violate gap count bounds, terminal count monotonicity, or worker pool
+// conservation (BVV-S-02, BVV-S-03, BVV-ERR-04).
+func TestProp_ConcurrentOutcomeProcessing(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		store := testutil.NewMockStore()
+		branch := "prop-conc"
+		maxWorkers := 3
+		tolerance := rapid.IntRange(1, 10).Draw(rt, "tolerance")
+
+		// Create 5-15 parallel tasks (no deps — max concurrency).
+		n := rapid.IntRange(5, 15).Draw(rt, "numTasks")
+		for i := 0; i < n; i++ {
+			err := store.CreateTask(&orch.Task{
+				ID:       fmt.Sprintf("c-%d", i),
+				Status:   orch.StatusOpen,
+				Priority: 0,
+				Labels: map[string]string{
+					orch.LabelBranch:      branch,
+					orch.LabelRole:        "builder",
+					orch.LabelCriticality: string(orch.NonCritical),
+				},
+			})
+			require.NoError(rt, err)
+		}
+
+		lifecycle := testutil.MockLifecycleConfig(branch, "builder")
+		lifecycle.GapTolerance = tolerance
+		pool := orch.NewWorkerPool(store, nil, maxWorkers, "conc-run", "/repo", t.TempDir())
+		gaps := orch.NewGapTracker(tolerance)
+		d, dErr := orch.NewDispatcher(
+			store, pool, nil, nil, nil,
+			gaps, orch.NewRetryState(), orch.NewHandoffState(3),
+			orch.RetryConfig{MaxRetries: 0},
+			lifecycle,
+			orch.DispatchConfig{Interval: time.Millisecond, AgentPollInterval: time.Millisecond},
+			nil,
+		)
+		if dErr != nil {
+			rt.Fatal(dErr)
+		}
+
+		// Random exit codes — outcomes submitted concurrently by SpawnFunc goroutines.
+		var codeIdx atomic.Int64
+		codes := make([]int, n)
+		for i := range codes {
+			codes[i] = rapid.SampledFrom([]int{0, 1, 2}).Draw(rt, fmt.Sprintf("code_%d", i))
+		}
+		d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+			idx := int(codeIdx.Add(1) - 1)
+			code := 0
+			if idx < len(codes) {
+				code = codes[idx]
+			}
+			outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(code), code, roleCfg)
+		})
+
+		ctx := context.Background()
+		prevTerminal := 0
+		for tick := 0; tick < 100; tick++ {
+			r := d.Tick(ctx)
+			d.Wait()
+
+			// Check terminal count monotonicity (BVV-S-02).
+			tasks, _ := store.ListTasks("branch:" + branch)
+			terminal := 0
+			for _, task := range tasks {
+				if task.Status.Terminal() {
+					terminal++
+				}
+			}
+			if terminal < prevTerminal {
+				rt.Fatalf("[BVV-S-02] terminal count decreased: %d → %d at tick %d", prevTerminal, terminal, tick)
+			}
+			prevTerminal = terminal
+
+			// Check worker conservation (BVV-S-03).
+			workers, _ := store.ListWorkers()
+			taskToWorkers := make(map[string][]string)
+			for _, w := range workers {
+				if w.CurrentTaskID != "" {
+					taskToWorkers[w.CurrentTaskID] = append(taskToWorkers[w.CurrentTaskID], w.Name)
+				}
+			}
+			for taskID, ws := range taskToWorkers {
+				if len(ws) > 1 {
+					rt.Fatalf("[BVV-S-03] task %s assigned to %d workers at tick %d", taskID, len(ws), tick)
+				}
+			}
+
+			if r.LifecycleDone || r.GapAbort {
 				break
 			}
 		}

@@ -3,6 +3,7 @@
 package orch_test
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/endgame/wonka-factory/orch"
@@ -116,6 +117,58 @@ func TestBVV_S07_BoundedDegradation(t *testing.T) {
 	assert.Panics(t, func() {
 		orch.AssertBoundedDegradation(gaps, 2)
 	}, "3 gaps > tolerance 2 should panic")
+}
+
+// TestBVV_S01_LifecycleExclusion verifies that AssertLifecycleExclusion panics
+// when the lifecycle lock is not held for the branch (BVV-S-01).
+func TestBVV_S01_LifecycleExclusion(t *testing.T) {
+	dir := t.TempDir()
+	lock := orch.NewLifecycleLock(orch.LockConfig{
+		Path: filepath.Join(dir, "test.lock"),
+	})
+
+	// Lock not held — should panic.
+	assert.Panics(t, func() {
+		orch.AssertLifecycleExclusion(lock, "feat/x")
+	}, "unheld lock should panic")
+
+	// Acquire the lock — should not panic.
+	require.NoError(t, lock.Acquire("holder-1", "feat/x"))
+	assert.NotPanics(t, func() {
+		orch.AssertLifecycleExclusion(lock, "feat/x")
+	})
+
+	// Nil lock — should not panic (graceful skip).
+	assert.NotPanics(t, func() {
+		orch.AssertLifecycleExclusion(nil, "feat/x")
+	})
+}
+
+// TestBVV_S08_AssignmentDurability verifies that an assignment survives
+// store close and reopen (BVV-S-08).
+func TestBVV_S08_AssignmentDurability(t *testing.T) {
+	dir := t.TempDir()
+	store, _, err := orch.NewStore("fs", dir)
+	require.NoError(t, err)
+
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID:     "durable-t",
+		Status: orch.StatusOpen,
+		Labels: map[string]string{orch.LabelBranch: "b"},
+	}))
+	require.NoError(t, store.CreateWorker(&orch.Worker{Name: "durable-w", Status: orch.WorkerIdle}))
+	require.NoError(t, store.Assign("durable-t", "durable-w"))
+	require.NoError(t, store.Close())
+
+	// Reopen the store and verify the assignment persisted.
+	store2, _, err := orch.NewStore("fs", dir)
+	require.NoError(t, err)
+	defer store2.Close()
+
+	task, err := store2.GetTask("durable-t")
+	require.NoError(t, err)
+	assert.Equal(t, "durable-w", task.Assignee, "assignee must survive close/reopen")
+	assert.Equal(t, orch.StatusAssigned, task.Status, "status must survive close/reopen")
 }
 
 // TestBVV_S05_ZeroContentInspection verifies BVV-S-05 by construction:

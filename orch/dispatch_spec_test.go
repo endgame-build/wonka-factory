@@ -1011,3 +1011,127 @@ func TestBVV_DSP04_TestModeStoreFailure(t *testing.T) {
 			"worker %s should be idle after store failure cleanup", w.Name)
 	}
 }
+
+// TestBVV_DSN01_DAGDrivenDispatch verifies BVV-DSN-01: dispatch ordering
+// emerges from DAG edges, not from any phase/ordering field. A diamond graph
+// (A → {B,C} → D) must dispatch A first, then B and C in parallel, then D —
+// purely from dependency structure.
+func TestBVV_DSN01_DAGDrivenDispatch(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 4, "builder")
+	testutil.DiamondGraph(t, store, "feat/x", "builder")
+
+	spawnLog := make([]string, 0)
+	var mu sync.Mutex
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		mu.Lock()
+		spawnLog = append(spawnLog, task.ID)
+		mu.Unlock()
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(0), 0, roleCfg)
+	})
+
+	ctx := context.Background()
+	for tick := 0; tick < 20; tick++ {
+		r := d.Tick(ctx)
+		d.Wait()
+		if r.LifecycleDone {
+			break
+		}
+	}
+
+	// A must be dispatched before B and C; D must be last.
+	require.GreaterOrEqual(t, len(spawnLog), 4, "all 4 tasks must be dispatched")
+	assert.Equal(t, "A", spawnLog[0], "root task dispatched first (DAG-driven)")
+	assert.Equal(t, "D", spawnLog[len(spawnLog)-1], "leaf task dispatched last (DAG-driven)")
+}
+
+// TestBVV_DSN02_OneTaskPerSession verifies BVV-DSN-02: each SpawnSession
+// call handles exactly one task. The spawn function is invoked once per task.
+func TestBVV_DSN02_OneTaskPerSession(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 2, "builder")
+	testutil.LinearGraph(t, store, "feat/x", "builder", 3)
+
+	var spawnCount atomic.Int64
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		spawnCount.Add(1)
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(0), 0, roleCfg)
+	})
+
+	ctx := context.Background()
+	for tick := 0; tick < 20; tick++ {
+		r := d.Tick(ctx)
+		d.Wait()
+		if r.LifecycleDone {
+			break
+		}
+	}
+
+	assert.Equal(t, int64(3), spawnCount.Load(),
+		"SpawnFunc called exactly once per task (one-task-per-session)")
+}
+
+// TestBVV_DSN03_TwoLayerMemory verifies BVV-DSN-03: the orchestrator uses
+// only labels (role, branch) and exit codes for routing and outcome
+// determination — it never reads task Title, Body, or any output content.
+func TestBVV_DSN03_TwoLayerMemory(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 2, "builder")
+
+	// Create a task with content that would break routing if read.
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID:     "content-task",
+		Title:  "this title is irrelevant to routing",
+		Body:   "this body contains no routing info",
+		Status: orch.StatusOpen,
+		Labels: map[string]string{
+			orch.LabelBranch:      "feat/x",
+			orch.LabelRole:        "builder",
+			orch.LabelCriticality: string(orch.NonCritical),
+		},
+	}))
+
+	var routedRole string
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		routedRole = task.Role()
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(0), 0, roleCfg)
+	})
+
+	ctx := context.Background()
+	d.Tick(ctx)
+	d.Wait()
+
+	assert.Equal(t, "builder", routedRole,
+		"routing uses Role() label, not Title or Body content")
+}
+
+// TestBVV_DSP_DispatchDuringOutcomeProcessing verifies that when task A
+// completes and unlocks task B as ready, B is dispatched on the next tick —
+// not during A's outcome processing in the same tick.
+func TestBVV_DSP_DispatchDuringOutcomeProcessing(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 2, "builder")
+	testutil.LinearGraph(t, store, "feat/x", "builder", 2) // t-0 → t-1
+
+	spawnFn, ch := testutil.ChannelSpawnFunc()
+	d.SetSpawnFunc(spawnFn)
+
+	ctx := context.Background()
+
+	// Tick 1: dispatches t-0 (only ready task).
+	r1 := d.Tick(ctx)
+	assert.Equal(t, 1, r1.Dispatched, "tick 1 dispatches t-0")
+
+	// Complete t-0 — this unlocks t-1.
+	ch <- 0
+	d.Wait()
+
+	// t-1 should NOT have been dispatched during t-0's outcome processing.
+	// It should be dispatched on the NEXT tick.
+	task1, err := store.GetTask("t-1")
+	require.NoError(t, err)
+	assert.Equal(t, orch.StatusOpen, task1.Status,
+		"t-1 should still be open after t-0 completes in same tick")
+
+	// Tick 2: now t-1 should be dispatched.
+	r2 := d.Tick(ctx)
+	assert.Equal(t, 1, r2.Dispatched, "tick 2 dispatches t-1")
+	ch <- 0
+	d.Wait()
+}
