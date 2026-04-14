@@ -20,9 +20,9 @@ import (
 
 type mockSession struct {
 	runID    string
-	alive    map[string]bool   // session name → alive
-	killed   []string          // sessions killed
-	sessions []string          // all sessions (for ListSessions)
+	alive    map[string]bool // session name → alive
+	killed   []string        // sessions killed
+	sessions []string        // all sessions (for ListSessions)
 }
 
 func newMockSession(runID string) *mockSession {
