@@ -21,6 +21,13 @@ var (
 	ErrLockContention      = errors.New("lifecycle lock held by another process")   // BVV-S-01, BVV-ERR-06
 	ErrResumeNoLedger      = errors.New("no ledger found for resume")               // BVV-ERR-07
 	ErrHandoffLimitReached = errors.New("handoff limit reached for task")           // BVV-L-04
+
+	// ErrCorruptLock signals a lock file that parses as invalid JSON or
+	// otherwise cannot be read as a LockContent. BVV-ERR-08 requires Resume
+	// to reconnect to the surviving tmux socket via the recovered RunID,
+	// so a corrupt lock is operator-intervention territory — silently
+	// fabricating a fresh RunID would orphan any live sessions.
+	ErrCorruptLock = errors.New("lifecycle lock file corrupt — operator intervention required")
 )
 
 // Sentinel errors for input validation.

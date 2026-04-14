@@ -26,10 +26,10 @@ type LockContent struct {
 //   - The dispatch loop MUST call Refresh on every tick (prevents false staleness)
 //
 // The BVV-ERR-10a precondition (all sessions drained before voluntary release)
-// is enforced at the dispatcher call site via a Phase 5 runtime invariant
-// (AssertLifecycleReleaseDrained), not inside Release(). Release() stays dumb
-// so the signal-handler (involuntary) path can call it without triggering
-// assertions under build tag verify.
+// is enforced by Engine.runLoop via AssertLifecycleReleaseDrained
+// (production-observable peer CheckReleaseDrained runs in any build), not
+// inside Release(). Release() stays dumb so the signal-handler (involuntary)
+// path can call it without triggering assertions under build tag verify.
 type LifecycleLock struct {
 	path               string
 	stalenessThreshold time.Duration
@@ -88,7 +88,26 @@ func (l *LifecycleLock) Acquire(holderID, branch string) error {
 		// Lock file exists — check staleness.
 		existing, readErr := l.read()
 		if readErr != nil {
-			// Can't read — maybe it was deleted between stat and read. Retry.
+			// File missing now (deleted between OpenFile and read) — retry create.
+			if errors.Is(readErr, os.ErrNotExist) {
+				continue
+			}
+			// Corrupt/unparseable lock file (partial write during a prior
+			// crash). Treat as stale: remove and retry create. Without this
+			// branch, Acquire would loop until RetryCount exhaustion and
+			// return "failed to acquire after N retries" — masking the
+			// recoverable corruption case as generic acquisition failure.
+			// EACCES, EROFS etc. should not be treated as removable, so
+			// surface them. A JSON unmarshal error is the only "corrupt"
+			// signal we get here; permission errors come back as PathError
+			// from os.ReadFile.
+			var perr *os.PathError
+			if errors.As(readErr, &perr) {
+				return fmt.Errorf("read lock file: %w", readErr)
+			}
+			if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove corrupt lock: %w", err)
+			}
 			continue
 		}
 
@@ -176,4 +195,29 @@ func (l *LifecycleLock) read() (*LockContent, error) {
 
 func (l *LifecycleLock) write(content LockContent) error {
 	return atomicWriteJSON(l.path, content)
+}
+
+// ReadHolder reads the lock file at path and returns the holder ID. Used by
+// Engine.Resume to recover the previous RunID for tmux socket reconnection
+// (BVV-ERR-08).
+//
+// Distinguishes three cases so callers can react appropriately:
+//   - Missing file:        ("", nil)        — fresh resume, no prior run.
+//   - Corrupt/unreadable:  ("", err)        — prior crash mid-write; caller
+//     must surface this because silently using a fresh RunID orphans the
+//     surviving tmux socket and defeats BVV-ERR-08.
+//   - Valid:               (holder, nil)
+func ReadHolder(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read lock file: %w", err)
+	}
+	var c LockContent
+	if err := json.Unmarshal(data, &c); err != nil {
+		return "", fmt.Errorf("parse lock file: %w", err)
+	}
+	return c.Holder, nil
 }

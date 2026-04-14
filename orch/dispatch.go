@@ -24,7 +24,7 @@ func DefaultDispatchConfig() DispatchConfig {
 }
 
 // TaskOutcome carries the result from a runAgent goroutine to the dispatch tick.
-// Sent on the outcomes channel; processed single-threaded by drainOutcomes.
+// Sent on the outcomes channel; processed single-threaded by Drain.
 // Exported so test SpawnFunc implementations can construct outcomes.
 type TaskOutcome struct {
 	Task     *Task
@@ -356,9 +356,16 @@ func (d *Dispatcher) abortCleanup() {
 
 // --- Dispatch step ---
 
-// drainOutcomes processes all completed agent outcomes from the channel.
-// Non-blocking: returns when the channel is empty.
-func (d *Dispatcher) drainOutcomes(ctx context.Context) {
+// Drain processes all completed agent outcomes from the channel,
+// non-blocking; returns when the channel is empty. Called inside Tick and
+// by Engine.runLoop after ctx cancellation + Wait(). Without the latter
+// call, BVV-ERR-10a's "all sessions drained before release" check trips
+// on workers whose agent goroutines exited but whose outcomes never
+// reached processOutcome — phantom-busy workers.
+//
+// Only safe to invoke when no other goroutine is receiving on outcomes;
+// concurrent receives would race processOutcome.
+func (d *Dispatcher) Drain(ctx context.Context) {
 	for {
 		select {
 		case o := <-d.outcomes:
@@ -614,7 +621,7 @@ func (d *Dispatcher) checkTermination() bool {
 // ready tasks, check termination, refresh lock.
 func (d *Dispatcher) Tick(ctx context.Context) DispatchResult {
 	// 1. Process completed agent outcomes.
-	d.drainOutcomes(ctx)
+	d.Drain(ctx)
 
 	// 2. Handle CB-tripped orphans.
 	orphans := d.orphanCk()
