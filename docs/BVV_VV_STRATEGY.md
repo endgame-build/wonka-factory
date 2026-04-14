@@ -254,7 +254,7 @@ Spec tests (`dispatch_spec_test.go`):
 |---|---|
 | `TestBVV_DSN01_DAGDrivenDispatch` | BVV-DSN-01 |
 | `TestBVV_DSN02_OneTaskPerSession` | BVV-DSN-02 |
-| `TestBVV_DSN03_TwoLayerMemory` | BVV-DSN-03 |
+| `TestBVV_S05_RoutingUsesLabelsOnly` | BVV-S-05 |
 | `TestBVV_DSP01_DispatchAllReady` | BVV-DSP-01 |
 | `TestBVV_DSP02_NoHoldingReady` | BVV-DSP-02 |
 | `TestBVV_DSP03_RoleBasedRouting` | BVV-DSP-03 |
@@ -440,7 +440,7 @@ Property: `TestProp_ConcurrentOutcomeProcessing`
 
 ### Dispatch-during-outcome race (`dispatch_spec_test.go`)
 
-Test: `TestBVV_DSP_DispatchDuringOutcomeProcessing`
+Test: `TestDispatchDuringOutcomeProcessing`
 - Task A completes (unlocks task B as ready) while outcome processing is mid-flight
 - Verify: task B is dispatched on the *next* tick, not during outcome processing of task A
 

@@ -3,11 +3,14 @@
 package orch_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/endgame/wonka-factory/orch"
 	"github.com/endgame/wonka-factory/orch/testutil"
+	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 )
 
@@ -52,58 +55,71 @@ func TestProp_HandoffRetryBounded(t *testing.T) {
 	})
 }
 
-// TestProp_AbortCleanupNoOpenTasks verifies BVV-ERR-04a: after an abort
-// cleanup, no tasks remain in non-terminal status.
+// TestProp_AbortCleanupNoOpenTasks verifies BVV-ERR-04a: after the Dispatcher's
+// abort cleanup runs (triggered by critical task failure), no open tasks remain.
+// Uses the production abortCleanup path via Dispatcher.Tick, not inline logic.
 func TestProp_AbortCleanupNoOpenTasks(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		store := testutil.NewMockStore()
 		branch := "prop-abort"
 
-		// Create random mix of tasks in various states.
-		n := rapid.IntRange(2, 15).Draw(rt, "numTasks")
+		// Create 1 critical task and N non-critical open tasks.
+		n := rapid.IntRange(1, 10).Draw(rt, "numNonCritical")
+		require.NoError(rt, store.CreateTask(&orch.Task{
+			ID: "crit", Status: orch.StatusOpen, Priority: 0,
+			Labels: map[string]string{
+				orch.LabelBranch:      branch,
+				orch.LabelRole:        "builder",
+				orch.LabelCriticality: string(orch.Critical),
+			},
+		}))
 		for i := 0; i < n; i++ {
-			status := rapid.SampledFrom([]orch.TaskStatus{
-				orch.StatusOpen, orch.StatusAssigned, orch.StatusInProgress,
-				orch.StatusCompleted, orch.StatusFailed, orch.StatusBlocked,
-			}).Draw(rt, fmt.Sprintf("status_%d", i))
-
-			task := &orch.Task{
-				ID:       fmt.Sprintf("abort-%d", i),
-				Status:   status,
-				Priority: i,
+			require.NoError(rt, store.CreateTask(&orch.Task{
+				ID: fmt.Sprintf("nc-%d", i), Status: orch.StatusOpen, Priority: i + 1,
 				Labels: map[string]string{
 					orch.LabelBranch:      branch,
 					orch.LabelRole:        "builder",
 					orch.LabelCriticality: string(orch.NonCritical),
 				},
-			}
-			if err := store.CreateTask(task); err != nil {
-				rt.Fatal(err)
+			}))
+			// Non-critical tasks depend on critical task.
+			require.NoError(rt, store.AddDep(fmt.Sprintf("nc-%d", i), "crit"))
+		}
+
+		lifecycle := testutil.MockLifecycleConfig(branch, "builder")
+		pool := orch.NewWorkerPool(store, nil, 1, "abort-run", "/repo", t.TempDir())
+		d, dErr := orch.NewDispatcher(
+			store, pool, nil, nil, nil,
+			orch.NewGapTracker(10), orch.NewRetryState(), orch.NewHandoffState(3),
+			orch.RetryConfig{MaxRetries: 0},
+			lifecycle,
+			orch.DispatchConfig{Interval: time.Millisecond, AgentPollInterval: time.Millisecond},
+			nil,
+		)
+		if dErr != nil {
+			rt.Fatal(dErr)
+		}
+
+		// Critical task fails (exit 1) → triggers abort cleanup.
+		d.SetSpawnFunc(testutil.ImmediateSpawnFunc(1))
+
+		ctx := context.Background()
+		for tick := 0; tick < 20; tick++ {
+			r := d.Tick(ctx)
+			d.Wait()
+			if r.GapAbort || r.LifecycleDone {
+				break
 			}
 		}
 
-		// Simulate abort cleanup: set all non-terminal tasks to blocked.
+		// Verify: no open tasks remain after abort cleanup.
 		tasks, err := store.ListTasks("branch:" + branch)
 		if err != nil {
 			rt.Fatal(err)
 		}
 		for _, task := range tasks {
-			if !task.Status.Terminal() {
-				task.Status = orch.StatusBlocked
-				if err := store.UpdateTask(task); err != nil {
-					rt.Fatal(err)
-				}
-			}
-		}
-
-		// Verify: no non-terminal tasks remain.
-		tasksAfter, err := store.ListTasks("branch:" + branch)
-		if err != nil {
-			rt.Fatal(err)
-		}
-		for _, task := range tasksAfter {
-			if !task.Status.Terminal() {
-				rt.Fatalf("[BVV-ERR-04a] task %s still in non-terminal status %s after abort cleanup", task.ID, task.Status)
+			if task.Status == orch.StatusOpen {
+				rt.Fatalf("[BVV-ERR-04a] task %s still open after abort cleanup", task.ID)
 			}
 		}
 	})

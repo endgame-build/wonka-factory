@@ -19,8 +19,9 @@ import (
 
 // --- Fault injection tests (Tier 3) ---
 
-// TestFault_SessionTimeout verifies BVV-ERR-02a: agent that hangs past
-// the session timeout is terminated by the watchdog.
+// TestFault_SessionTimeout verifies the engine completes without hanging
+// or panicking when a spawn function blocks indefinitely and the context
+// times out.
 func TestFault_SessionTimeout(t *testing.T) {
 	skipWithoutTmux(t)
 
@@ -50,11 +51,15 @@ func TestFault_SessionTimeout(t *testing.T) {
 	defer cancel()
 
 	// Engine must not hang — context timeout is the backstop.
-	_ = e.Run(ctx)
+	err = e.Run(ctx)
+	if err != nil {
+		assert.ErrorIs(t, err, context.DeadlineExceeded,
+			"expected nil or deadline exceeded, got %v", err)
+	}
 }
 
-// TestFault_CircuitBreakerTrip verifies BVV-L-03: 3 rapid consecutive
-// failures trip the circuit breaker, suspending the worker.
+// TestFault_CircuitBreakerTrip exercises rapid consecutive failure handling
+// and verifies gap recording occurs under rapid consecutive failures.
 func TestFault_CircuitBreakerTrip(t *testing.T) {
 	skipWithoutTmux(t)
 
@@ -86,9 +91,13 @@ func TestFault_CircuitBreakerTrip(t *testing.T) {
 	defer cancel()
 
 	// May abort via gap tolerance or complete — either is acceptable.
-	_ = e.Run(ctx)
+	err = e.Run(ctx)
+	if err != nil {
+		assert.True(t, errors.Is(err, orch.ErrLifecycleAborted) || errors.Is(err, context.DeadlineExceeded),
+			"expected nil, lifecycle aborted, or deadline exceeded, got %v", err)
+	}
 
-	// Circuit breaker should have recorded rapid failures.
+	// Rapid failures should have been recorded as gaps.
 	logPath := filepath.Join(runDir, "events.jsonl")
 	assertEventKinds(t, logPath, orch.EventGapRecorded)
 }
@@ -153,9 +162,9 @@ func TestFault_ConcurrentLockContention(t *testing.T) {
 		"one engine should succeed and one should get lock contention (err1=%v, err2=%v)", err1, err2)
 }
 
-// TestFault_KillTmuxSession verifies BVV-ERR-11 + BVV-S-08: killing a tmux
-// session mid-run is detected by the watchdog, and the assignment survives
-// (durable in ledger). The task is treated as a handoff and re-dispatched.
+// TestFault_KillTmuxSession verifies the engine does not hang or panic when
+// a spawn function blocks indefinitely on the first invocation and subsequent
+// invocations succeed.
 func TestFault_KillTmuxSession(t *testing.T) {
 	skipWithoutTmux(t)
 
@@ -192,7 +201,11 @@ func TestFault_KillTmuxSession(t *testing.T) {
 	defer cancel()
 
 	// May timeout — the test verifies the engine doesn't hang or panic.
-	_ = e.Run(ctx)
+	err = e.Run(ctx)
+	if err != nil {
+		assert.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, orch.ErrLifecycleAborted),
+			"expected nil, deadline exceeded, or lifecycle aborted, got %v", err)
+	}
 }
 
 // TestFault_StoreFailureDuringDispatch verifies graceful degradation when
@@ -234,16 +247,23 @@ func TestFault_StoreFailureDuringDispatch(t *testing.T) {
 	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(0))
 
 	ctx := context.Background()
-	// Run a few ticks — the store will start failing mid-dispatch.
-	// The dispatcher must not panic.
+	// Run ticks until the store failure surfaces. The dispatcher must not panic
+	// and must eventually report an error.
+	var sawError bool
 	for tick := 0; tick < 20; tick++ {
 		r := d.Tick(ctx)
 		d.Wait()
-		if r.LifecycleDone || r.GapAbort || r.Error != nil {
+		if r.Error != nil {
+			sawError = true
+			assert.ErrorIs(t, r.Error, testutil.ErrInjectedFailure,
+				"store failure should surface as injected failure")
+			break
+		}
+		if r.LifecycleDone || r.GapAbort {
 			break
 		}
 	}
-	// If we get here without panicking, graceful degradation works.
+	assert.True(t, sawError, "dispatcher should have encountered store failure within 20 ticks")
 }
 
 // TestFault_WorktreeMergeConflict verifies BVV-DSP-13: when a worktree

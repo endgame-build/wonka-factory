@@ -309,7 +309,10 @@ func TestProp_ConcurrentOutcomeProcessing(t *testing.T) {
 			d.Wait()
 
 			// Check terminal count monotonicity (BVV-S-02).
-			tasks, _ := store.ListTasks("branch:" + branch)
+			tasks, tErr := store.ListTasks("branch:" + branch)
+			if tErr != nil {
+				rt.Fatalf("ListTasks: %v", tErr)
+			}
 			terminal := 0
 			for _, task := range tasks {
 				if task.Status.Terminal() {
@@ -322,7 +325,10 @@ func TestProp_ConcurrentOutcomeProcessing(t *testing.T) {
 			prevTerminal = terminal
 
 			// Check worker conservation (BVV-S-03).
-			workers, _ := store.ListWorkers()
+			workers, wErr := store.ListWorkers()
+			if wErr != nil {
+				rt.Fatalf("ListWorkers: %v", wErr)
+			}
 			taskToWorkers := make(map[string][]string)
 			for _, w := range workers {
 				if w.CurrentTaskID != "" {

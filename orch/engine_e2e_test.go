@@ -3,9 +3,7 @@
 package orch_test
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,7 +22,7 @@ import (
 // 2. Mandatory event sequence in audit trail
 // 3. Runtime invariants don't fire (implicit via -tags verify)
 
-// TestE2E_HappyPath verifies the golden path: plan→build→vv→gate, all exit 0.
+// TestE2E_HappyPath verifies the golden path: a linear chain of builder tasks, all exit 0.
 func TestE2E_HappyPath(t *testing.T) {
 	skipWithoutTmux(t)
 
@@ -261,8 +259,12 @@ func TestE2E_ResumeAfterCrash(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	cancel1()
 
-	// First run exits via context cancellation (simulated crash).
-	<-done
+	// First run should exit via context cancellation only.
+	runErr := <-done
+	if runErr != nil {
+		assert.ErrorIs(t, runErr, context.Canceled,
+			"Phase 1 should exit via cancellation, got: %v", runErr)
+	}
 
 	// Phase 2: resume and complete remaining task.
 	cfg2 := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
@@ -297,19 +299,7 @@ func TestE2E_ResumeAfterCrash(t *testing.T) {
 // between them).
 func validateEventSequence(t *testing.T, logPath string, expected []orch.EventKind) {
 	t.Helper()
-	f, err := os.Open(logPath)
-	require.NoError(t, err)
-	defer f.Close()
-
-	var events []orch.Event
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		var e orch.Event
-		if json.Unmarshal(scanner.Bytes(), &e) == nil {
-			events = append(events, e)
-		}
-	}
-	require.NoError(t, scanner.Err())
+	events := readEvents(t, logPath) // reuse JSONL parser from watchdog_test.go
 
 	idx := 0
 	for _, e := range events {

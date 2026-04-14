@@ -1069,10 +1069,9 @@ func TestBVV_DSN02_OneTaskPerSession(t *testing.T) {
 		"SpawnFunc called exactly once per task (one-task-per-session)")
 }
 
-// TestBVV_DSN03_TwoLayerMemory verifies BVV-DSN-03: the orchestrator uses
-// only labels (role, branch) and exit codes for routing and outcome
-// determination — it never reads task Title, Body, or any output content.
-func TestBVV_DSN03_TwoLayerMemory(t *testing.T) {
+// TestBVV_S05_RoutingUsesLabelsOnly verifies BVV-S-05: the orchestrator routes
+// tasks using the Role() label, not Title, Body, or any output content.
+func TestBVV_S05_RoutingUsesLabelsOnly(t *testing.T) {
 	d, store, _ := newTestDispatcher(t, "feat/x", 2, "builder")
 
 	// Create a task with content that would break routing if read.
@@ -1102,10 +1101,10 @@ func TestBVV_DSN03_TwoLayerMemory(t *testing.T) {
 		"routing uses Role() label, not Title or Body content")
 }
 
-// TestBVV_DSP_DispatchDuringOutcomeProcessing verifies that when task A
-// completes and unlocks task B as ready, B is dispatched on the next tick —
-// not during A's outcome processing in the same tick.
-func TestBVV_DSP_DispatchDuringOutcomeProcessing(t *testing.T) {
+// TestDispatchDuringOutcomeProcessing verifies that when task A completes
+// and unlocks task B as ready, B is dispatched on the next tick — not during
+// A's outcome processing in the same tick.
+func TestDispatchDuringOutcomeProcessing(t *testing.T) {
 	d, store, _ := newTestDispatcher(t, "feat/x", 2, "builder")
 	testutil.LinearGraph(t, store, "feat/x", "builder", 2) // t-0 → t-1
 
