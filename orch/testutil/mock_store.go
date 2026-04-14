@@ -25,9 +25,15 @@ type MockStore struct {
 	workers map[string]*orch.Worker
 	deps    map[string][]string // taskID → []dependsOn
 
-	// Error injection for testing store-failure paths.
-	// When non-nil, UpdateTask returns this error. Thread-safe: guarded by mu.
-	UpdateTaskErr error
+	// Error injection for testing store-failure paths. When non-nil, the
+	// matching operation returns the error instead of succeeding. Each
+	// independent hook lets tests pin the exact step under Reconcile that
+	// surfaces a store failure. Thread-safe: guarded by mu.
+	UpdateTaskErr   error
+	UpdateWorkerErr error
+	ListTasksErr    error
+	ListWorkersErr  error
+	GetTaskErr      error // applied BEFORE ErrNotFound lookup; set to ErrNotFound itself to simulate deletion
 }
 
 // Compile-time interface compliance check.
@@ -48,6 +54,39 @@ func (s *MockStore) SetUpdateTaskErr(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.UpdateTaskErr = err
+}
+
+// SetUpdateWorkerErr sets (or clears) the error returned by UpdateWorker.
+// Thread-safe: acquires the store mutex.
+func (s *MockStore) SetUpdateWorkerErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.UpdateWorkerErr = err
+}
+
+// SetListTasksErr sets (or clears) the error returned by ListTasks.
+// Thread-safe: acquires the store mutex.
+func (s *MockStore) SetListTasksErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ListTasksErr = err
+}
+
+// SetListWorkersErr sets (or clears) the error returned by ListWorkers.
+// Thread-safe: acquires the store mutex.
+func (s *MockStore) SetListWorkersErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ListWorkersErr = err
+}
+
+// SetGetTaskErr sets (or clears) the error returned by GetTask. Applies to
+// every task ID — set to ErrNotFound to simulate operator deletion between
+// crash and resume. Thread-safe: acquires the store mutex.
+func (s *MockStore) SetGetTaskErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.GetTaskErr = err
 }
 
 // clone helpers — return copies so callers can't mutate internal state.
@@ -95,6 +134,9 @@ func (s *MockStore) GetTask(id string) (*orch.Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.GetTaskErr != nil {
+		return nil, s.GetTaskErr
+	}
 	t, ok := s.tasks[id]
 	if !ok {
 		return nil, fmt.Errorf("task %q: %w", id, orch.ErrNotFound)
@@ -128,6 +170,9 @@ func (s *MockStore) ListTasks(labels ...string) ([]*orch.Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.ListTasksErr != nil {
+		return nil, s.ListTasksErr
+	}
 	var result []*orch.Task
 	for _, t := range s.tasks {
 		if labelsMatch(t, labels) {
@@ -239,6 +284,9 @@ func (s *MockStore) ListWorkers() ([]*orch.Worker, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.ListWorkersErr != nil {
+		return nil, s.ListWorkersErr
+	}
 	var result []*orch.Worker
 	for _, w := range s.workers {
 		result = append(result, cloneWorker(w))
@@ -254,6 +302,9 @@ func (s *MockStore) UpdateWorker(w *orch.Worker) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.UpdateWorkerErr != nil {
+		return s.UpdateWorkerErr
+	}
 	if _, ok := s.workers[w.Name]; !ok {
 		return fmt.Errorf("worker %q: %w", w.Name, orch.ErrNotFound)
 	}

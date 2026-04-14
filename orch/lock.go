@@ -26,10 +26,10 @@ type LockContent struct {
 //   - The dispatch loop MUST call Refresh on every tick (prevents false staleness)
 //
 // The BVV-ERR-10a precondition (all sessions drained before voluntary release)
-// is enforced at the dispatcher call site via a Phase 5 runtime invariant
-// (AssertLifecycleReleaseDrained), not inside Release(). Release() stays dumb
-// so the signal-handler (involuntary) path can call it without triggering
-// assertions under build tag verify.
+// is enforced by Engine.runLoop via AssertLifecycleReleaseDrained
+// (production-observable peer CheckReleaseDrained runs in any build), not
+// inside Release(). Release() stays dumb so the signal-handler (involuntary)
+// path can call it without triggering assertions under build tag verify.
 type LifecycleLock struct {
 	path               string
 	stalenessThreshold time.Duration

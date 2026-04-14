@@ -17,6 +17,13 @@ import (
 type TmuxClient struct {
 	Socket string
 	runID  string
+
+	// owned records whether StartServer created the server on this socket
+	// (true) or detected one already running and joined it (false). Resume
+	// may reconnect to a live orchestrator's socket; killing that server
+	// would destroy the live holder's sessions and violate BVV-ERR-08.
+	// Cleanup paths consult OwnsServer before deciding whether to KillServer.
+	owned bool
 }
 
 // NewTmuxClient creates a TmuxClient with socket isolation for the given run.
@@ -27,6 +34,14 @@ func NewTmuxClient(runID string) *TmuxClient {
 // RunID returns the run identifier this client was created with.
 func (tc *TmuxClient) RunID() string {
 	return tc.runID
+}
+
+// OwnsServer reports whether this client created the tmux server on its
+// socket. False when StartServer found a server already running and
+// joined instead of creating. See TmuxClient.owned for the BVV-ERR-08
+// rationale.
+func (tc *TmuxClient) OwnsServer() bool {
+	return tc.owned
 }
 
 // Available reports whether the tmux binary is on PATH.
@@ -41,13 +56,21 @@ func Available() bool {
 // CreateSession calls — a race observed on CI where mock agents finish
 // in <10ms.
 //
-// Safe to call if the server is already running (skips if bootstrap session exists).
-// Must be paired with KillServer in cleanup.
+// Idempotent: if a server is already running on this socket, StartServer
+// joins it and returns nil (OwnsServer will report false). Must be paired
+// with KillServer in cleanup for servers this client created.
 func (tc *TmuxClient) StartServer() error {
 	bootstrapName := tc.runID + "-bootstrap"
 
-	if exists, err := tc.HasSession(bootstrapName); err == nil && exists {
-		return nil
+	// Probe the server directly rather than checking for the bootstrap
+	// session: on macOS, `sleep infinity` exits immediately and the
+	// bootstrap session dies, leaving the server alive (exit-empty off)
+	// but with no marker session. BVV-ERR-08 depends on accurate
+	// ownership detection across platforms.
+	if alreadyRunning, err := tc.serverIsRunning(); err != nil {
+		return fmt.Errorf("tmux probe server: %w", err)
+	} else if alreadyRunning {
+		return nil // joined; leave owned=false
 	}
 
 	// Create a bootstrap session + set exit-empty off in a single tmux
@@ -63,7 +86,21 @@ func (tc *TmuxClient) StartServer() error {
 		_ = tc.KillServer() // clean up partial state
 		return fmt.Errorf("tmux start-server: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	tc.owned = true
 	return nil
+}
+
+// serverIsRunning reports whether a tmux server is reachable on this client's
+// socket. Used by StartServer to decide between create and join.
+func (tc *TmuxClient) serverIsRunning() (bool, error) {
+	out, err := exec.Command("tmux", "-L", tc.Socket, "list-sessions").CombinedOutput() //nolint:gosec // args are controlled
+	if err == nil {
+		return true, nil
+	}
+	if isSessionNotFound(string(out)) {
+		return false, nil
+	}
+	return false, fmt.Errorf("list-sessions probe: %w: %s", err, strings.TrimSpace(string(out)))
 }
 
 // CreateSession starts a new detached tmux session.

@@ -59,7 +59,6 @@ type Engine struct {
 	// is visible in the audit trail rather than only on stderr.
 	storeFallbackFrom LedgerKind // non-empty if store fell back to a different backend
 	storeFallbackTo   LedgerKind
-	lockReadErr       error // ReadHolder error in initForResume (corrupt lock file)
 
 	// started guards against double invocation of Run/Resume. A second
 	// call would re-init, double-acquire the lock, and leak resources.
@@ -118,7 +117,8 @@ func (e *Engine) retryConfig() RetryConfig {
 	}
 }
 
-// Run executes a fresh lifecycle (BVV §8).
+// Run executes a fresh lifecycle (BVV §8, implements BVV-S-01, BVV-ERR-09,
+// BVV-ERR-10a, BVV-SS-01).
 // The ledger must be pre-populated (by planner or human); there is no Expand().
 // Single-use: returns ErrEngineAlreadyStarted on subsequent calls.
 func (e *Engine) Run(ctx context.Context) error {
@@ -131,8 +131,12 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 
 	// 2. Acquire lifecycle lock (BVV-S-01).
+	// Typically a fresh run creates its own tmux socket (random RunID),
+	// but a caller-supplied RunID could collide with a live socket — in
+	// which case StartServer joined rather than created. cleanupAfterFailedAcquire
+	// consults OwnsServer so the collision case doesn't take down a live holder.
 	if err := e.lock.Acquire(e.cfg.RunID, e.cfg.Lifecycle.Branch); err != nil {
-		Cleanup(e.tmux, nil, e.log, e.store)
+		e.cleanupAfterFailedAcquire()
 		return fmt.Errorf("engine: %w", err)
 	}
 
@@ -172,8 +176,12 @@ func (e *Engine) Resume(ctx context.Context) error {
 	}
 
 	// 2. Acquire lifecycle lock (BVV-ERR-06: staleness recovery).
+	// BVV-ERR-08 hazard: Resume may have recovered a RunID pointing at a
+	// still-live orchestrator's tmux socket. If Acquire fails here, the
+	// previous holder is alive — cleanupAfterFailedAcquire consults
+	// tmux.OwnsServer() and refuses to KillServer on a joined socket.
 	if err := e.lock.Acquire(e.cfg.RunID, e.cfg.Lifecycle.Branch); err != nil {
-		Cleanup(e.tmux, nil, e.log, e.store)
+		e.cleanupAfterFailedAcquire()
 		return fmt.Errorf("engine: %w", err)
 	}
 
@@ -195,14 +203,27 @@ func (e *Engine) Resume(ctx context.Context) error {
 	e.handoffs.SetCounts(result.HandoffsRecovered)
 
 	// BVV-S-02a: human re-opens reset retry+handoff counters.
+	// Emit the audit-trail record BEFORE mutating in-memory counters. If
+	// emit fails and we returned after the reset, the next Resume would
+	// replay the (unchanged) event log, recompute pre-reopen counters,
+	// and have no EscalationResolved marker to justify clearing them —
+	// silently restoring the old limits. Emit-first preserves the
+	// invariant: counters only change if the audit trail records why.
+	//
+	// Reopen detection is idempotent (step 6 keys off terminalHistory,
+	// which EscalationResolved does not affect), so fail-fast here is
+	// safe: the next Resume will detect the same reopens and retry.
 	for _, taskID := range result.HumanReopens {
-		e.retries.ResetTask(taskID)
-		e.handoffs.Reset(taskID)
-		_ = emitAndNotify(e.log, e.cfg.Progress, Event{
+		if err := emitAndNotify(e.log, e.cfg.Progress, Event{
 			Kind:    EventEscalationResolved,
 			TaskID:  taskID,
 			Summary: fmt.Sprintf("human re-open detected for task %s — counters reset", taskID),
-		})
+		}); err != nil {
+			Cleanup(e.tmux, e.lock, e.log, e.store)
+			return fmt.Errorf("engine: emit escalation_resolved for %s: %w", taskID, err)
+		}
+		e.retries.ResetTask(taskID)
+		e.handoffs.Reset(taskID)
 	}
 
 	// 5. Create watchdog + dispatcher.
@@ -241,27 +262,39 @@ func (e *Engine) init() error {
 // initForResume verifies the ledger exists, recovers the previous RunID from
 // the stale lock file (BVV-ERR-08: tmux socket reconnection), and opens
 // shared infrastructure.
+//
+// Fails fast on:
+//   - ledger missing: wraps ErrResumeNoLedger so callers can distinguish
+//     "fresh start needed" from any other Stat error (perm-denied, EIO).
+//   - lock corrupt: returns ErrCorruptLock. Silently fabricating a fresh
+//     RunID would orphan any live tmux socket (BVV-ERR-08 violation) and
+//     race the live orchestrator against the ledger (BVV-S-03 hazard).
+//     Corrupt-lock recovery is operator-intervention territory, not
+//     log-and-continue.
 func (e *Engine) initForResume() error {
 	ledgerDir := filepath.Join(e.cfg.RunDir, "ledger")
 	if _, err := os.Stat(ledgerDir); err != nil {
-		return fmt.Errorf("engine: %w: %v", ErrResumeNoLedger, err)
+		// Only IsNotExist qualifies as "no ledger found — fresh start OK".
+		// Permission-denied, EIO, and friends must not be squashed into
+		// ErrResumeNoLedger; callers that branch on errors.Is(…, ErrResumeNoLedger)
+		// would otherwise treat an unreadable ledger dir as "create a new one"
+		// and clobber the real ledger.
+		if os.IsNotExist(err) {
+			return fmt.Errorf("engine: %w: %v", ErrResumeNoLedger, err)
+		}
+		return fmt.Errorf("engine: stat ledger dir: %w", err)
 	}
 
 	// Recover previous RunID from stale lock file so we can reconnect to
 	// the surviving tmux socket and detect live sessions (BVV-ERR-08).
 	// Distinguish missing (genuine fresh resume) from corrupt (prior crash
-	// mid-write): a corrupt lock means we cannot trust the recovered RunID,
-	// and silently using a fresh one would orphan the surviving socket.
+	// mid-write).
 	lockPath := e.lockPath()
 	prev, err := ReadHolder(lockPath)
 	if err != nil {
-		// Stash for emission once the event log is open. We continue with
-		// the caller-provided RunID — refusing to resume would be worse
-		// than degraded recovery, but the operator must see the warning.
-		e.lockReadErr = err
-		fmt.Fprintf(os.Stderr, "warning: lock file corrupt at %s: %v — using configured RunID %s\n",
-			lockPath, err, e.cfg.RunID)
-	} else if prev != "" {
+		return fmt.Errorf("engine: %w: %s: %v", ErrCorruptLock, lockPath, err)
+	}
+	if prev != "" {
 		e.cfg.RunID = prev
 	}
 
@@ -281,10 +314,20 @@ func (e *Engine) initCommon(ledgerDir string) error {
 	// Stash fallback for emission via lifecycle_started detail — stderr
 	// alone is invisible in the audit trail, so an operator reading
 	// events.jsonl post-incident cannot tell the run was degraded.
-	if e.cfg.LedgerKind != "" && kind != e.cfg.LedgerKind {
-		e.storeFallbackFrom = e.cfg.LedgerKind
+	//
+	// NewStore treats empty LedgerKind as LedgerBeads and silently falls
+	// back to LedgerFS if Beads is unreachable. Comparing against the
+	// effective requested kind (not the raw config field) ensures the
+	// common default-config path also surfaces the fallback — the prior
+	// `!= ""` guard skipped exactly this case.
+	requested := e.cfg.LedgerKind
+	if requested == "" {
+		requested = LedgerBeads
+	}
+	if kind != requested {
+		e.storeFallbackFrom = requested
 		e.storeFallbackTo = kind
-		fmt.Fprintf(os.Stderr, "warning: store fallback: requested %s, using %s\n", e.cfg.LedgerKind, kind)
+		fmt.Fprintf(os.Stderr, "warning: store fallback: requested %s, using %s\n", requested, kind)
 	}
 
 	// 2. Open event log.
@@ -385,38 +428,95 @@ func (e *Engine) runLoop(ctx context.Context) error {
 	e.disp.Wait()
 	wg.Wait()
 
-	// 6. Voluntary exit: assert drain precondition (BVV-ERR-10a) and emit event.
-	// BVV-ERR-09: signal path (ctx.Err()) — no status modifications, no event.
-	if err == nil || errors.Is(err, ErrLifecycleAborted) {
-		// Production-build observability: CheckReleaseDrained runs in any
-		// build; AssertLifecycleReleaseDrained panics only under -tags
-		// verify. Without the Check, a release build would hide BVV-ERR-10a
-		// violations entirely.
-		var summary, detail string
-		if errors.Is(err, ErrLifecycleAborted) {
-			summary = fmt.Sprintf("lifecycle aborted: gap tolerance reached (run %s, branch %s)",
-				e.cfg.RunID, e.cfg.Lifecycle.Branch)
-			detail = "outcome=aborted reason=gap_tolerance_exceeded"
-		} else {
-			summary = fmt.Sprintf("lifecycle completed (run %s, branch %s)",
-				e.cfg.RunID, e.cfg.Lifecycle.Branch)
-		}
-		if busy := CheckReleaseDrained(e.store); len(busy) > 0 {
-			summary = fmt.Sprintf("[BVV-ERR-10a] lifecycle release with active workers: %v", busy)
-			detail = fmt.Sprintf("run=%s branch=%s busy=%v", e.cfg.RunID, e.cfg.Lifecycle.Branch, busy)
-		}
-		AssertLifecycleReleaseDrained(e.store)
-		_ = emitAndNotify(e.log, e.cfg.Progress, Event{
-			Kind:    EventLifecycleCompleted,
-			Summary: summary,
-			Detail:  detail,
-		})
+	// 6. Drain any outcomes that in-flight agents pushed after cancel but
+	// before their goroutines returned (BVV-ERR-10a precondition). Without
+	// this, the ctx.Done branch in runAgent writes an OutcomeFailure that
+	// never reaches processOutcome, so Worker.Status stays Active in the
+	// store and CheckReleaseDrained/AssertLifecycleReleaseDrained reports a
+	// phantom violation. Drain must run AFTER Wait() — concurrent receives
+	// on d.outcomes would race processOutcome.
+	//
+	// Uses a background context rather than the cancelled mergedCtx because
+	// processOutcome's internal store writes should not be skipped just
+	// because the user-facing ctx was cancelled; the goroutines have
+	// already landed, and refusing to record their outcomes would re-create
+	// the same phantom-busy condition.
+	e.disp.Drain(context.Background())
+
+	// 7. Classify the exit. Signal paths stay silent per BVV-ERR-09 —
+	// a mid-run Ctrl-C must not modify status or leave a completion event
+	// that would look like clean termination to the next Resume.
+	// Operational errors need their own anchor so the event log isn't
+	// truncated in a way indistinguishable from a crash.
+	switch {
+	case err == nil, errors.Is(err, ErrLifecycleAborted):
+		e.emitLifecycleCompleted(err)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// Signal path — intentionally no event.
+	default:
+		e.emitLifecycleFailed(err)
 	}
 
-	// 7. Cleanup (releases lock, kills tmux, closes log+store).
+	// 8. Cleanup (releases lock, kills tmux, closes log+store).
 	Cleanup(e.tmux, e.lock, e.log, e.store)
 
 	return err
+}
+
+// emitLifecycleCompleted emits the clean-exit or gap-abort lifecycle anchor
+// and runs the BVV-ERR-10a drain check. The Check runs in any build; the
+// Assert panics only under -tags verify. Without the Check, a release build
+// would hide BVV-ERR-10a violations entirely.
+func (e *Engine) emitLifecycleCompleted(err error) {
+	var summary, detail string
+	if errors.Is(err, ErrLifecycleAborted) {
+		summary = fmt.Sprintf("lifecycle aborted: gap tolerance reached (run %s, branch %s)",
+			e.cfg.RunID, e.cfg.Lifecycle.Branch)
+		detail = "outcome=aborted reason=gap_tolerance_exceeded"
+	} else {
+		summary = fmt.Sprintf("lifecycle completed (run %s, branch %s)",
+			e.cfg.RunID, e.cfg.Lifecycle.Branch)
+	}
+	if busy := CheckReleaseDrained(e.store); len(busy) > 0 {
+		summary = fmt.Sprintf("[BVV-ERR-10a] lifecycle release with active workers: %v", busy)
+		detail = fmt.Sprintf("run=%s branch=%s busy=%v", e.cfg.RunID, e.cfg.Lifecycle.Branch, busy)
+	}
+	AssertLifecycleReleaseDrained(e.store)
+	if emitErr := emitAndNotify(e.log, e.cfg.Progress, Event{
+		Kind:    EventLifecycleCompleted,
+		Summary: summary,
+		Detail:  detail,
+	}); emitErr != nil {
+		// Lifecycle-completed is the terminal anchor a future Resume keys off.
+		// If its write fails (disk full, fd gone), surface it on stderr so
+		// the operator at least sees the gap. We cannot return an error here —
+		// the caller is already committed to returning `err`, and the lock
+		// still needs releasing.
+		fmt.Fprintf(os.Stderr, "warning: emit lifecycle_completed failed: %v\n", emitErr)
+	}
+}
+
+// emitLifecycleFailed emits a completion anchor for the operational-error
+// exit (dispatcher Tick.Error, store corruption mid-run). Preserves the
+// BVV-SS-01 / §10.3 guarantee that every lifecycle has a terminal anchor
+// event, so a future Resume can tell the prior run ended rather than
+// crashed. Also runs CheckReleaseDrained + AssertLifecycleReleaseDrained
+// (BVV-ERR-10a) — operational errors do not legitimise leaked sessions.
+func (e *Engine) emitLifecycleFailed(runErr error) {
+	detail := fmt.Sprintf("outcome=failed reason=%s", runErr)
+	if busy := CheckReleaseDrained(e.store); len(busy) > 0 {
+		detail += fmt.Sprintf(" busy=%v", busy)
+	}
+	AssertLifecycleReleaseDrained(e.store)
+	summary := fmt.Sprintf("lifecycle failed (run %s, branch %s): %v",
+		e.cfg.RunID, e.cfg.Lifecycle.Branch, runErr)
+	if emitErr := emitAndNotify(e.log, e.cfg.Progress, Event{
+		Kind:    EventLifecycleCompleted,
+		Summary: summary,
+		Detail:  detail,
+	}); emitErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: emit lifecycle_completed (failed) failed: %v\n", emitErr)
+	}
 }
 
 // markStarted returns true on the first call (Run or Resume) and false on
@@ -445,18 +545,19 @@ func (e *Engine) emitLifecycleStarted(summary string, result *ResumeResult) erro
 	return nil
 }
 
-// diagnosticsDetail formats stashed warnings (store fallback, corrupt lock,
-// event-log corruption, failed kills) for inclusion in the lifecycle_started
-// event. Returns "" if there is nothing to report. The audit trail is the
+// diagnosticsDetail formats stashed warnings (store fallback, event-log
+// corruption, failed kills) for inclusion in the lifecycle_started event.
+// Returns "" if there is nothing to report. The audit trail is the
 // canonical surface for these conditions — stderr alone is invisible to
 // post-incident review.
+//
+// Lock-file corruption is NOT surfaced here: corrupt locks fail Resume
+// outright (ErrCorruptLock) rather than continuing into lifecycle_started,
+// so the audit-trail anchor is never written under that condition.
 func (e *Engine) diagnosticsDetail(resume *ResumeResult) string {
 	var parts []string
 	if e.storeFallbackFrom != "" {
 		parts = append(parts, fmt.Sprintf("store_fallback=%s->%s", e.storeFallbackFrom, e.storeFallbackTo))
-	}
-	if e.lockReadErr != nil {
-		parts = append(parts, fmt.Sprintf("lock_corrupt=%v", e.lockReadErr))
 	}
 	if resume != nil {
 		if resume.EventLogCorruptLines > 0 {
@@ -470,6 +571,26 @@ func (e *Engine) diagnosticsDetail(resume *ResumeResult) string {
 		return ""
 	}
 	return "warnings: " + strings.Join(parts, ", ")
+}
+
+// cleanupAfterFailedAcquire releases resources opened during init* when lock
+// acquisition fails. Unlike the generic Cleanup, it refuses to KillServer on
+// a tmux socket this engine joined rather than created: under Resume, a
+// joined socket belongs to the still-live orchestrator whose contention
+// blocked us, and killing it would destroy the live holder's sessions
+// (BVV-ERR-08).
+func (e *Engine) cleanupAfterFailedAcquire() {
+	var tmuxForCleanup *TmuxClient
+	if e.tmux != nil {
+		if e.tmux.OwnsServer() {
+			tmuxForCleanup = e.tmux
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"warning: leaving tmux server on socket %s intact — joined from prior run, KillServer would destroy the live holder's sessions (BVV-ERR-08)\n",
+				e.tmux.Socket)
+		}
+	}
+	Cleanup(tmuxForCleanup, nil, e.log, e.store)
 }
 
 // lockPath returns the default lock file path for the current branch.

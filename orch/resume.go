@@ -38,8 +38,13 @@ type ResumeResult struct {
 // Reconcile reconstructs lifecycle state from the ledger, tmux, and event log
 // (BVV-ERR-07: reconciliation MUST complete before dispatch resumes).
 //
-// The 7-step algorithm follows BVV spec §11a.2:
-//  1. Reset stale assignments (dead sessions → task open).
+// Implements the five reconciliation concerns enumerated in BVV spec §11a.2
+// (stale assignments, orphans, gap/retry recovery, human re-opens) plus two
+// implementation-level steps the spec implies but does not spell out:
+// per-task handoff recovery (BVV-L-04 monotonic-across-sessions) and
+// worker-state reset (BVV-DSP-08 preservation exception for live sessions).
+// The resulting seven-step order is:
+//  1. Reset stale assignments (dead sessions → task open; live sessions preserved per BVV-ERR-08).
 //  2. Kill orphaned tmux sessions.
 //  3. Recover gap count from event log (BVV-ERR-05 monotonic).
 //  4. Recover retry counts from event log (BVV-ERR-01 monotonic).
@@ -109,9 +114,15 @@ func Reconcile(
 	// Step 2: Orphaned session cleanup.
 	// Kill tmux sessions that have no corresponding in_progress task.
 	// Reuses the tasks slice from step 1 (mutated in-place above).
+	//
+	// Note on error handling: TmuxClient.ListSessions already converts the
+	// "no server running" case to ([]string{}, nil), so any error here is
+	// a genuine exec failure (missing tmux, EACCES on socket). Treat it as
+	// fatal — the orchestrator cannot trust orphan cleanup to be accurate,
+	// and continuing would leave stale sessions racing the next dispatch.
 	sessions, err := tmux.ListSessions()
 	if err != nil {
-		sessions = nil // tmux server may be dead — not fatal
+		return nil, fmt.Errorf("reconcile: list sessions: %w", err)
 	}
 	if len(sessions) > 0 {
 		expected := make(map[string]bool)
