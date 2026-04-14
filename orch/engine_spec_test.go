@@ -169,6 +169,11 @@ func TestEngine_RunGapAbort(t *testing.T) {
 
 	err = e.Run(ctx)
 	assert.ErrorIs(t, err, orch.ErrLifecycleAborted)
+
+	// Audit trail must distinguish abort from normal completion — the event
+	// kind is shared but Detail carries the abort marker.
+	assertEventDetailContains(t, filepath.Join(runDir, "events.jsonl"),
+		orch.EventLifecycleCompleted, "outcome=aborted")
 }
 
 // TestBVV_ERR06_LockExclusion verifies BVV-S-01: two engines on the same

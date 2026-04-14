@@ -392,8 +392,15 @@ func (e *Engine) runLoop(ctx context.Context) error {
 		// build; AssertLifecycleReleaseDrained panics only under -tags
 		// verify. Without the Check, a release build would hide BVV-ERR-10a
 		// violations entirely.
-		summary := fmt.Sprintf("lifecycle completed (run %s, branch %s)", e.cfg.RunID, e.cfg.Lifecycle.Branch)
-		detail := ""
+		var summary, detail string
+		if errors.Is(err, ErrLifecycleAborted) {
+			summary = fmt.Sprintf("lifecycle aborted: gap tolerance reached (run %s, branch %s)",
+				e.cfg.RunID, e.cfg.Lifecycle.Branch)
+			detail = "outcome=aborted reason=gap_tolerance_exceeded"
+		} else {
+			summary = fmt.Sprintf("lifecycle completed (run %s, branch %s)",
+				e.cfg.RunID, e.cfg.Lifecycle.Branch)
+		}
 		if busy := CheckReleaseDrained(e.store); len(busy) > 0 {
 			summary = fmt.Sprintf("[BVV-ERR-10a] lifecycle release with active workers: %v", busy)
 			detail = fmt.Sprintf("run=%s branch=%s busy=%v", e.cfg.RunID, e.cfg.Lifecycle.Branch, busy)
@@ -466,12 +473,25 @@ func (e *Engine) diagnosticsDetail(resume *ResumeResult) string {
 }
 
 // lockPath returns the default lock file path for the current branch.
+// Branch names may contain path separators (e.g. "feat/x") or parent-dir
+// references ("..") that would otherwise nest the lock under RunDir or
+// escape it entirely. Sanitize to a flat, filename-safe fragment.
 func (e *Engine) lockPath() string {
 	if e.cfg.Lifecycle.Lock.Path != "" {
 		return e.cfg.Lifecycle.Lock.Path
 	}
 	return filepath.Join(e.cfg.RunDir,
-		fmt.Sprintf(".wonka-%s.lock", e.cfg.Lifecycle.Branch))
+		fmt.Sprintf(".wonka-%s.lock", sanitizeBranchForLock(e.cfg.Lifecycle.Branch)))
+}
+
+// sanitizeBranchForLock flattens a branch name into a filename-safe fragment
+// so the derived lock path cannot escape RunDir.
+func sanitizeBranchForLock(branch string) string {
+	safe := strings.NewReplacer("/", "-", "\\", "-").Replace(strings.TrimSpace(branch))
+	if safe == "" || safe == "." || safe == ".." {
+		return "default"
+	}
+	return safe
 }
 
 // generateRunID produces a short random hex string for run identification.
