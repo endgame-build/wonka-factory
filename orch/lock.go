@@ -88,7 +88,26 @@ func (l *LifecycleLock) Acquire(holderID, branch string) error {
 		// Lock file exists — check staleness.
 		existing, readErr := l.read()
 		if readErr != nil {
-			// Can't read — maybe it was deleted between stat and read. Retry.
+			// File missing now (deleted between OpenFile and read) — retry create.
+			if errors.Is(readErr, os.ErrNotExist) {
+				continue
+			}
+			// Corrupt/unparseable lock file (partial write during a prior
+			// crash). Treat as stale: remove and retry create. Without this
+			// branch, Acquire would loop until RetryCount exhaustion and
+			// return "failed to acquire after N retries" — masking the
+			// recoverable corruption case as generic acquisition failure.
+			// EACCES, EROFS etc. should not be treated as removable, so
+			// surface them. A JSON unmarshal error is the only "corrupt"
+			// signal we get here; permission errors come back as PathError
+			// from os.ReadFile.
+			var perr *os.PathError
+			if errors.As(readErr, &perr) {
+				return fmt.Errorf("read lock file: %w", readErr)
+			}
+			if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove corrupt lock: %w", err)
+			}
 			continue
 		}
 
@@ -178,17 +197,27 @@ func (l *LifecycleLock) write(content LockContent) error {
 	return atomicWriteJSON(l.path, content)
 }
 
-// ReadHolder reads the lock file at path and returns the holder ID, or ""
-// if the file is missing, unreadable, or corrupt. Used by Engine.Resume to
-// recover the previous RunID for tmux socket reconnection (BVV-ERR-08).
-func ReadHolder(path string) string {
+// ReadHolder reads the lock file at path and returns the holder ID. Used by
+// Engine.Resume to recover the previous RunID for tmux socket reconnection
+// (BVV-ERR-08).
+//
+// Distinguishes three cases so callers can react appropriately:
+//   - Missing file:        ("", nil)        — fresh resume, no prior run.
+//   - Corrupt/unreadable:  ("", err)        — prior crash mid-write; caller
+//     must surface this because silently using a fresh RunID orphans the
+//     surviving tmux socket and defeats BVV-ERR-08.
+//   - Valid:               (holder, nil)
+func ReadHolder(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read lock file: %w", err)
 	}
 	var c LockContent
-	if json.Unmarshal(data, &c) != nil {
-		return ""
+	if err := json.Unmarshal(data, &c); err != nil {
+		return "", fmt.Errorf("parse lock file: %w", err)
 	}
-	return c.Holder
+	return c.Holder, nil
 }

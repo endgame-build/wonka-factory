@@ -74,13 +74,7 @@ func AssertBoundedDegradation(gaps *GapTracker, tolerance int) {
 // voluntary lock release time. BVV-ERR-10a: all sessions must be drained
 // before the orchestrator releases the lifecycle lock.
 func AssertLifecycleReleaseDrained(store Store) {
-	workers, err := store.ListWorkers()
-	if err != nil {
-		return // can't verify — skip
-	}
-	for _, w := range workers {
-		if w.Status == WorkerActive {
-			panic(fmt.Sprintf("[BVV-ERR-10a] release with active worker %s (task %s)", w.Name, w.CurrentTaskID))
-		}
+	if busy := CheckReleaseDrained(store); len(busy) > 0 {
+		panic(fmt.Sprintf("[BVV-ERR-10a] release with active workers: %v", busy))
 	}
 }

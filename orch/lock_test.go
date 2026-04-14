@@ -266,6 +266,9 @@ func TestBVV_L02_RefreshRejectsWrongHolder(t *testing.T) {
 }
 
 // TestReadHolder verifies RunID recovery from stale lock files (BVV-ERR-08).
+// Distinguishes missing (silent fresh resume) from corrupt (must surface)
+// because silently using a fresh RunID after a corrupt-lock read orphans
+// the surviving tmux socket and defeats BVV-ERR-08.
 func TestReadHolder(t *testing.T) {
 	t.Run("valid lock file", func(t *testing.T) {
 		dir := t.TempDir()
@@ -273,19 +276,25 @@ func TestReadHolder(t *testing.T) {
 		content := `{"holder":"run-abc123","branch":"feature-x","timestamp":"2025-01-01T00:00:00Z"}`
 		require.NoError(t, os.WriteFile(lockPath, []byte(content), 0o644))
 
-		assert.Equal(t, "run-abc123", orch.ReadHolder(lockPath))
+		holder, err := orch.ReadHolder(lockPath)
+		require.NoError(t, err)
+		assert.Equal(t, "run-abc123", holder)
 	})
 
-	t.Run("missing file", func(t *testing.T) {
-		assert.Equal(t, "", orch.ReadHolder("/nonexistent/path"))
+	t.Run("missing file returns no error", func(t *testing.T) {
+		holder, err := orch.ReadHolder("/nonexistent/path")
+		assert.NoError(t, err, "missing lock is a normal fresh-resume case")
+		assert.Equal(t, "", holder)
 	})
 
-	t.Run("corrupt JSON", func(t *testing.T) {
+	t.Run("corrupt JSON surfaces error", func(t *testing.T) {
 		dir := t.TempDir()
 		lockPath := filepath.Join(dir, ".wonka-test.lock")
 		require.NoError(t, os.WriteFile(lockPath, []byte("not json"), 0o644))
 
-		assert.Equal(t, "", orch.ReadHolder(lockPath))
+		holder, err := orch.ReadHolder(lockPath)
+		require.Error(t, err, "corrupt lock must not be silently downgraded to fresh resume")
+		assert.Equal(t, "", holder)
 	})
 
 	t.Run("empty holder", func(t *testing.T) {
@@ -294,6 +303,8 @@ func TestReadHolder(t *testing.T) {
 		content := `{"holder":"","branch":"feature-x","timestamp":"2025-01-01T00:00:00Z"}`
 		require.NoError(t, os.WriteFile(lockPath, []byte(content), 0o644))
 
-		assert.Equal(t, "", orch.ReadHolder(lockPath))
+		holder, err := orch.ReadHolder(lockPath)
+		require.NoError(t, err)
+		assert.Equal(t, "", holder)
 	})
 }

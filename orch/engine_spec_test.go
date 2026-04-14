@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,12 +122,12 @@ func TestEngine_RunLifecycleDone(t *testing.T) {
 	lifecycle.Lock.RetryCount = 0
 
 	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
-	cfg.TestSpawnFunc = testutil.ImmediateSpawnFunc(0)
 	cfg.RunID = "test-run"
 	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
 
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
 
 	prepopulateLedger(t, runDir, testTask("build-1", "feat/x", "builder"))
 
@@ -151,12 +152,12 @@ func TestEngine_RunGapAbort(t *testing.T) {
 	lifecycle.Lock.RetryCount = 0
 
 	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
-	cfg.TestSpawnFunc = testutil.ImmediateSpawnFunc(1) // all tasks fail
 	cfg.RunID = "test-abort"
 	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
 
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(1)) // all tasks fail
 
 	prepopulateLedger(t, runDir,
 		testTask("t1", "feat/x", "builder"),
@@ -190,11 +191,11 @@ func TestBVV_ERR06_LockExclusion(t *testing.T) {
 
 	// Second engine should fail to acquire.
 	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
-	cfg.TestSpawnFunc = testutil.ImmediateSpawnFunc(0)
 	cfg.RunID = "second-run"
 
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
 
 	// Pre-create infrastructure dirs so init succeeds before lock.
 	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "ledger"), 0o755))
@@ -223,12 +224,12 @@ func TestBVV_ERR09_GracefulShutdown(t *testing.T) {
 	}
 
 	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
-	cfg.TestSpawnFunc = blockingSpawn
 	cfg.RunID = "test-shutdown"
 	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
 
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
+	e.SetTestSpawnFunc(blockingSpawn)
 
 	prepopulateLedger(t, runDir, testTask("build-1", "feat/x", "builder"))
 	statusBefore := orch.StatusOpen
@@ -268,12 +269,12 @@ func TestEngine_RunCreatesInfrastructure(t *testing.T) {
 	lifecycle.Lock.RetryCount = 0
 
 	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
-	cfg.TestSpawnFunc = testutil.ImmediateSpawnFunc(0)
 	cfg.RunID = "test-infra"
 	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
 
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
 
 	prepopulateLedger(t, runDir, testTask("t1", "feat/x", "builder"))
 
@@ -367,7 +368,325 @@ func TestEngine_ResumeFallbackRunID(t *testing.T) {
 	assert.Equal(t, "my-run-id", e.RunID())
 }
 
+// TestEngine_ResumeResetsHandoffOnReopen verifies BVV-S-02a end-to-end
+// through Engine.Resume — when an event-log terminal task is now open, the
+// handoff counter for that task is reset and an escalation_resolved event
+// is emitted. Without this coverage, a regression that drops the
+// handoffs.Reset call inside Engine.Resume would slip past unit tests of
+// HandoffState alone.
+func TestEngine_ResumeResetsHandoffOnReopen(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat-x"
+	lifecycle := testutil.MockLifecycleConfig(branch, "builder")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	// Pre-populate ledger with a task that is currently open.
+	prepopulateLedger(t, runDir, testTask("build-1", branch, "builder"))
+
+	// Pre-write event log saying the task was previously completed (terminal),
+	// then a handoff record (so handoff count > 0 is recovered).
+	logPath := filepath.Join(runDir, "events.jsonl")
+	f, err := os.Create(logPath)
+	require.NoError(t, err)
+	enc := json.NewEncoder(f)
+	require.NoError(t, enc.Encode(orch.Event{
+		Kind: orch.EventTaskHandoff, TaskID: "build-1", Timestamp: time.Now(),
+	}))
+	require.NoError(t, enc.Encode(orch.Event{
+		Kind: orch.EventTaskCompleted, TaskID: "build-1", Timestamp: time.Now(),
+	}))
+	require.NoError(t, f.Close())
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "test-reopen"
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, e.Resume(ctx))
+
+	// Verify escalation_resolved event was emitted for build-1 — proves that
+	// Engine.Resume's HumanReopens loop ran (which is where retries.ResetTask
+	// AND handoffs.Reset are both called). Without this, BVV-S-02a coverage
+	// for the handoff counter is structural-only.
+	assertEventForTask(t, logPath, orch.EventEscalationResolved, "build-1")
+}
+
+// TestEngine_ResumeLockContention verifies BVV-S-01 / BVV-ERR-06 on the
+// Resume path. Today only Run is covered; Resume is the more likely
+// human-invoked path after a crash, so contention against a still-live
+// holder must also fail-fast rather than silently overlap.
+func TestEngine_ResumeLockContention(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat-x"
+	lockPath := filepath.Join(runDir, ".wonka-"+branch+".lock")
+
+	lifecycle := testutil.MockLifecycleConfig(branch, "builder")
+	lifecycle.Lock.Path = lockPath
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	// First holder (still alive — recent timestamp).
+	first := orch.NewLifecycleLock(lifecycle.Lock)
+	require.NoError(t, first.Acquire("first-run", branch))
+	defer first.Release() //nolint:errcheck // test cleanup
+
+	// Pre-create ledger so initForResume passes the existence check.
+	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "ledger"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "logs"), 0o755))
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "second-run"
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+
+	err = e.Resume(context.Background())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, orch.ErrLockContention)
+}
+
+// TestEngine_ResumeReconcilesBeforeDispatch verifies BVV-ERR-07: Reconcile
+// completes before dispatch resumes. Closes the structural-only coverage gap
+// by setting up a state only Reconcile can unblock (in_progress task with
+// dead session): if dispatch ran first, the task would stay in_progress and
+// never terminate; only after Reconcile resets it to open can dispatch pick
+// it up. Task reaching completed proves the ordering.
+func TestEngine_ResumeReconcilesBeforeDispatch(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat-x"
+
+	// Pre-populate ledger with a task in status=in_progress (pointing at a
+	// worker and a dead session). Without Reconcile resetting it, dispatch
+	// would never pick this task up.
+	task := testTask("build-1", branch, "builder")
+	task.Status = orch.StatusInProgress
+	task.Assignee = "w-dead"
+	prepopulateLedger(t, runDir, task)
+
+	lifecycle := testutil.MockLifecycleConfig(branch, "builder")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "resume-order"
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, e.Resume(ctx))
+
+	// Task must have terminated successfully — proves Reconcile ran before
+	// dispatch (otherwise dispatch would never have queued it).
+	fsStore, _, err := orch.NewStore("", filepath.Join(runDir, "ledger"))
+	require.NoError(t, err)
+	defer fsStore.Close()
+	got, err := fsStore.GetTask("build-1")
+	require.NoError(t, err)
+	assert.Equal(t, orch.StatusCompleted, got.Status)
+}
+
+// TestEngine_ResumeSurfacesEventLogCorruption verifies that corrupt JSONL
+// lines in a pre-existing event log surface via lifecycle_started.Detail.
+// Without this, C2's counter reaches ResumeResult but never the audit
+// trail — the operator cannot see that recovery was partial.
+func TestEngine_ResumeSurfacesEventLogCorruption(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat-x"
+	prepopulateLedger(t, runDir, testTask("build-1", branch, "builder"))
+
+	// Pre-write an event log with one valid + two corrupt lines.
+	logPath := filepath.Join(runDir, "events.jsonl")
+	f, err := os.Create(logPath)
+	require.NoError(t, err)
+	enc := json.NewEncoder(f)
+	require.NoError(t, enc.Encode(orch.Event{
+		Kind: orch.EventGapRecorded, TaskID: "some-task", Timestamp: time.Now(),
+	}))
+	_, _ = f.WriteString("not valid json\n")
+	_, _ = f.WriteString("{truncated\n")
+	require.NoError(t, f.Close())
+
+	lifecycle := testutil.MockLifecycleConfig(branch, "builder")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "resume-corrupt"
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, e.Resume(ctx))
+
+	assertEventDetailContains(t, logPath, orch.EventLifecycleStarted, "event_log_corrupt_lines=2")
+}
+
+// TestEngine_RunSurfacesStoreFallback verifies that when the requested store
+// backend falls back to a different one (e.g. beads → fs when Dolt is
+// unavailable), the audit trail carries that signal. Skipped when the
+// environment can actually serve the requested backend (no fallback occurs).
+func TestEngine_RunSurfacesStoreFallback(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "test-fallback"
+	cfg.LedgerKind = orch.LedgerBeads
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	// Skip if Beads is actually reachable — the fallback would not fire
+	// and the assertion would be vacuously wrong.
+	if _, kind, err := orch.NewStore(orch.LedgerBeads, filepath.Join(t.TempDir(), "probe")); err == nil && kind == orch.LedgerBeads {
+		t.Skip("Beads backend reachable — fallback path cannot be exercised")
+	}
+
+	prepopulateLedger(t, runDir, testTask("t1", "feat/x", "builder"))
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, e.Run(ctx))
+
+	assertEventDetailContains(t, filepath.Join(runDir, "events.jsonl"),
+		orch.EventLifecycleStarted, "store_fallback=beads->")
+}
+
+// TestBVV_ERR10a_CheckReleaseDrained verifies the production-observable
+// check helper used by runLoop in non-verify builds. CheckReleaseDrained
+// runs in any build (unlike AssertLifecycleReleaseDrained which panics only
+// under -tags verify and is a no-op otherwise) so release builds can still
+// emit an audit-trail warning when a BVV-ERR-10a violation occurs.
+func TestBVV_ERR10a_CheckReleaseDrained(t *testing.T) {
+	t.Run("empty store → no busy workers", func(t *testing.T) {
+		store := testutil.NewMockStore()
+		assert.Empty(t, orch.CheckReleaseDrained(store))
+	})
+
+	t.Run("idle workers → no busy workers", func(t *testing.T) {
+		store := testutil.NewMockStore()
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w1", Status: orch.WorkerIdle}))
+		assert.Empty(t, orch.CheckReleaseDrained(store))
+	})
+
+	t.Run("active worker → reported busy", func(t *testing.T) {
+		store := testutil.NewMockStore()
+		require.NoError(t, store.CreateWorker(&orch.Worker{
+			Name: "w1", Status: orch.WorkerActive, CurrentTaskID: "t1",
+		}))
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w2", Status: orch.WorkerIdle}))
+		busy := orch.CheckReleaseDrained(store)
+		assert.Equal(t, []string{"w1"}, busy)
+	})
+}
+
+// TestEngine_DoubleRunRejected verifies single-use Engine semantics: a
+// second Run/Resume call on the same instance returns
+// ErrEngineAlreadyStarted rather than re-initialising and double-acquiring
+// the lock.
+func TestEngine_DoubleRunRejected(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "single-use"
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	prepopulateLedger(t, runDir, testTask("t1", "feat/x", "builder"))
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	// First call runs to completion so we know the once-guard was consumed.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, e.Run(ctx))
+
+	// Second Run/Resume should be rejected by the guard, with no lock
+	// re-acquire, no tmux re-init, no audit-trail duplicate.
+	err = e.Run(context.Background())
+	assert.ErrorIs(t, err, orch.ErrEngineAlreadyStarted)
+
+	err = e.Resume(context.Background())
+	assert.ErrorIs(t, err, orch.ErrEngineAlreadyStarted)
+}
+
 // --- Helpers ---
+
+// assertEventDetailContains asserts the log contains an event of the given
+// kind whose Detail field contains the given substring.
+func assertEventDetailContains(t *testing.T, logPath string, kind orch.EventKind, needle string) {
+	t.Helper()
+	f, err := os.Open(logPath)
+	require.NoError(t, err)
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var e orch.Event
+		if json.Unmarshal(scanner.Bytes(), &e) == nil {
+			if e.Kind == kind && strings.Contains(e.Detail, needle) {
+				return
+			}
+		}
+	}
+	require.NoError(t, scanner.Err())
+	t.Fatalf("expected event kind %q with Detail containing %q in %s", kind, needle, logPath)
+}
+
+// assertEventForTask asserts the log contains an event of the given kind
+// for the given task ID.
+func assertEventForTask(t *testing.T, logPath string, kind orch.EventKind, taskID string) {
+	t.Helper()
+	f, err := os.Open(logPath)
+	require.NoError(t, err)
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var e orch.Event
+		if json.Unmarshal(scanner.Bytes(), &e) == nil {
+			if e.Kind == kind && e.TaskID == taskID {
+				return
+			}
+		}
+	}
+	require.NoError(t, scanner.Err())
+	t.Fatalf("expected event kind %q for task %q in %s", kind, taskID, logPath)
+}
 
 // assertEventKinds checks that the event log contains the expected event kinds
 // (in any order, non-exclusively).

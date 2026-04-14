@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -22,8 +23,7 @@ type EngineConfig struct {
 	LedgerKind LedgerKind       // store backend; see NewStore for default and fallback
 	Dispatch   DispatchConfig
 	Watchdog   WatchdogConfig
-	Progress      ProgressReporter // nil = no-op
-	TestSpawnFunc SpawnFunc        // test override: bypasses tmux (nil = production runAgent)
+	Progress   ProgressReporter // nil = no-op
 }
 
 // DefaultEngineConfig returns sensible defaults with the given required parameters.
@@ -53,7 +53,25 @@ type Engine struct {
 	gaps     *GapTracker
 	retries  *RetryState
 	handoffs *HandoffState
+
+	// Diagnostics surfaced via lifecycle_started detail. Populated during
+	// init*; consumed in Run/Resume after the event log is open so corruption
+	// is visible in the audit trail rather than only on stderr.
+	storeFallbackFrom LedgerKind // non-empty if store fell back to a different backend
+	storeFallbackTo   LedgerKind
+	lockReadErr       error // ReadHolder error in initForResume (corrupt lock file)
+
+	// started guards against double invocation of Run/Resume. A second
+	// call would re-init, double-acquire the lock, and leak resources.
+	started sync.Once
+
+	testSpawnFunc SpawnFunc // test-only override; see SetTestSpawnFunc in testhooks_test.go
 }
+
+// ErrEngineAlreadyStarted is returned by Run or Resume if the Engine has
+// already been started. Engines are single-use — construct a new one for
+// each lifecycle.
+var ErrEngineAlreadyStarted = errors.New("engine: already started")
 
 // NewEngine validates the config and returns an uninitialised Engine shell.
 // Call Run or Resume to start execution.
@@ -102,7 +120,11 @@ func (e *Engine) retryConfig() RetryConfig {
 
 // Run executes a fresh lifecycle (BVV §8).
 // The ledger must be pre-populated (by planner or human); there is no Expand().
+// Single-use: returns ErrEngineAlreadyStarted on subsequent calls.
 func (e *Engine) Run(ctx context.Context) error {
+	if !e.markStarted() {
+		return ErrEngineAlreadyStarted
+	}
 	// 1. Initialise infrastructure.
 	if err := e.init(); err != nil {
 		return err
@@ -125,20 +147,25 @@ func (e *Engine) Run(ctx context.Context) error {
 		return err
 	}
 
-	// 5. Emit lifecycle_started.
-	_ = emitAndNotify(e.log, e.cfg.Progress, Event{
-		Kind:    EventLifecycleStarted,
-		Summary: fmt.Sprintf("lifecycle started (run %s, branch %s)", e.cfg.RunID, e.cfg.Lifecycle.Branch),
-	})
+	// 5. Emit lifecycle_started — fatal on failure.
+	summary := fmt.Sprintf("lifecycle started (run %s, branch %s)", e.cfg.RunID, e.cfg.Lifecycle.Branch)
+	if err := e.emitLifecycleStarted(summary, nil); err != nil {
+		return err
+	}
 
 	// 6. Run dispatch loop.
 	return e.runLoop(ctx)
 }
 
 // Resume re-enters execution from persisted state (BVV-ERR-06..08).
-// Recovers gap/retry/handoff counters from the event log, reconciles stale
-// assignments, and resumes the dispatch loop.
+// Reconciles lifecycle state (stale assignments, orphan sessions, recovered
+// gap/retry/handoff counters, human re-opens) then resumes the dispatch
+// loop. Reconciliation produces the recovered counters; counters do not
+// flow in independently.
 func (e *Engine) Resume(ctx context.Context) error {
+	if !e.markStarted() {
+		return ErrEngineAlreadyStarted
+	}
 	// 1. Initialise infrastructure (verifies ledger, recovers previous RunID).
 	if err := e.initForResume(); err != nil {
 		return err
@@ -151,7 +178,7 @@ func (e *Engine) Resume(ctx context.Context) error {
 	}
 
 	// 3. Reconcile state (BVV-ERR-07: must complete before dispatch).
-	result, err := Reconcile(e.store, e.tmux, e.cfg.Lifecycle.Branch, e.log.Path())
+	result, err := Reconcile(e.store, e.tmux, e.cfg.RunID, e.cfg.Lifecycle.Branch, e.log.Path())
 	if err != nil {
 		Cleanup(e.tmux, e.lock, e.log, e.store)
 		return fmt.Errorf("engine: reconcile: %w", err)
@@ -184,14 +211,14 @@ func (e *Engine) Resume(ctx context.Context) error {
 		return err
 	}
 
-	// 6. Emit lifecycle_started with resume detail.
-	_ = emitAndNotify(e.log, e.cfg.Progress, Event{
-		Kind: EventLifecycleStarted,
-		Summary: fmt.Sprintf("lifecycle resumed (run %s, branch %s, reconciled=%d, orphans=%d, gaps=%d, reopens=%d)",
-			e.cfg.RunID, e.cfg.Lifecycle.Branch,
-			result.Reconciled, result.OrphanedSessions,
-			len(result.GapsRecovered), len(result.HumanReopens)),
-	})
+	// 6. Emit lifecycle_started with resume detail — fatal on failure.
+	summary := fmt.Sprintf("lifecycle resumed (run %s, branch %s, reconciled=%d, orphans=%d, gaps=%d, reopens=%d)",
+		e.cfg.RunID, e.cfg.Lifecycle.Branch,
+		result.Reconciled, result.OrphanedSessions,
+		len(result.GapsRecovered), len(result.HumanReopens))
+	if err := e.emitLifecycleStarted(summary, result); err != nil {
+		return err
+	}
 
 	// 7. Run dispatch loop.
 	return e.runLoop(ctx)
@@ -222,15 +249,28 @@ func (e *Engine) initForResume() error {
 
 	// Recover previous RunID from stale lock file so we can reconnect to
 	// the surviving tmux socket and detect live sessions (BVV-ERR-08).
+	// Distinguish missing (genuine fresh resume) from corrupt (prior crash
+	// mid-write): a corrupt lock means we cannot trust the recovered RunID,
+	// and silently using a fresh one would orphan the surviving socket.
 	lockPath := e.lockPath()
-	if prev := ReadHolder(lockPath); prev != "" {
+	prev, err := ReadHolder(lockPath)
+	if err != nil {
+		// Stash for emission once the event log is open. We continue with
+		// the caller-provided RunID — refusing to resume would be worse
+		// than degraded recovery, but the operator must see the warning.
+		e.lockReadErr = err
+		fmt.Fprintf(os.Stderr, "warning: lock file corrupt at %s: %v — using configured RunID %s\n",
+			lockPath, err, e.cfg.RunID)
+	} else if prev != "" {
 		e.cfg.RunID = prev
 	}
 
 	return e.initCommon(ledgerDir)
 }
 
-// initCommon opens store, event log, tmux, lock, and pool.
+// initCommon opens store, event log, tmux, lock, and pool. On any failure
+// after a resource has been opened, this cascades closes so the caller does
+// not need to (Run/Resume only call Cleanup after the lock has been acquired).
 func (e *Engine) initCommon(ledgerDir string) error {
 	// 1. Open store.
 	store, kind, err := NewStore(e.cfg.LedgerKind, ledgerDir)
@@ -238,7 +278,12 @@ func (e *Engine) initCommon(ledgerDir string) error {
 		return fmt.Errorf("engine: open store: %w", err)
 	}
 	e.store = store
+	// Stash fallback for emission via lifecycle_started detail — stderr
+	// alone is invisible in the audit trail, so an operator reading
+	// events.jsonl post-incident cannot tell the run was degraded.
 	if e.cfg.LedgerKind != "" && kind != e.cfg.LedgerKind {
+		e.storeFallbackFrom = e.cfg.LedgerKind
+		e.storeFallbackTo = kind
 		fmt.Fprintf(os.Stderr, "warning: store fallback: requested %s, using %s\n", e.cfg.LedgerKind, kind)
 	}
 
@@ -263,6 +308,11 @@ func (e *Engine) initCommon(ledgerDir string) error {
 	lockCfg := e.cfg.Lifecycle.Lock
 	lockCfg.Path = e.lockPath()
 	if err := os.MkdirAll(filepath.Dir(lockCfg.Path), 0o755); err != nil {
+		// Cascade-close the resources opened above. Without this, the tmux
+		// server, event log fd, and store all leak because Run/Resume only
+		// invoke Cleanup once the lock has been acquired.
+		Cleanup(e.tmux, nil, e.log, e.store)
+		e.tmux, e.log, e.store = nil, nil, nil
 		return fmt.Errorf("engine: create lock dir: %w", err)
 	}
 	e.lock = NewLifecycleLock(lockCfg)
@@ -294,8 +344,8 @@ func (e *Engine) buildDispatchAndWatchdog() error {
 	if err != nil {
 		return fmt.Errorf("engine: %w", err)
 	}
-	if e.cfg.TestSpawnFunc != nil {
-		disp.SetSpawnFunc(e.cfg.TestSpawnFunc)
+	if e.testSpawnFunc != nil {
+		disp.SetSpawnFunc(e.testSpawnFunc)
 	}
 	e.disp = disp
 
@@ -338,10 +388,21 @@ func (e *Engine) runLoop(ctx context.Context) error {
 	// 6. Voluntary exit: assert drain precondition (BVV-ERR-10a) and emit event.
 	// BVV-ERR-09: signal path (ctx.Err()) — no status modifications, no event.
 	if err == nil || errors.Is(err, ErrLifecycleAborted) {
+		// Production-build observability: CheckReleaseDrained runs in any
+		// build; AssertLifecycleReleaseDrained panics only under -tags
+		// verify. Without the Check, a release build would hide BVV-ERR-10a
+		// violations entirely.
+		summary := fmt.Sprintf("lifecycle completed (run %s, branch %s)", e.cfg.RunID, e.cfg.Lifecycle.Branch)
+		detail := ""
+		if busy := CheckReleaseDrained(e.store); len(busy) > 0 {
+			summary = fmt.Sprintf("[BVV-ERR-10a] lifecycle release with active workers: %v", busy)
+			detail = fmt.Sprintf("run=%s branch=%s busy=%v", e.cfg.RunID, e.cfg.Lifecycle.Branch, busy)
+		}
 		AssertLifecycleReleaseDrained(e.store)
 		_ = emitAndNotify(e.log, e.cfg.Progress, Event{
 			Kind:    EventLifecycleCompleted,
-			Summary: fmt.Sprintf("lifecycle completed (run %s, branch %s)", e.cfg.RunID, e.cfg.Lifecycle.Branch),
+			Summary: summary,
+			Detail:  detail,
 		})
 	}
 
@@ -349,6 +410,59 @@ func (e *Engine) runLoop(ctx context.Context) error {
 	Cleanup(e.tmux, e.lock, e.log, e.store)
 
 	return err
+}
+
+// markStarted returns true on the first call (Run or Resume) and false on
+// every subsequent call. Engines are single-use — re-running through the
+// same Engine instance would re-init and double-acquire.
+func (e *Engine) markStarted() bool {
+	first := false
+	e.started.Do(func() { first = true })
+	return first
+}
+
+// emitLifecycleStarted writes the canonical §10.3 anchor event. Its absence
+// from the audit trail leaves a future Resume blind to the lifecycle
+// boundary (recoverFromEventLog keys off it), so a failed emit is fatal and
+// must cascade-close the resources the caller otherwise expects to own.
+func (e *Engine) emitLifecycleStarted(summary string, result *ResumeResult) error {
+	err := emitAndNotify(e.log, e.cfg.Progress, Event{
+		Kind:    EventLifecycleStarted,
+		Summary: summary,
+		Detail:  e.diagnosticsDetail(result),
+	})
+	if err != nil {
+		Cleanup(e.tmux, e.lock, e.log, e.store)
+		return fmt.Errorf("engine: emit lifecycle_started: %w", err)
+	}
+	return nil
+}
+
+// diagnosticsDetail formats stashed warnings (store fallback, corrupt lock,
+// event-log corruption, failed kills) for inclusion in the lifecycle_started
+// event. Returns "" if there is nothing to report. The audit trail is the
+// canonical surface for these conditions — stderr alone is invisible to
+// post-incident review.
+func (e *Engine) diagnosticsDetail(resume *ResumeResult) string {
+	var parts []string
+	if e.storeFallbackFrom != "" {
+		parts = append(parts, fmt.Sprintf("store_fallback=%s->%s", e.storeFallbackFrom, e.storeFallbackTo))
+	}
+	if e.lockReadErr != nil {
+		parts = append(parts, fmt.Sprintf("lock_corrupt=%v", e.lockReadErr))
+	}
+	if resume != nil {
+		if resume.EventLogCorruptLines > 0 {
+			parts = append(parts, fmt.Sprintf("event_log_corrupt_lines=%d", resume.EventLogCorruptLines))
+		}
+		if len(resume.FailedKills) > 0 {
+			parts = append(parts, fmt.Sprintf("failed_kills=%v", resume.FailedKills))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "warnings: " + strings.Join(parts, ", ")
 }
 
 // lockPath returns the default lock file path for the current branch.

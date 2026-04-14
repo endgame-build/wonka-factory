@@ -63,7 +63,7 @@ func TestProp_ReconcileNeverReversesTerminal(t *testing.T) {
 
 		tmux := newMockSession("run-prop")
 
-		_, err := orch.Reconcile(store, tmux, branch, "")
+		_, err := orch.Reconcile(store, tmux, tmux.runID, branch, "")
 		if err != nil {
 			return
 		}
@@ -81,7 +81,10 @@ func TestProp_ReconcileNeverReversesTerminal(t *testing.T) {
 }
 
 // TestProp_ReconcileIdempotent verifies that running Reconcile twice on the
-// same state produces identical results (all steps are idempotent).
+// same state produces stable results across all observable fields, not just
+// the count of newly-reset tasks. A regression that re-counted gaps,
+// retries, handoffs, or orphans on the second pass would slip past a
+// Reconciled-only check.
 func TestProp_ReconcileIdempotent(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		store := testutil.NewMockStore()
@@ -100,19 +103,39 @@ func TestProp_ReconcileIdempotent(t *testing.T) {
 
 		tmux := newMockSession("run-idem")
 
-		result1, err1 := orch.Reconcile(store, tmux, branch, "")
+		_, err1 := orch.Reconcile(store, tmux, tmux.runID, branch, "")
 		if err1 != nil {
 			return
 		}
 
-		result2, err2 := orch.Reconcile(store, tmux, branch, "")
+		result2, err2 := orch.Reconcile(store, tmux, tmux.runID, branch, "")
 		if err2 != nil {
 			rt.Fatalf("second Reconcile failed: %v", err2)
 		}
 
 		if result2.Reconciled != 0 {
-			rt.Fatalf("idempotency violated: second Reconcile reconciled %d tasks (first: %d)",
-				result2.Reconciled, result1.Reconciled)
+			rt.Fatalf("idempotency: second Reconcile reset %d tasks (expected 0)", result2.Reconciled)
+		}
+		if result2.OrphanedSessions != 0 {
+			rt.Fatalf("idempotency: second Reconcile killed %d orphans (expected 0)", result2.OrphanedSessions)
+		}
+		if len(result2.FailedKills) != 0 {
+			rt.Fatalf("idempotency: second Reconcile reported failed kills %v (expected none)", result2.FailedKills)
+		}
+		if len(result2.GapsRecovered) != 0 {
+			rt.Fatalf("idempotency: second Reconcile recovered %d gaps (expected 0)", len(result2.GapsRecovered))
+		}
+		if len(result2.RetriesRecovered) != 0 {
+			rt.Fatalf("idempotency: second Reconcile recovered retries for %d tasks (expected 0)", len(result2.RetriesRecovered))
+		}
+		if len(result2.HandoffsRecovered) != 0 {
+			rt.Fatalf("idempotency: second Reconcile recovered handoffs for %d tasks (expected 0)", len(result2.HandoffsRecovered))
+		}
+		if len(result2.HumanReopens) != 0 {
+			rt.Fatalf("idempotency: second Reconcile detected %d reopens (expected 0)", len(result2.HumanReopens))
+		}
+		if result2.EventLogCorruptLines != 0 {
+			rt.Fatalf("idempotency: second Reconcile reported %d corrupt lines (expected 0)", result2.EventLogCorruptLines)
 		}
 	})
 }

@@ -32,8 +32,6 @@ func newMockSession(runID string) *mockSession {
 	}
 }
 
-func (m *mockSession) RunID() string { return m.runID }
-
 func (m *mockSession) HasSession(name string) (bool, error) {
 	return m.alive[name], nil
 }
@@ -80,7 +78,7 @@ func TestReconcile_StaleAssignmentReset(t *testing.T) {
 	tmux := newMockSession("run-1")
 	// Session is NOT alive → stale.
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", "")
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.Reconciled)
 
@@ -104,7 +102,7 @@ func TestReconcile_LiveSessionPreserved(t *testing.T) {
 	sessionName := orch.SessionName("run-1", "w1")
 	tmux.alive[sessionName] = true
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", "")
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
 	require.NoError(t, err)
 	assert.Equal(t, 0, result.Reconciled)
 
@@ -127,7 +125,7 @@ func TestReconcile_AssignedNoSession(t *testing.T) {
 	tmux := newMockSession("run-1")
 	// Session dead for assigned task.
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", "")
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.Reconciled)
 
@@ -150,7 +148,7 @@ func TestReconcile_OrphanSessionKilled(t *testing.T) {
 		orch.SessionName("run-1", "w2"), // orphan
 	}
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", "")
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.OrphanedSessions)
 	assert.Len(t, tmux.killed, 2)
@@ -171,7 +169,7 @@ func TestReconcile_GapRecovery(t *testing.T) {
 		{Kind: orch.EventGapRecorded, TaskID: "task-c"},
 	})
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", logPath)
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", logPath)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"task-a", "task-c"}, result.GapsRecovered)
 }
@@ -189,7 +187,7 @@ func TestReconcile_RetryRecovery(t *testing.T) {
 		{Kind: orch.EventTaskRetried, TaskID: "task-b"},
 	})
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", logPath)
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", logPath)
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.RetriesRecovered["task-a"])
 	assert.Equal(t, 1, result.RetriesRecovered["task-b"])
@@ -208,7 +206,7 @@ func TestReconcile_HandoffRecovery(t *testing.T) {
 		{Kind: orch.EventTaskHandoff, TaskID: "task-a"},
 	})
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", logPath)
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", logPath)
 	require.NoError(t, err)
 	assert.Equal(t, 3, result.HandoffsRecovered["task-a"])
 }
@@ -230,7 +228,7 @@ func TestReconcile_HumanReopenDetection(t *testing.T) {
 		{Kind: orch.EventTaskCompleted, TaskID: "build-1"},
 	})
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", logPath)
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", logPath)
 	require.NoError(t, err)
 	assert.Contains(t, result.HumanReopens, "build-1")
 }
@@ -249,7 +247,7 @@ func TestReconcile_WorkerReset(t *testing.T) {
 
 	tmux := newMockSession("run-1")
 
-	_, err := orch.Reconcile(store, tmux, "feat/x", "")
+	_, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
 	require.NoError(t, err)
 
 	w1, _ := store.GetWorker("w1")
@@ -277,7 +275,7 @@ func TestReconcile_WorkerPreservedForLiveSession(t *testing.T) {
 	tmux := newMockSession("run-1")
 	tmux.alive[orch.SessionName("run-1", "w1")] = true
 
-	_, err := orch.Reconcile(store, tmux, "feat/x", "")
+	_, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
 	require.NoError(t, err)
 
 	w1, _ := store.GetWorker("w1")
@@ -293,7 +291,7 @@ func TestReconcile_EmptyState(t *testing.T) {
 	store := testutil.NewMockStore()
 	tmux := newMockSession("run-1")
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", "")
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
 	require.NoError(t, err)
 	assert.Equal(t, 0, result.Reconciled)
 	assert.Equal(t, 0, result.OrphanedSessions)
@@ -307,7 +305,7 @@ func TestReconcile_MissingEventLog(t *testing.T) {
 	store := testutil.NewMockStore()
 	tmux := newMockSession("run-1")
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", "/nonexistent/events.jsonl")
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "/nonexistent/events.jsonl")
 	require.NoError(t, err)
 	assert.Empty(t, result.GapsRecovered)
 	assert.Empty(t, result.RetriesRecovered)
@@ -328,7 +326,7 @@ func TestReconcile_TerminalTasksUntouched(t *testing.T) {
 
 	tmux := newMockSession("run-1")
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", "")
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
 	require.NoError(t, err)
 	assert.Equal(t, 0, result.Reconciled)
 
@@ -339,7 +337,9 @@ func TestReconcile_TerminalTasksUntouched(t *testing.T) {
 }
 
 // TestReconcile_CorruptEventLogLines verifies that malformed JSON lines
-// in the event log are silently skipped.
+// are counted and surfaced via ResumeResult.EventLogCorruptLines.
+// Corrupt lines must not be silently dropped — they would otherwise
+// under-count BVV-ERR-01 / BVV-L-04 monotonic counters on resume.
 func TestReconcile_CorruptEventLogLines(t *testing.T) {
 	store := testutil.NewMockStore()
 	tmux := newMockSession("run-1")
@@ -355,9 +355,77 @@ func TestReconcile_CorruptEventLogLines(t *testing.T) {
 	require.NoError(t, enc.Encode(orch.Event{Kind: orch.EventGapRecorded, TaskID: "task-b", Timestamp: time.Now()}))
 	f.Close()
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", logPath)
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", logPath)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"task-a", "task-b"}, result.GapsRecovered)
+	assert.Equal(t, 2, result.EventLogCorruptLines, "both bad lines must be counted")
+}
+
+// TestReconcile_HasSessionError verifies that a tmux probe error must surface
+// rather than silently leaving an in_progress task unverified. A swallowed
+// probe error leaves the task in_progress with no live session, the
+// dispatcher will not re-queue it (status != open), and the watchdog has
+// no worker to monitor — a silent orphan that stalls the lifecycle.
+func TestReconcile_HasSessionError(t *testing.T) {
+	store := testutil.NewMockStore()
+	task := testutil.SingleTask(t, store, "build-1", "feat/x", "builder")
+	task.Status = orch.StatusInProgress
+	task.Assignee = "w1"
+	require.NoError(t, store.UpdateTask(task))
+
+	tmux := &errSession{runID: "run-1", err: assertProbeErr}
+
+	_, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, assertProbeErr)
+
+	// Task status must be unchanged so the operator can investigate.
+	got, _ := store.GetTask("build-1")
+	assert.Equal(t, orch.StatusInProgress, got.Status)
+}
+
+// errSession is a SessionPresence that returns a fixed error from HasSession.
+type errSession struct {
+	runID string
+	err   error
+}
+
+func (e *errSession) HasSession(string) (bool, error)  { return false, e.err }
+func (e *errSession) ListSessions() ([]string, error)  { return nil, nil }
+func (e *errSession) KillSessionIfExists(string) error { return nil }
+
+var assertProbeErr = errProbe("tmux: socket EBADF")
+
+type errProbe string
+
+func (e errProbe) Error() string { return string(e) }
+
+// TestReconcile_FailedKillTracked verifies that when KillSessionIfExists
+// errors, the session is recorded in FailedKills and NOT counted in
+// OrphanedSessions. Reporting failed kills as cleaned up lies in the audit
+// trail.
+func TestReconcile_FailedKillTracked(t *testing.T) {
+	store := testutil.NewMockStore()
+	tmux := &killErrSession{
+		runID:    "run-1",
+		sessions: []string{orch.SessionName("run-1", "w-orphan")},
+	}
+
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.OrphanedSessions, "failed kill must not count as orphan cleanup")
+	assert.Equal(t, []string{orch.SessionName("run-1", "w-orphan")}, result.FailedKills)
+}
+
+type killErrSession struct {
+	runID    string
+	sessions []string
+}
+
+func (k *killErrSession) HasSession(string) (bool, error) { return false, nil }
+func (k *killErrSession) ListSessions() ([]string, error) { return k.sessions, nil }
+func (k *killErrSession) KillSessionIfExists(string) error {
+	return errProbe("tmux: kill failed")
 }
 
 // TestReconcile_MultipleBranches verifies that reconciliation only touches
@@ -383,7 +451,7 @@ func TestReconcile_MultipleBranches(t *testing.T) {
 	tmux := newMockSession("run-1")
 
 	// Reconcile only feat/x.
-	result, err := orch.Reconcile(store, tmux, "feat/x", "")
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.Reconciled) // only task-x
 
@@ -409,7 +477,7 @@ func TestReconcile_HumanReopenNotTriggeredForCurrentlyTerminal(t *testing.T) {
 		{Kind: orch.EventTaskCompleted, TaskID: "build-1"},
 	})
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", logPath)
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", logPath)
 	require.NoError(t, err)
 	assert.Empty(t, result.HumanReopens, "already-terminal task is not a re-open")
 }
@@ -455,7 +523,7 @@ func TestReconcile_FullScenario(t *testing.T) {
 		{Kind: orch.EventTaskCompleted, TaskID: "verify-1"}, // verify-1 was completed
 	})
 
-	result, err := orch.Reconcile(store, tmux, "feat/x", logPath)
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", logPath)
 	require.NoError(t, err)
 
 	// Step 1: build-1 reset (dead session), build-2 preserved (alive).

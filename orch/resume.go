@@ -3,6 +3,7 @@ package orch
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -11,7 +12,6 @@ import (
 // SessionPresence abstracts tmux session operations needed by Reconcile.
 // *TmuxClient satisfies this interface. Tests provide a mock.
 type SessionPresence interface {
-	RunID() string
 	HasSession(name string) (bool, error)
 	ListSessions() ([]string, error)
 	KillSessionIfExists(name string) error
@@ -20,12 +20,19 @@ type SessionPresence interface {
 // ResumeResult describes the outcome of DAG state reconciliation (BVV §11a.2).
 // Returned by Reconcile for the Engine to restore in-memory state machines.
 type ResumeResult struct {
-	Reconciled        int              // stale assignments reset to open
-	OrphanedSessions  int              // orphan tmux sessions killed
-	GapsRecovered     []string         // task IDs from gap_recorded events
-	RetriesRecovered  map[string]int   // taskID → retry count from event log
-	HandoffsRecovered map[string]int   // taskID → handoff count from event log
-	HumanReopens      []string         // task IDs where terminal→open detected (BVV-S-02a)
+	Reconciled        int            // stale assignments reset to open
+	OrphanedSessions  int            // orphan tmux sessions successfully killed
+	FailedKills       []string       // session names whose kill returned an error
+	GapsRecovered     []string       // task IDs from gap_recorded events
+	RetriesRecovered  map[string]int // taskID → retry count from event log
+	HandoffsRecovered map[string]int // taskID → handoff count from event log
+	HumanReopens      []string       // task IDs where terminal→open detected (BVV-S-02a)
+
+	// EventLogCorruptLines counts JSONL lines that failed to parse during
+	// recovery. A corrupt mid-record line truncates downstream counter
+	// recovery (BVV-ERR-01 / BVV-L-04 monotonic guarantees), and the
+	// single-pass scan makes Reconcile the only chance to notice.
+	EventLogCorruptLines int
 }
 
 // Reconcile reconstructs lifecycle state from the ledger, tmux, and event log
@@ -45,6 +52,7 @@ type ResumeResult struct {
 func Reconcile(
 	store Store,
 	tmux SessionPresence,
+	runID string,
 	branch string,
 	logPath string,
 ) (*ResumeResult, error) {
@@ -54,7 +62,8 @@ func Reconcile(
 	}
 	branchLabel := LabelBranch + ":" + branch
 
-	// Step 1: Stale assignment detection (BVV-ERR-08).
+	// Step 1: Stale assignment reset (§11a.2 step 1; BVV-ERR-08 defines the
+	// preservation exception for live sessions).
 	// Tasks with status assigned/in_progress but no live tmux session are
 	// reset to open. BVV-ERR-08: in_progress tasks WITH a live session are
 	// preserved — the watchdog picks up monitoring after reconciliation.
@@ -72,10 +81,15 @@ func Reconcile(
 		if task.Assignee == "" {
 			continue
 		}
-		sessionName := SessionName(tmux.RunID(), task.Assignee)
+		sessionName := SessionName(runID, task.Assignee)
 		alive, hasErr := tmux.HasSession(sessionName)
 		if hasErr != nil {
-			continue // tmux infra error — skip, don't corrupt state
+			// Surface the error rather than silently skipping. Leaving the
+			// task in_progress with an unverifiable session corrupts state:
+			// the dispatcher will not re-queue (status != open) and the
+			// watchdog has no worker to monitor.
+			return nil, fmt.Errorf("reconcile: probe session %s for task %s: %w",
+				sessionName, task.ID, hasErr)
 		}
 		if alive && task.Status == StatusInProgress {
 			liveTasks[task.ID] = true
@@ -88,7 +102,7 @@ func Reconcile(
 		if err := store.UpdateTask(task); err != nil {
 			return nil, fmt.Errorf("reconcile: reset task %s: %w", task.ID, err)
 		}
-		tasks[i] = task // update slice in-place for step 2
+		tasks[i] = task // keep slice in sync — step 2 reads task.Status below
 		result.Reconciled++
 	}
 
@@ -103,12 +117,19 @@ func Reconcile(
 		expected := make(map[string]bool)
 		for _, t := range tasks {
 			if t.Status == StatusInProgress && t.Assignee != "" {
-				expected[SessionName(tmux.RunID(), t.Assignee)] = true
+				expected[SessionName(runID, t.Assignee)] = true
 			}
 		}
 		for _, session := range sessions {
 			if !expected[session] {
-				_ = tmux.KillSessionIfExists(session)
+				// Only count successful kills. Reporting a kill that errored
+				// as "cleaned up" lies in the audit trail and lets stale
+				// sessions accumulate while the operator believes state is
+				// clean.
+				if killErr := tmux.KillSessionIfExists(session); killErr != nil {
+					result.FailedKills = append(result.FailedKills, session)
+					continue
+				}
 				result.OrphanedSessions++
 			}
 		}
@@ -124,16 +145,21 @@ func Reconcile(
 		result.GapsRecovered = rec.gaps
 		result.RetriesRecovered = rec.retries
 		result.HandoffsRecovered = rec.handoffs
+		result.EventLogCorruptLines = rec.corruptLines
 
 		// Step 6: Human re-open detection (BVV-S-02a).
 		// A task that was terminal in the event log but is now open was
-		// re-opened by a human.
-		for taskID, lastTerminal := range rec.terminalHistory {
+		// re-opened by a human. terminalHistory only contains terminal
+		// statuses by construction, so the store-side check is sufficient.
+		for taskID := range rec.terminalHistory {
 			task, getErr := store.GetTask(taskID)
 			if getErr != nil {
-				continue // task may have been deleted
+				if errors.Is(getErr, ErrNotFound) {
+					continue // task deleted by operator — not a re-open
+				}
+				return nil, fmt.Errorf("reconcile: get task %s: %w", taskID, getErr)
 			}
-			if task.Status == StatusOpen && lastTerminal.Terminal() {
+			if task.Status == StatusOpen {
 				result.HumanReopens = append(result.HumanReopens, taskID)
 			}
 		}
@@ -169,40 +195,49 @@ func Reconcile(
 
 // eventLogRecovery holds all counters extracted from a single event log scan.
 type eventLogRecovery struct {
-	gaps            []string            // task IDs from gap_recorded events
-	retries         map[string]int      // taskID → retry count
-	handoffs        map[string]int      // taskID → handoff count
+	gaps            []string              // task IDs from gap_recorded events
+	retries         map[string]int        // taskID → retry count
+	handoffs        map[string]int        // taskID → handoff count
 	terminalHistory map[string]TaskStatus // taskID → last terminal status
+	corruptLines    int                   // unparseable JSONL lines
 }
+
+// maxEventLogLine bounds the per-line buffer for the event-log scanner.
+// Defaults of bufio.Scanner truncate at 64 KiB, which silently drops large
+// Detail/Summary payloads and skips every subsequent line. 16 MiB matches
+// the practical ceiling of a single Event after JSON encoding.
+const maxEventLogLine = 16 * 1024 * 1024
 
 // recoverFromEventLog performs a single-pass scan of the event log and
 // extracts gap task IDs, per-task retry counts, per-task handoff counts,
 // and the last terminal status per task. Missing log file → zero values, nil.
-// Corrupt JSON lines are silently skipped.
+//
+// Corrupt JSON lines are counted, not silently dropped. The single-pass
+// optimisation makes this the only chance to notice corruption that would
+// otherwise under-count BVV-ERR-01 / BVV-L-04 monotonic counters; callers
+// must surface eventLogRecovery.corruptLines.
 func recoverFromEventLog(logPath string) (*eventLogRecovery, error) {
-	f, err := os.Open(logPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &eventLogRecovery{
-				retries:         make(map[string]int),
-				handoffs:        make(map[string]int),
-				terminalHistory: make(map[string]TaskStatus),
-			}, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-
 	rec := &eventLogRecovery{
 		retries:         make(map[string]int),
 		handoffs:        make(map[string]int),
 		terminalHistory: make(map[string]TaskStatus),
 	}
 
+	f, err := os.Open(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return rec, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), maxEventLogLine)
 	for scanner.Scan() {
 		var e Event
-		if json.Unmarshal(scanner.Bytes(), &e) != nil {
+		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
+			rec.corruptLines++
 			continue
 		}
 		if e.TaskID == "" {
@@ -223,5 +258,10 @@ func recoverFromEventLog(logPath string) (*eventLogRecovery, error) {
 			rec.terminalHistory[e.TaskID] = StatusBlocked
 		}
 	}
-	return rec, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		// Partial recovery is worse than none — counters would be
+		// silently truncated. Return the error so Reconcile fails.
+		return nil, fmt.Errorf("event log scan: %w", err)
+	}
+	return rec, nil
 }
