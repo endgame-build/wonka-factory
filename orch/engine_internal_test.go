@@ -159,4 +159,3 @@ func readSingleEvent(t *testing.T, logPath string, kind EventKind) *Event {
 	require.NoError(t, scanner.Err())
 	return nil
 }
-
