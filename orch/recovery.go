@@ -59,6 +59,20 @@ func (rs *RetryState) AttemptCount(taskID string) int {
 	return rs.attempts[taskID]
 }
 
+// SetCounts restores retry counts from event log recovery (BVV-ERR-01).
+// Called by Engine.Resume to initialise state from the audit trail.
+func (rs *RetryState) SetCounts(counts map[string]int) {
+	rs.attempts = maps.Clone(counts)
+	if rs.attempts == nil {
+		rs.attempts = make(map[string]int)
+	}
+}
+
+// ResetTask clears the retry count for a task (BVV-S-02a: human re-open).
+func (rs *RetryState) ResetTask(taskID string) {
+	delete(rs.attempts, taskID)
+}
+
 // ScaledTimeout computes the timeout for a retry attempt (BVV-ERR-02a):
 //
 //	timeout(attempt) = base_timeout * (1.0 + 0.5 * attempt_number)

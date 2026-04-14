@@ -177,3 +177,18 @@ func (l *LifecycleLock) read() (*LockContent, error) {
 func (l *LifecycleLock) write(content LockContent) error {
 	return atomicWriteJSON(l.path, content)
 }
+
+// ReadHolder reads the lock file at path and returns the holder ID, or ""
+// if the file is missing, unreadable, or corrupt. Used by Engine.Resume to
+// recover the previous RunID for tmux socket reconnection (BVV-ERR-08).
+func ReadHolder(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var c LockContent
+	if json.Unmarshal(data, &c) != nil {
+		return ""
+	}
+	return c.Holder
+}

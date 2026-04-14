@@ -264,3 +264,36 @@ func TestBVV_L02_RefreshRejectsWrongHolder(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "holder mismatch")
 }
+
+// TestReadHolder verifies RunID recovery from stale lock files (BVV-ERR-08).
+func TestReadHolder(t *testing.T) {
+	t.Run("valid lock file", func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, ".wonka-test.lock")
+		content := `{"holder":"run-abc123","branch":"feature-x","timestamp":"2025-01-01T00:00:00Z"}`
+		require.NoError(t, os.WriteFile(lockPath, []byte(content), 0o644))
+
+		assert.Equal(t, "run-abc123", orch.ReadHolder(lockPath))
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		assert.Equal(t, "", orch.ReadHolder("/nonexistent/path"))
+	})
+
+	t.Run("corrupt JSON", func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, ".wonka-test.lock")
+		require.NoError(t, os.WriteFile(lockPath, []byte("not json"), 0o644))
+
+		assert.Equal(t, "", orch.ReadHolder(lockPath))
+	})
+
+	t.Run("empty holder", func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, ".wonka-test.lock")
+		content := `{"holder":"","branch":"feature-x","timestamp":"2025-01-01T00:00:00Z"}`
+		require.NoError(t, os.WriteFile(lockPath, []byte(content), 0o644))
+
+		assert.Equal(t, "", orch.ReadHolder(lockPath))
+	})
+}

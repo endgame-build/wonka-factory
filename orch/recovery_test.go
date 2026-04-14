@@ -99,6 +99,36 @@ func TestBVV_ERR01_DefaultRetryConfig(t *testing.T) {
 	assert.Equal(t, 30*time.Minute, cfg.BaseTimeout)
 }
 
+// TestRetryState_SetCounts verifies resume recovery of retry counters.
+func TestRetryState_SetCounts(t *testing.T) {
+	rs := orch.NewRetryState()
+	cfg := orch.RetryConfig{MaxRetries: 2}
+
+	// Restore counts from a previous run.
+	rs.SetCounts(map[string]int{"task-a": 1, "task-b": 2})
+	assert.Equal(t, 1, rs.AttemptCount("task-a"))
+	assert.Equal(t, 2, rs.AttemptCount("task-b"))
+	assert.True(t, rs.CanRetry("task-a", cfg))
+	assert.False(t, rs.CanRetry("task-b", cfg))
+
+	// Nil map → empty state (no panic).
+	rs.SetCounts(nil)
+	assert.Equal(t, 0, rs.AttemptCount("task-a"))
+}
+
+// TestRetryState_ResetTask verifies BVV-S-02a: human re-open clears retry count.
+func TestRetryState_ResetTask(t *testing.T) {
+	rs := orch.NewRetryState()
+	rs.SetCounts(map[string]int{"task-a": 2})
+	assert.Equal(t, 2, rs.AttemptCount("task-a"))
+
+	rs.ResetTask("task-a")
+	assert.Equal(t, 0, rs.AttemptCount("task-a"))
+
+	// Reset non-existent task is a no-op.
+	rs.ResetTask("task-nonexistent")
+}
+
 // --- Gap Tracker Tests (BVV-ERR-03, BVV-ERR-04, BVV-ERR-05, S7) ---
 
 // TestBVV_ERR05_MonotonicGapAccumulation verifies BVV-ERR-05: gap count is
