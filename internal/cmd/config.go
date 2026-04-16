@@ -180,11 +180,12 @@ func resolveRepoPath(raw string) (string, error) {
 }
 
 // buildRoleRegistry stat-checks each role's instruction file under agentDir.
-// - All three missing → error (operator clearly hasn't run Phase 8; fail fast
-//   before any tmux/lock side effects).
-// - Some missing → per-role warnings, partial registry returned so runs with
-//   subset workloads (e.g. builders only) keep working during Phase 8 dev.
-// - All present → silent.
+//   - All three missing → error (operator clearly hasn't run Phase 8; fail fast
+//     before any tmux/lock side effects).
+//   - Some missing → per-role warnings, partial registry returned so runs with
+//     subset workloads (e.g. builders only) keep working during Phase 8 dev.
+//   - All present → silent.
+//
 // The preset is shared by every role; MaxTurns stays at zero (preset default)
 // until a flag is added in a later phase.
 func buildRoleRegistry(agentDir string, preset *orch.Preset) (map[string]orch.RoleConfig, []string, error) {

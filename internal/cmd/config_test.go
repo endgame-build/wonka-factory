@@ -148,7 +148,7 @@ func TestBuildEngineConfig_InvalidTimeout(t *testing.T) {
 // single test — all three share the same error wording.
 func TestBuildEngineConfig_NegativeBudgets(t *testing.T) {
 	cases := []struct {
-		name  string
+		name   string
 		mutate func(*CLIFlags)
 	}{
 		{"gap", func(f *CLIFlags) { f.GapTolerance = -1 }},
