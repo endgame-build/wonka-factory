@@ -254,7 +254,8 @@ Spec tests (`dispatch_spec_test.go`):
 |---|---|
 | `TestBVV_DSN01_DAGDrivenDispatch` | BVV-DSN-01 |
 | `TestBVV_DSN02_OneTaskPerSession` | BVV-DSN-02 |
-| `TestBVV_DSN03_TwoLayerMemory` | BVV-DSN-03 |
+| `TestBVV_DSN03_HandoffIsInfrastructureDriven` | BVV-DSN-03 (in `safety_spec_test.go`) |
+| `TestBVV_S05_RoutingUsesLabelsOnly` | BVV-S-05 |
 | `TestBVV_DSP01_DispatchAllReady` | BVV-DSP-01 |
 | `TestBVV_DSP02_NoHoldingReady` | BVV-DSP-02 |
 | `TestBVV_DSP03_RoleBasedRouting` | BVV-DSP-03 |
@@ -275,6 +276,12 @@ Property tests (`dispatch_prop_test.go`):
 - `TestProp_NoDepsDispatchedBeforeTerminal` (BVV-S-04)
 - `TestProp_SingleWorkerPerTask` (BVV-S-03)
 - `TestProp_GapBoundedOvershoot` (BVV-ERR-04, MaxWorkers-1 overshoot)
+- `TestProp_ConcurrentOutcomeProcessing` (BVV-S-02, BVV-S-03 under concurrent outcomes)
+- `TestProp_MixedOutcomeDAGTerminates` (termination under random exit codes)
+
+Property tests (`recovery_prop_test.go`):
+- `TestProp_HandoffRetryBounded` (BVV-ERR-01, BVV-L-04 bounds hold under random op sequences)
+- `TestProp_AbortCleanupNoOpenTasks` (BVV-ERR-04a — no open tasks after abort cleanup)
 
 Agent/gate spec tests:
 
@@ -326,20 +333,19 @@ Safety spec tests (`safety_spec_test.go`):
 | `TestBVV_S02_TerminalIrreversibility` | BVV-S-02 |
 | `TestBVV_S03_SingleAssignment` | BVV-S-03 |
 | `TestBVV_S04_DependencyOrdering` | BVV-S-04 |
-| `TestBVV_S05_ZeroContentInspection` | BVV-S-05 |
 | `TestBVV_S07_BoundedDegradation` | BVV-S-07 |
 | `TestBVV_S08_AssignmentDurability` | BVV-S-08 |
 
 ### Phase 8: Integration & System-Level V&V
 
 **Tests:** `engine_e2e_test.go`, `engine_fault_test.go` (build tag `integration`)
-**Testdata:** `testdata/mock-agents/{success.sh, fail.sh, blocked.sh, handoff.sh, hang.sh, crash.sh, slow-success.sh}`
+**Testdata:** `testdata/mock-agents/{ok.sh, fail.sh, blocked.sh, handoff.sh, hang.sh, crash.sh, slow-success.sh}`
 
 Mock agent scripts:
 
 | Script | Exit Code | Purpose |
 |---|---|---|
-| `success.sh` | 0 | Task completes |
+| `ok.sh` | 0 | Task completes |
 | `fail.sh` | 1 | Task fails (retryable) |
 | `blocked.sh` | 2 | Task blocked (terminal) |
 | `handoff.sh` | 3 | Session handoff |
@@ -355,6 +361,7 @@ Each e2e test asserts three things: (1) expected final task statuses, (2) mandat
 |---|---|---|---|---|
 | `TestE2E_HappyPath` | plan→build→vv→gate, all exit 0 | 9.1 | `lifecycle_started → task_dispatched{plan} → task_completed{plan} → task_dispatched{build} → task_completed{build} → task_dispatched{vv} → task_completed{vv} → task_dispatched{gate} → gate_passed → lifecycle_completed` | All tasks `completed` |
 | `TestE2E_RetryThenSucceed` | build fails once, retries, succeeds | — | `...→ task_dispatched{build} → task_retried{build} → task_dispatched{build} → task_completed{build} → ...` | Build `completed` after retry |
+| `TestE2E_HandoffSuccess` | exit 3 then exit 0 — happy-path handoff (BVV-DSP-14) | — | `task_dispatched → task_handoff → task_completed`; no `task_failed`/`task_blocked`/`handoff_limit_reached` | Task `completed` |
 | `TestE2E_PlannerPartialFailure` | Planner crashes, retries, reconciles | 9.2 | `...→ task_retried{plan} → task_completed{plan} → ...` | Plan `completed`, subsequent tasks dispatched |
 | `TestE2E_ConcurrentVVConflict` | Parallel V&V, git conflict, retry | 9.3 | Contains `task_retried` for conflicting V&V task | Both V&V `completed` |
 | `TestE2E_CrashDuringReconciliation` | Kill orchestrator during reconcile, resume | 9.4 | Second run's log starts with reconciliation, then dispatch | All tasks eventually terminal |
@@ -374,11 +381,12 @@ Fault injection tests:
 | `TestFault_KillTmuxSession` | Kill tmux mid-run | BVV-ERR-11, BVV-S-08 |
 | `TestFault_StoreFailureDuringDispatch` | FailingStore mid-dispatch | Graceful degradation |
 | `TestFault_CircuitBreakerTrip` | 3 rapid failures (<60s each) | BVV-L-03 |
-| `TestFault_SessionTimeoutForced` | Agent hangs past timeout | BVV-ERR-02a |
+| `TestFault_SessionTimeout` | Agent hangs past timeout | BVV-ERR-02a |
 | `TestFault_ConcurrentLockContention` | Two engines race for lock | BVV-S-01, BVV-ERR-06 |
-| `TestFault_WorktreeMergeConflict` | Worktree rebase fails | BVV-DSP-13 |
+| `TestFault_FailureThenRetry` | Exit 1 then exit 0 | BVV-ERR-01 (engine level) |
+| `TestE2E_HandoffSuccess` | Exit 3 then exit 0 | BVV-DSP-14 (engine level) |
 
-**BVV-DSP-13 (worktree merge-back failure):** Tested via `TestFault_WorktreeMergeConflict` — mocks the git rebase operation to return a conflict error, verifies the task is treated as exit code 1 (failed) and retry protocol invoked. After retries exhausted, task set to `failed` with escalation task containing conflict details.
+**BVV-DSP-13 (worktree merge-back failure):** NOT YET COVERED. Open gap until worktree merge-back is wired into the dispatcher. The earlier placeholder (`TestFault_WorktreeMergeConflict`) was renamed to `TestFault_FailureThenRetry` because it only exercised the generic exit-1-retry path, not the actual merge-back code.
 
 ### Phase 9: CLI
 
@@ -440,9 +448,9 @@ Property: `TestProp_ConcurrentOutcomeProcessing`
 
 ### Dispatch-during-outcome race (`dispatch_spec_test.go`)
 
-Test: `TestBVV_DSP_DispatchDuringOutcomeProcessing`
+Test: `TestBVV_DSP02_TickBoundaryDispatch`
 - Task A completes (unlocks task B as ready) while outcome processing is mid-flight
-- Verify: task B is dispatched on the *next* tick, not during outcome processing of task A
+- Verify via a spawn counter: task B is dispatched on the *next* tick, not reentrantly during outcome processing of task A
 
 ---
 
@@ -544,13 +552,13 @@ exit $MISSING
 ### Unit + Integration Tests
 | Requirement | Unit Test | Integration Test |
 |---|---|---|
-| BVV-ERR-02a | `TestBVV_ERR02a_BaseSessionTimeout` (mock timer) | `TestFault_SessionTimeoutForced` (real tmux hang) |
+| BVV-ERR-02a | `TestBVV_ERR02a_BaseSessionTimeout` (mock timer) | `TestFault_SessionTimeout` (real tmux hang) |
 
 ### L2 Integration Tests Only
 | Requirement | Test |
 |---|---|
 | BVV-TG-04/05/06/11/12 | L2 integration tests with planner |
-| BVV-DSP-13 | `TestFault_WorktreeMergeConflict` |
+| BVV-DSP-13 | NOT YET COVERED (see Phase 8 notes) |
 
 ---
 
@@ -597,13 +605,13 @@ Mock scripts accept configuration via environment variables. All scripts are in 
 
 | Script | Env Vars | Behavior |
 |---|---|---|
-| `success.sh` | — | Exits immediately with code 0 |
+| `ok.sh` | — | Exits immediately with code 0 |
 | `fail.sh` | — | Exits immediately with code 1 |
 | `blocked.sh` | — | Exits immediately with code 2 |
 | `handoff.sh` | — | Exits immediately with code 3 |
-| `slow-success.sh` | `MOCK_DELAY_SECONDS` (default: 5) | Sleeps for delay, then exits 0 |
-| `crash.sh` | `MOCK_DELAY_SECONDS` (default: 2) | Sleeps for delay (simulating partial work), then exits 1 |
-| `hang.sh` | — | Sleeps indefinitely (`sleep infinity`). Tests must kill via timeout. |
+| `slow-success.sh` | `DELAY` (default: 5) | Sleeps for delay seconds, then exits 0 |
+| `crash.sh` | — | Sleeps 2 seconds then exits 1 |
+| `hang.sh` | — | Sleeps 3600 seconds (traps SIGTERM → exit 143). Tests must kill via timeout. |
 
 All scripts write an `<outcome>` diagnostic tag to stdout before exiting (matching BVV Section 8.3.2) so that diagnostic tag capture can be tested alongside exit code handling.
 
@@ -674,7 +682,7 @@ Legend — **Method**: S=Spec test, C=Contract test, P=Property test, I=Integrat
 |---|---|---|---|---|---|---|---|
 | 1 | BVV-DSN-01 | Design | L1 | Yes | S | `dispatch_spec_test.go` | DAG-driven dispatch |
 | 2 | BVV-DSN-02 | Design | L1 | Yes | S | `dispatch_spec_test.go` | One task per session |
-| 3 | BVV-DSN-03 | Design | L1 | Yes | S,G | `dispatch_spec_test.go` | Two-layer memory, no agent memory access |
+| 3 | BVV-DSN-03 | Design | L1 | Yes | X,G | _(by construction)_ | Two-layer memory: orchestrator never reads agent memory files (`PROGRESS.md`, handoff paths). Enforced by structural absence of read sites, verifiable via grep. |
 | 4 | BVV-DSN-04 | Design | L1 | Yes | S | `types_test.go` | Phase-agnostic via labels |
 | 5 | BVV-AI-01 | Agent | L1 | No | S | `agent_spec_test.go` | Instruction file injection via SystemPromptFlag |
 | 6 | BVV-AI-02 | Agent | L1 | Yes | S | `agent_spec_test.go` | Role→instruction file mapping |

@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"context"
+	"path/filepath"
 	"sync/atomic"
 
 	"github.com/endgame/wonka-factory/orch"
@@ -74,5 +75,23 @@ func SequenceSpawnFunc(codes []int) orch.SpawnFunc {
 			code = codes[i]
 		}
 		outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(code), code, roleCfg)
+	}
+}
+
+// MockScriptDir returns the absolute path to testdata/mock-agents/ relative
+// to the repo root.
+func MockScriptDir(repoRoot string) string {
+	return filepath.Join(repoRoot, "testdata", "mock-agents")
+}
+
+// MockPresetForScript returns a Preset that runs a named mock agent script
+// from the given scripts directory via bash.
+func MockPresetForScript(scriptsDir, name string) *orch.Preset {
+	return &orch.Preset{
+		Name:         "mock-" + name,
+		Command:      "bash",
+		Args:         []string{filepath.Join(scriptsDir, name+".sh")},
+		ProcessNames: []string{"bash"},
+		Env:          map[string]string{},
 	}
 }

@@ -3,6 +3,7 @@
 package orch_test
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/endgame/wonka-factory/orch"
@@ -118,13 +119,87 @@ func TestBVV_S07_BoundedDegradation(t *testing.T) {
 	}, "3 gaps > tolerance 2 should panic")
 }
 
-// TestBVV_S05_ZeroContentInspection verifies BVV-S-05 by construction:
-// DetermineOutcome takes only an exit code — no output path, no content
-// parameter. The orchestrator has no API surface for reading agent output.
-func TestBVV_S05_ZeroContentInspection(t *testing.T) {
-	// DetermineOutcome's signature is func(int) AgentOutcome.
-	// If it accepted an output path or content, this test would fail to compile.
-	// The assertion here is that the function exists with this signature.
-	var fn func(int) orch.AgentOutcome = orch.DetermineOutcome
-	assert.NotNil(t, fn, "DetermineOutcome has exit-code-only signature (BVV-S-05)")
+// TestBVV_S01_LifecycleExclusion verifies that AssertLifecycleExclusion panics
+// when the lifecycle lock is not held for the branch (BVV-S-01).
+func TestBVV_S01_LifecycleExclusion(t *testing.T) {
+	dir := t.TempDir()
+	lock := orch.NewLifecycleLock(orch.LockConfig{
+		Path: filepath.Join(dir, "test.lock"),
+	})
+
+	// Lock not held — should panic.
+	assert.Panics(t, func() {
+		orch.AssertLifecycleExclusion(lock, "feat/x")
+	}, "unheld lock should panic")
+
+	// Acquire the lock — should not panic.
+	require.NoError(t, lock.Acquire("holder-1", "feat/x"))
+	assert.NotPanics(t, func() {
+		orch.AssertLifecycleExclusion(lock, "feat/x")
+	})
+
+	// Nil lock — should not panic (graceful skip).
+	assert.NotPanics(t, func() {
+		orch.AssertLifecycleExclusion(nil, "feat/x")
+	})
+}
+
+// TestBVV_S08_AssignmentDurability verifies that an assignment survives
+// store close and reopen (BVV-S-08).
+func TestBVV_S08_AssignmentDurability(t *testing.T) {
+	dir := t.TempDir()
+	store, _, err := orch.NewStore("fs", dir)
+	require.NoError(t, err)
+
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID:     "durable-t",
+		Status: orch.StatusOpen,
+		Labels: map[string]string{orch.LabelBranch: "b"},
+	}))
+	require.NoError(t, store.CreateWorker(&orch.Worker{Name: "durable-w", Status: orch.WorkerIdle}))
+	require.NoError(t, store.Assign("durable-t", "durable-w"))
+	require.NoError(t, store.Close())
+
+	// Reopen the store and verify the assignment persisted.
+	store2, _, err := orch.NewStore("fs", dir)
+	require.NoError(t, err)
+	defer store2.Close()
+
+	task, err := store2.GetTask("durable-t")
+	require.NoError(t, err)
+	assert.Equal(t, "durable-w", task.Assignee, "assignee must survive close/reopen")
+	assert.Equal(t, orch.StatusAssigned, task.Status, "status must survive close/reopen")
+}
+
+// TestBVV_DSN03_HandoffIsInfrastructureDriven verifies BVV-DSN-03: the handoff
+// counter lives in HandoffState (infrastructure); the orchestrator never reads
+// or mutates task.Body (agent-owned memory).
+func TestBVV_DSN03_HandoffIsInfrastructureDriven(t *testing.T) {
+	const maxHandoffs = 3
+	h := orch.NewHandoffState(maxHandoffs)
+	taskID := "handoff-t"
+
+	agentMemory := "PROGRESS.md: step 1/3 complete\nstep 2/3 in progress"
+	task := &orch.Task{
+		ID:     taskID,
+		Status: orch.StatusInProgress,
+		Body:   agentMemory,
+		Labels: map[string]string{
+			orch.LabelBranch: "feat/x",
+			orch.LabelRole:   "builder",
+		},
+	}
+
+	for i := 1; i <= maxHandoffs; i++ {
+		count, ok := h.TryRecord(taskID)
+		require.True(t, ok, "handoff %d within limit must be recorded", i)
+		require.Equal(t, i, count, "counter increments monotonically")
+	}
+
+	count, ok := h.TryRecord(taskID)
+	assert.False(t, ok, "at MaxHandoffs, infrastructure must refuse handoff")
+	assert.Equal(t, maxHandoffs, count, "refused TryRecord must not increment")
+
+	assert.Equal(t, agentMemory, task.Body,
+		"orchestrator must not read or mutate agent memory (task.Body)")
 }

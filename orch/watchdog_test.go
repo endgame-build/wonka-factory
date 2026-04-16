@@ -425,13 +425,21 @@ func TestBVV_S02_WatchdogNeverMutatesTaskStatus(t *testing.T) {
 }
 
 // readEvents parses the JSONL event log into a slice for assertion.
+// If the file does not end with a newline, the last split fragment is dropped:
+// a concurrent writer may be mid-flush, and parsing a partial line would hard-fail
+// callers that poll the log during a live run.
 func readEvents(t *testing.T, logPath string) []orch.Event {
 	t.Helper()
 	data, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 
+	lines := bytes.Split(data, []byte{'\n'})
+	if len(lines) > 0 && !bytes.HasSuffix(data, []byte{'\n'}) {
+		lines = lines[:len(lines)-1]
+	}
+
 	var events []orch.Event
-	for _, line := range bytes.Split(data, []byte{'\n'}) {
+	for _, line := range lines {
 		if len(line) == 0 {
 			continue
 		}

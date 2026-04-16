@@ -202,10 +202,9 @@ func TestBVV_DSP09_OrchestratorAuthority(t *testing.T) {
 	assert.Equal(t, orch.StatusCompleted, task.Status, "after outcome: completed (set by dispatcher)")
 }
 
-// TestBVV_DSP14_HandoffNoStatusChange verifies that exit code 3 (handoff)
-// does not change the task's ledger status — it stays in_progress and the
-// session is restarted (BVV-DSP-14). In test mode, RestartSession is skipped
-// and the SpawnFunc is re-launched directly.
+// TestBVV_DSP14_HandoffNoStatusChange verifies BVV-DSP-14: exit code 3
+// (handoff) leaves the task's ledger status as in_progress. Asserts status
+// between ticks so a transient flip isn't hidden by a final-status check.
 func TestBVV_DSP14_HandoffNoStatusChange(t *testing.T) {
 	d, store, _ := newTestDispatcher(t, "feat/x", 1, "builder")
 	testutil.ParallelGraph(t, store, "feat/x", "builder", 1)
@@ -220,18 +219,26 @@ func TestBVV_DSP14_HandoffNoStatusChange(t *testing.T) {
 		}
 	})
 
-	// Tick 1: dispatch → agent exits 3 (handoff).
-	d.Tick(context.Background())
-	d.Wait()
-	// Tick 2: process handoff → re-launch SpawnFunc → agent exits 0.
-	d.Tick(context.Background())
-	d.Wait()
-	// Tick 3: process success outcome.
-	d.Tick(context.Background())
+	ctx := context.Background()
 
-	assert.GreaterOrEqual(t, callCount.Load(), int32(2), "handoff should trigger re-launch")
+	d.Tick(ctx)
+	d.Wait()
 
-	task, _ := store.GetTask("p-0")
+	task, err := store.GetTask("p-0")
+	require.NoError(t, err)
+	assert.Equal(t, orch.StatusInProgress, task.Status,
+		"BVV-DSP-14: task status must remain in_progress across a handoff")
+	assert.Equal(t, int32(1), callCount.Load(),
+		"exactly one spawn observed before handoff re-launch")
+
+	d.Tick(ctx)
+	d.Wait()
+	assert.GreaterOrEqual(t, callCount.Load(), int32(2),
+		"handoff should trigger re-launch of the SpawnFunc")
+
+	d.Tick(ctx)
+	task, err = store.GetTask("p-0")
+	require.NoError(t, err)
 	assert.Equal(t, orch.StatusCompleted, task.Status,
 		"after handoff + success, task should be completed")
 }
@@ -1010,4 +1017,150 @@ func TestBVV_DSP04_TestModeStoreFailure(t *testing.T) {
 		assert.Equal(t, orch.WorkerIdle, w.Status,
 			"worker %s should be idle after store failure cleanup", w.Name)
 	}
+}
+
+// TestBVV_DSN01_DAGDrivenDispatch verifies BVV-DSN-01: dispatch ordering
+// emerges from DAG edges, not from any phase/ordering field. A diamond graph
+// (A → {B,C} → D) must dispatch A first, then B and C in parallel, then D —
+// purely from dependency structure.
+func TestBVV_DSN01_DAGDrivenDispatch(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 4, "builder")
+	testutil.DiamondGraph(t, store, "feat/x", "builder")
+
+	spawnLog := make([]string, 0)
+	var mu sync.Mutex
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		mu.Lock()
+		spawnLog = append(spawnLog, task.ID)
+		mu.Unlock()
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(0), 0, roleCfg)
+	})
+
+	ctx := context.Background()
+	for tick := 0; tick < 20; tick++ {
+		r := d.Tick(ctx)
+		d.Wait()
+		if r.LifecycleDone {
+			break
+		}
+	}
+
+	// Snapshot spawnLog under the mutex. d.Wait() only synchronizes outcome
+	// processing — spawn goroutines may still be past mu.Unlock() but before
+	// return, so reads without the lock race.
+	mu.Lock()
+	logSnapshot := append([]string(nil), spawnLog...)
+	mu.Unlock()
+
+	// A must be dispatched before B and C; both B and C must be dispatched before D.
+	require.Len(t, logSnapshot, 4, "diamond graph should dispatch exactly the 4 expected tasks")
+
+	counts := make(map[string]int, 4)
+	indices := make(map[string]int, 4)
+	for i, taskID := range logSnapshot {
+		counts[taskID]++
+		indices[taskID] = i
+	}
+
+	for _, taskID := range []string{"A", "B", "C", "D"} {
+		assert.Equal(t, 1, counts[taskID], "task %s should be dispatched exactly once", taskID)
+	}
+
+	assert.Less(t, indices["A"], indices["B"], "A must dispatch before B")
+	assert.Less(t, indices["A"], indices["C"], "A must dispatch before C")
+	assert.Less(t, indices["B"], indices["D"], "B must dispatch before D")
+	assert.Less(t, indices["C"], indices["D"], "C must dispatch before D")
+}
+
+// TestBVV_DSN02_OneTaskPerSession verifies BVV-DSN-02: each SpawnSession
+// call handles exactly one task. The spawn function is invoked once per task.
+func TestBVV_DSN02_OneTaskPerSession(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 2, "builder")
+	testutil.LinearGraph(t, store, "feat/x", "builder", 3)
+
+	var spawnCount atomic.Int64
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		spawnCount.Add(1)
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(0), 0, roleCfg)
+	})
+
+	ctx := context.Background()
+	for tick := 0; tick < 20; tick++ {
+		r := d.Tick(ctx)
+		d.Wait()
+		if r.LifecycleDone {
+			break
+		}
+	}
+
+	assert.Equal(t, int64(3), spawnCount.Load(),
+		"SpawnFunc called exactly once per task (one-task-per-session)")
+}
+
+// TestBVV_S05_RoutingUsesLabelsOnly verifies BVV-S-05: the orchestrator routes
+// tasks using the Role() label, not Title, Body, or any output content.
+func TestBVV_S05_RoutingUsesLabelsOnly(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 2, "builder")
+
+	// Create a task with content that would break routing if read.
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID:     "content-task",
+		Title:  "this title is irrelevant to routing",
+		Body:   "this body contains no routing info",
+		Status: orch.StatusOpen,
+		Labels: map[string]string{
+			orch.LabelBranch:      "feat/x",
+			orch.LabelRole:        "builder",
+			orch.LabelCriticality: string(orch.NonCritical),
+		},
+	}))
+
+	var routedRole string
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		routedRole = task.Role()
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(0), 0, roleCfg)
+	})
+
+	ctx := context.Background()
+	d.Tick(ctx)
+	d.Wait()
+
+	assert.Equal(t, "builder", routedRole,
+		"routing uses Role() label, not Title or Body content")
+}
+
+// TestBVV_DSP02_TickBoundaryDispatch verifies BVV-DSP-02: when A completes
+// and unlocks B, B is dispatched on the next Tick, not reentrantly during
+// A's outcome processing. The spawn counter guards against reentrant dispatch.
+func TestBVV_DSP02_TickBoundaryDispatch(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 2, "builder")
+	testutil.LinearGraph(t, store, "feat/x", "builder", 2) // t-0 → t-1
+
+	var spawnCount atomic.Int64
+	baseFn, ch := testutil.ChannelSpawnFunc()
+	d.SetSpawnFunc(func(ctx context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, attempt int, outcomes chan<- orch.TaskOutcome) {
+		spawnCount.Add(1)
+		baseFn(ctx, task, worker, roleCfg, attempt, outcomes)
+	})
+
+	ctx := context.Background()
+
+	r1 := d.Tick(ctx)
+	require.Equal(t, 1, r1.Dispatched, "tick 1 dispatches t-0")
+
+	ch <- 0
+	d.Wait()
+
+	assert.EqualValues(t, 1, spawnCount.Load(),
+		"outcome processing must not reentrantly dispatch t-1 within the same tick")
+	task1, err := store.GetTask("t-1")
+	require.NoError(t, err)
+	assert.Equal(t, orch.StatusOpen, task1.Status,
+		"t-1 should remain open until the next Tick")
+
+	r2 := d.Tick(ctx)
+	assert.Equal(t, 1, r2.Dispatched, "tick 2 dispatches t-1")
+	ch <- 0
+	d.Wait()
+	assert.EqualValues(t, 2, spawnCount.Load(), "second tick produces a second spawn")
 }
