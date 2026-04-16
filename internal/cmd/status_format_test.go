@@ -2,13 +2,21 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/endgame/wonka-factory/orch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// errWriter returns err on every Write. Used to exercise renderTable's
+// error-propagation paths without needing a real OS pipe.
+type errWriter struct{ err error }
+
+func (w errWriter) Write(p []byte) (int, error) { return 0, w.err }
 
 // TestRenderTable_HeaderAndRows pins the column order and the placeholder
 // ("-") used for empty Assignee / Role fields. Operators grep these tables;
@@ -32,7 +40,7 @@ func TestRenderTable_HeaderAndRows(t *testing.T) {
 			Labels:   map[string]string{orch.LabelRole: "verifier"},
 		},
 	}
-	renderTable(&buf, tasks)
+	require.NoError(t, renderTable(&buf, tasks))
 
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
 	require.Len(t, lines, 3, "one header + two rows")
@@ -56,10 +64,30 @@ func TestRenderTable_HeaderAndRows(t *testing.T) {
 // so downstream parsers don't choke on an empty stream.
 func TestRenderTable_Empty(t *testing.T) {
 	var buf bytes.Buffer
-	renderTable(&buf, nil)
+	require.NoError(t, renderTable(&buf, nil))
 	assert.Contains(t, buf.String(), "STATUS")
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
 	assert.Len(t, lines, 1, "header only when no tasks")
+}
+
+// TestRenderTable_EPIPESwallowed verifies that a reader closing the pipe
+// early (SIGPIPE / EPIPE) is treated as clean exit, not a failure —
+// otherwise `wonka status | head` would spuriously return exit 1.
+func TestRenderTable_EPIPESwallowed(t *testing.T) {
+	w := errWriter{err: syscall.EPIPE}
+	err := renderTable(w, []*orch.Task{{ID: "issue-1", Title: "x", Status: orch.StatusOpen}})
+	assert.NoError(t, err, "EPIPE must collapse to nil — reader closed the pipe, not our failure")
+}
+
+// TestRenderTable_PropagatesOtherErrors verifies that non-EPIPE write
+// failures (disk full, EIO, closed file) do surface — swallowing these
+// would mask real problems behind a truncated table and exit 0.
+func TestRenderTable_PropagatesOtherErrors(t *testing.T) {
+	sentinel := errors.New("disk full")
+	w := errWriter{err: sentinel}
+	err := renderTable(w, []*orch.Task{{ID: "issue-1", Title: "x", Status: orch.StatusOpen}})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, sentinel, "non-EPIPE errors must propagate for the caller to map to exit 1")
 }
 
 // fields splits on whitespace; tabwriter expands \t into padding spaces so

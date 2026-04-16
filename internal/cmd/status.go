@@ -13,9 +13,22 @@ import (
 )
 
 // Must agree with the ledger subdirectory orch's Engine opens under RunDir.
-// TODO: orch should export this (or an OpenLedgerForRun helper) so the CLI
-// doesn't hardcode the literal.
+// TODO(orch-seam): orch currently derives this literal inside Engine.init;
+// either export a LedgerSubdir constant or an OpenLedgerForRun(runDir,
+// kind) helper that returns (Store, LedgerKind, error). Today a rename in
+// orch would silently break `wonka status`.
 const ledgerSubdir = "ledger"
+
+// warnLedgerFallback prints a stderr warning when the store factory fell
+// back to a different backend than was requested. A scripted
+// `wonka status --json --ledger beads` on an FS fallback would otherwise
+// see data from the wrong backend with zero signal.
+func warnLedgerFallback(stderr io.Writer, requested, actual orch.LedgerKind) {
+	if actual == requested {
+		return
+	}
+	fmt.Fprintf(stderr, "warning: ledger fallback (requested: %s, using: %s)\n", requested, actual)
+}
 
 // statusOutputFormat selects how the status command renders results.
 type statusOutputFormat string
@@ -94,13 +107,7 @@ func showStatus(flags CLIFlags, format statusOutputFormat, stdout, stderr io.Wri
 		return die(stderr, exitRuntimeError, "list tasks: %s", err)
 	}
 
-	// Surface ledger-backend fallback in both output modes. JSON consumers
-	// that pipe 2>/dev/null can opt out; without this, a scripted
-	// `wonka status --json --ledger beads` running on an FS fallback would
-	// see data from the wrong backend with zero signal.
-	if actualKind != ledgerKind {
-		fmt.Fprintf(stderr, "warning: ledger fallback (requested: %s, using: %s)\n", ledgerKind, actualKind)
-	}
+	warnLedgerFallback(stderr, ledgerKind, actualKind)
 
 	switch format {
 	case statusFormatJSON:
@@ -121,7 +128,9 @@ func showStatus(flags CLIFlags, format statusOutputFormat, stdout, stderr io.Wri
 		// Header to stderr so `wonka status | awk` can slice table columns
 		// without stripping a banner line.
 		fmt.Fprintf(stderr, "branch: %s    ledger: %s\n", branch, actualKind)
-		renderTable(stdout, tasks)
+		if err := renderTable(stdout, tasks); err != nil {
+			return die(stderr, exitRuntimeError, "render table: %s", err)
+		}
 	}
 	return nil
 }

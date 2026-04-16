@@ -10,7 +10,8 @@ import (
 	"github.com/endgame/wonka-factory/orch"
 )
 
-// Pulls assistant text from claude's stream-json output for the .txt sidecar log.
+// jqExtractText pulls assistant text from claude's stream-json output for
+// the .txt sidecar log.
 const jqExtractText = `select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text // empty`
 
 // SystemPromptFlag must be --append-system-prompt (body value), not

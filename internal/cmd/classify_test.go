@@ -26,6 +26,9 @@ import (
 //   - ErrLockContention   → exit 4   (BVV-ERR-06: retryable)
 //   - ErrCorruptLock      → exit 3   (BVV-ERR-08: human intervention)
 //   - os.ErrPermission    → exit 2   (operator fixable — chmod/chown)
+//   - ErrInvalidLabelFilter/ID/EnvKey → exit 2 (bad operator input — no retry)
+//   - ErrCycle            → exit 2   (ledger data defect — no retry)
+//   - ErrHandoffLimitReached → exit 2 (BVV-L-04: terminal task outcome)
 //   - default             → exit 1   (generic runtime failure)
 //
 // Also verifies the wrapped-sentinel path (errors.Is walks the chain).
@@ -84,6 +87,36 @@ func TestClassifyEngineError(t *testing.T) {
 			err:        fmt.Errorf("orch: resume: %w", orch.ErrResumeNoLedger),
 			wantCode:   exitConfigError,
 			wantStderr: "wonka run",
+		},
+		{
+			name:       "invalid_label_filter_exit_2",
+			err:        orch.ErrInvalidLabelFilter,
+			wantCode:   exitConfigError,
+			wantStderr: "invalid input",
+		},
+		{
+			name:       "invalid_id_exit_2",
+			err:        fmt.Errorf("store: %w", orch.ErrInvalidID),
+			wantCode:   exitConfigError,
+			wantStderr: "invalid input",
+		},
+		{
+			name:       "invalid_env_key_exit_2",
+			err:        orch.ErrInvalidEnvKey,
+			wantCode:   exitConfigError,
+			wantStderr: "invalid input",
+		},
+		{
+			name:       "cycle_exit_2_with_hint",
+			err:        orch.ErrCycle,
+			wantCode:   exitConfigError,
+			wantStderr: "dependency cycle",
+		},
+		{
+			name:       "handoff_limit_exit_2_with_hint",
+			err:        orch.ErrHandoffLimitReached,
+			wantCode:   exitConfigError,
+			wantStderr: "handoff limit",
 		},
 		{
 			name:       "unknown_error_default_exit_1",

@@ -176,6 +176,26 @@ func TestStatusCmd_JSONOutput(t *testing.T) {
 	assert.Equal(t, "worker-1", byID["issue-2"].Assignee)
 }
 
+// TestWarnLedgerFallback pins the ledger-backend fallback warning.
+// A silent fallback would let a scripted `wonka status --json --ledger
+// beads` running on an FS fallback see data from the wrong backend with
+// no signal — the warning (plus the actualKind in the table header) is
+// the only way downstream tooling can detect the drift.
+func TestWarnLedgerFallback(t *testing.T) {
+	t.Run("fallback_prints_warning", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnLedgerFallback(&buf, orch.LedgerBeads, orch.LedgerFS)
+		assert.Contains(t, buf.String(), "ledger fallback")
+		assert.Contains(t, buf.String(), "requested: beads")
+		assert.Contains(t, buf.String(), "using: fs")
+	})
+	t.Run("same_kind_silent", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnLedgerFallback(&buf, orch.LedgerFS, orch.LedgerFS)
+		assert.Empty(t, buf.String(), "no warning when requested == actual")
+	})
+}
+
 // TestStatusCmd_BranchFilter verifies ListTasks(branch:<name>) excludes
 // tasks for other branches. Otherwise a shared run-dir (unusual, but
 // possible) would leak tasks across lifecycles.

@@ -73,7 +73,12 @@ func BuildEngineConfig(flags CLIFlags) (orch.EngineConfig, []string, error) {
 	if branch == "" {
 		return orch.EngineConfig{}, nil, errors.New("branch is required")
 	}
-	// Match orch's internal sanitizer for nonsensical branch values.
+	// Reject two classes of unusable branch names:
+	//   - "." and ".." — orch's lock-path sanitizer flattens both to "default",
+	//     which would silently merge two typo'd --branch values into one lifecycle
+	//     lock. Surface the invalid name instead.
+	//   - NUL bytes — not filesystem-safe; the OS rejects them downstream, but
+	//     erroring here yields a clearer message than the eventual syscall error.
 	if branch == "." || branch == ".." || strings.ContainsRune(branch, 0) {
 		return orch.EngineConfig{}, nil, fmt.Errorf("invalid branch name %q", branch)
 	}
@@ -243,8 +248,10 @@ func resolveRunDir(repoPath, branch, explicit string) string {
 
 // sanitizeBranch duplicates orch's internal sanitizeBranchForLock logic so
 // RunDir and the engine-derived lock path agree on the fragment shape.
-// TODO: orch should export this helper (or an OpenLedgerForRun constructor)
-// so the CLI doesn't hardcode the sanitization rule.
+// TODO(orch-seam): export sanitizeBranchForLock from orch (or better, an
+// OpenLedgerForRun constructor that owns path derivation end-to-end) so
+// the two copies can't drift. If orch's rule changes and this doesn't,
+// the CLI's run-dir and the engine's lock path stop agreeing.
 func sanitizeBranch(branch string) string {
 	safe := strings.NewReplacer("/", "-", "\\", "-").Replace(strings.TrimSpace(branch))
 	if safe == "" || safe == "." || safe == ".." {

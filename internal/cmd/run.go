@@ -45,10 +45,9 @@ populate via 'bd' or your own tooling.`,
 }
 
 // runLifecycle is the shared run/resume body. Passes context.Background to
-// the engine because orch.SetupSignalHandler (called from Engine.runLoop)
-// already installs SIGINT/SIGTERM handling for graceful shutdown
-// (BVV-ERR-09); a second signal.Notify here would create two cancellation
-// paths racing each other during shutdown.
+// the engine because the engine installs its own SIGINT/SIGTERM handler
+// per BVV-ERR-09; a second signal.Notify here would create two
+// cancellation paths racing each other during shutdown.
 func runLifecycle(flags CLIFlags, invoke lifecycleFn, stderr io.Writer) error {
 	cfg, warnings, err := BuildEngineConfig(flags)
 	if err != nil {
@@ -94,6 +93,25 @@ func classifyEngineError(err error, branch string, stderr io.Writer) error {
 
 	case errors.Is(err, os.ErrPermission):
 		return die(stderr, exitConfigError, "permission denied — check ownership/mode of the run directory and its ledger subdirectory (%s)", err)
+
+	// Validation-family sentinels come from bad input (operator-passed label
+	// filters, env keys, task IDs). Retrying without fixing the data won't
+	// help — exit 2 tells wrappers "do not retry, human fix required".
+	case errors.Is(err, orch.ErrInvalidLabelFilter),
+		errors.Is(err, orch.ErrInvalidID),
+		errors.Is(err, orch.ErrInvalidEnvKey):
+		return die(stderr, exitConfigError, "invalid input: %s", err)
+
+	// A dependency cycle is a data defect in the ledger — the planner (or
+	// whoever populated beads) must fix the graph before any lifecycle can
+	// converge. Same "don't retry" semantics as validation errors.
+	case errors.Is(err, orch.ErrCycle):
+		return die(stderr, exitConfigError, "ledger has a dependency cycle — inspect the task graph and remove the offending edge (%s)", err)
+
+	// Handoff limit (BVV-L-04) is a terminal task outcome, not a crash.
+	// Retrying won't help; the task graph needs operator attention.
+	case errors.Is(err, orch.ErrHandoffLimitReached):
+		return die(stderr, exitConfigError, "task exceeded handoff limit — inspect with 'wonka status --branch %s' and reopen after investigating (%s)", branch, err)
 
 	default:
 		return die(stderr, exitRuntimeError, "lifecycle failed: %s", err)
