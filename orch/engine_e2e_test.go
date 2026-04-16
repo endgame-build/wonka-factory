@@ -352,7 +352,6 @@ func TestE2E_ResumeAfterCrash(t *testing.T) {
 	}
 }
 
-
 // --- Helpers ---
 
 // validateEventSequence checks that the event log contains the specified
