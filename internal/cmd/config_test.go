@@ -1,0 +1,265 @@
+package cmd
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/endgame/wonka-factory/orch"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// seedAgentDir creates a temp dir populated with the three instruction files.
+// Missing files can be suppressed by removing them before BuildEngineConfig.
+func seedAgentDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, name := range []string{"OOMPA.md", "LOOMPA.md", "CHARLIE.md"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("# placeholder\n"), 0o644))
+	}
+	return dir
+}
+
+// validFlags returns a CLIFlags with all fields populated to defaults and
+// pointed at a fully-seeded agent dir. Tests mutate a single field to probe
+// validation paths.
+func validFlags(t *testing.T) CLIFlags {
+	t.Helper()
+	return CLIFlags{
+		Branch:       "feat-x",
+		Ledger:       "fs",
+		AgentDir:     seedAgentDir(t),
+		RunDir:       t.TempDir(),
+		RepoPath:     t.TempDir(),
+		AgentPreset:  defaultAgentPreset,
+		Workers:      defaultWorkers,
+		GapTolerance: defaultGapTolerance,
+		MaxRetries:   defaultMaxRetries,
+		MaxHandoffs:  defaultMaxHandoffs,
+		BaseTimeout:  defaultBaseTimeout,
+	}
+}
+
+// TestBuildEngineConfig_Defaults confirms the spec-defined default values
+// propagate into EngineConfig / LifecycleConfig. Guards against silent
+// regressions where a constant rename breaks the CLI's contract.
+func TestBuildEngineConfig_Defaults(t *testing.T) {
+	cfg, warnings, err := BuildEngineConfig(validFlags(t))
+	require.NoError(t, err)
+	assert.Empty(t, warnings, "all instruction files present, no warnings expected")
+
+	assert.Equal(t, defaultWorkers, cfg.MaxWorkers)
+	require.NotNil(t, cfg.Lifecycle)
+	assert.Equal(t, "feat-x", cfg.Lifecycle.Branch)
+	assert.Equal(t, defaultGapTolerance, cfg.Lifecycle.GapTolerance)
+	assert.Equal(t, defaultMaxRetries, cfg.Lifecycle.MaxRetries)
+	assert.Equal(t, defaultMaxHandoffs, cfg.Lifecycle.MaxHandoffs)
+	assert.Equal(t, defaultBaseTimeout, cfg.Lifecycle.BaseTimeout)
+	assert.Equal(t, defaultLockStaleness, cfg.Lifecycle.Lock.StalenessThreshold)
+	assert.Equal(t, orch.LedgerFS, cfg.LedgerKind)
+}
+
+// TestBuildEngineConfig_BranchSanitization verifies the raw branch label is
+// preserved in Lifecycle.Branch (so label filters keep finding tasks created
+// with the slashed name) while the RunDir uses the sanitized fragment. Pins
+// the behavior documented at orch/types.go:174 and orch/engine.go:610.
+func TestBuildEngineConfig_BranchSanitization(t *testing.T) {
+	flags := validFlags(t)
+	flags.Branch = "feat/x"
+	flags.RunDir = "" // force default-derivation from repo + branch
+
+	cfg, _, err := BuildEngineConfig(flags)
+	require.NoError(t, err)
+	assert.Equal(t, "feat/x", cfg.Lifecycle.Branch, "raw branch must survive for label filtering")
+	assert.Contains(t, cfg.RunDir, "feat-x", "RunDir must use sanitized fragment")
+	assert.NotContains(t, cfg.RunDir, "feat/x", "RunDir must not contain the unsanitized slash form")
+}
+
+// TestBuildEngineConfig_RejectsEmptyBranch ensures the required-branch check
+// fires before any side effects (temp dir stat, preset lookup, etc.).
+func TestBuildEngineConfig_RejectsEmptyBranch(t *testing.T) {
+	flags := validFlags(t)
+	flags.Branch = "  "
+	_, _, err := BuildEngineConfig(flags)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "branch")
+}
+
+// TestBuildEngineConfig_RejectsDotBranch covers the "." / ".." / NUL guards
+// that prevent a sanitized RunDir from collapsing into a parent traversal.
+func TestBuildEngineConfig_RejectsDotBranch(t *testing.T) {
+	for _, b := range []string{".", "..", "bad\x00branch"} {
+		flags := validFlags(t)
+		flags.Branch = b
+		_, _, err := BuildEngineConfig(flags)
+		require.Error(t, err, "branch %q should be rejected", b)
+	}
+}
+
+// TestBuildEngineConfig_UnknownAgent proves preset validation happens inside
+// BuildEngineConfig, not inside orch — catches typos before engine init.
+func TestBuildEngineConfig_UnknownAgent(t *testing.T) {
+	flags := validFlags(t)
+	flags.AgentPreset = "gpt4"
+	_, _, err := BuildEngineConfig(flags)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "gpt4")
+	assert.Contains(t, err.Error(), "claude")
+}
+
+// TestBuildEngineConfig_UnknownLedger surfaces the parseLedgerKind error path.
+func TestBuildEngineConfig_UnknownLedger(t *testing.T) {
+	flags := validFlags(t)
+	flags.Ledger = "dolt"
+	_, _, err := BuildEngineConfig(flags)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dolt")
+	assert.Contains(t, err.Error(), "beads")
+}
+
+// TestBuildEngineConfig_InvalidWorkers guards the >= 1 constraint that would
+// otherwise produce a runtime divide-by-zero or zero-goroutine deadlock
+// inside the dispatcher.
+func TestBuildEngineConfig_InvalidWorkers(t *testing.T) {
+	flags := validFlags(t)
+	flags.Workers = 0
+	_, _, err := BuildEngineConfig(flags)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "workers")
+}
+
+// TestBuildEngineConfig_InvalidTimeout guards against a zero or negative
+// timeout, which would make ScaledTimeout return an immediately-fired timer.
+func TestBuildEngineConfig_InvalidTimeout(t *testing.T) {
+	flags := validFlags(t)
+	flags.BaseTimeout = 0
+	_, _, err := BuildEngineConfig(flags)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timeout")
+
+	flags.BaseTimeout = -1 * time.Second
+	_, _, err = BuildEngineConfig(flags)
+	require.Error(t, err)
+}
+
+// TestBuildEngineConfig_NegativeBudgets covers the three ">= 0" guards in a
+// single test — all three share the same error wording.
+func TestBuildEngineConfig_NegativeBudgets(t *testing.T) {
+	cases := []struct {
+		name  string
+		mutate func(*CLIFlags)
+	}{
+		{"gap", func(f *CLIFlags) { f.GapTolerance = -1 }},
+		{"retries", func(f *CLIFlags) { f.MaxRetries = -1 }},
+		{"handoffs", func(f *CLIFlags) { f.MaxHandoffs = -1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			flags := validFlags(t)
+			tc.mutate(&flags)
+			_, _, err := BuildEngineConfig(flags)
+			require.Error(t, err)
+		})
+	}
+}
+
+// TestBuildEngineConfig_RolesPopulated proves all three roles land in the
+// Lifecycle.Roles map when their files exist, with the correct InstructionFile
+// paths — the dispatcher reads this map to route role labels to agents.
+func TestBuildEngineConfig_RolesPopulated(t *testing.T) {
+	flags := validFlags(t)
+	cfg, _, err := BuildEngineConfig(flags)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.Lifecycle)
+
+	require.Len(t, cfg.Lifecycle.Roles, 3)
+	assert.Equal(t, filepath.Join(flags.AgentDir, "OOMPA.md"), cfg.Lifecycle.Roles["builder"].InstructionFile)
+	assert.Equal(t, filepath.Join(flags.AgentDir, "LOOMPA.md"), cfg.Lifecycle.Roles["verifier"].InstructionFile)
+	assert.Equal(t, filepath.Join(flags.AgentDir, "CHARLIE.md"), cfg.Lifecycle.Roles["planner"].InstructionFile)
+
+	for role, rc := range cfg.Lifecycle.Roles {
+		assert.NotNil(t, rc.Preset, "role %s must have a non-nil preset pointer", role)
+	}
+}
+
+// TestBuildEngineConfig_MissingInstructionFile_Warns proves the partial-set
+// path: one file missing produces a warning and the role is absent from the
+// registry, but the other roles are still usable.
+func TestBuildEngineConfig_MissingInstructionFile_Warns(t *testing.T) {
+	flags := validFlags(t)
+	require.NoError(t, os.Remove(filepath.Join(flags.AgentDir, "LOOMPA.md")))
+
+	cfg, warnings, err := BuildEngineConfig(flags)
+	require.NoError(t, err, "missing verifier file must not block the run")
+
+	require.Len(t, warnings, 1)
+	assert.Contains(t, warnings[0], "verifier")
+	assert.Contains(t, warnings[0], "LOOMPA.md")
+	assert.Contains(t, warnings[0], "BVV-DSP-03a")
+
+	_, hasVerifier := cfg.Lifecycle.Roles["verifier"]
+	assert.False(t, hasVerifier, "missing role must not be in the registry")
+	assert.Len(t, cfg.Lifecycle.Roles, 2)
+}
+
+// TestBuildEngineConfig_AllInstructionsMissing_Errors is the fail-fast path:
+// zero role files → halt before any side effects, clearer than letting the
+// dispatcher escalate every task to BVV-DSP-03a.
+func TestBuildEngineConfig_AllInstructionsMissing_Errors(t *testing.T) {
+	flags := validFlags(t)
+	for _, name := range []string{"OOMPA.md", "LOOMPA.md", "CHARLIE.md"} {
+		require.NoError(t, os.Remove(filepath.Join(flags.AgentDir, name)))
+	}
+
+	_, _, err := BuildEngineConfig(flags)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "none of")
+	assert.Contains(t, err.Error(), "OOMPA.md")
+}
+
+// TestBuildEngineConfig_MissingAgentDir halts before role-checking with a
+// clearer error ("agent directory not found" beats three synthesized
+// per-role "file not found" warnings).
+func TestBuildEngineConfig_MissingAgentDir(t *testing.T) {
+	flags := validFlags(t)
+	flags.AgentDir = filepath.Join(t.TempDir(), "does-not-exist")
+	_, _, err := BuildEngineConfig(flags)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "agent directory")
+}
+
+// TestBuildEngineConfig_DefaultRunDir exercises the RunDir-derivation path:
+// when --run-dir is empty, RunDir = <repo>/.wonka/<sanitized-branch>.
+func TestBuildEngineConfig_DefaultRunDir(t *testing.T) {
+	flags := validFlags(t)
+	flags.RunDir = ""
+	cfg, _, err := BuildEngineConfig(flags)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(flags.RepoPath, ".wonka", "feat-x"), cfg.RunDir)
+}
+
+// TestBuildEngineConfig_RelativeAgentDirResolvesUnderRepo pins the resolution
+// rule: `--agent-dir agents` with `--repo /elsewhere` must stat
+// /elsewhere/agents, not <cwd>/agents. Without this rule, operators running
+// wonka outside the repo root see confusing "agent directory not found"
+// errors despite the files existing where they expect.
+func TestBuildEngineConfig_RelativeAgentDirResolvesUnderRepo(t *testing.T) {
+	repo := t.TempDir()
+	agents := filepath.Join(repo, "agents")
+	require.NoError(t, os.Mkdir(agents, 0o755))
+	for _, name := range []string{"OOMPA.md", "LOOMPA.md", "CHARLIE.md"} {
+		require.NoError(t, os.WriteFile(filepath.Join(agents, name), []byte("# x\n"), 0o644))
+	}
+
+	flags := validFlags(t)
+	flags.RepoPath = repo
+	flags.AgentDir = "agents" // relative — must resolve under RepoPath
+
+	cfg, _, err := BuildEngineConfig(flags)
+	require.NoError(t, err, "relative agent-dir must resolve under --repo")
+
+	require.NotNil(t, cfg.Lifecycle)
+	assert.Equal(t, filepath.Join(agents, "OOMPA.md"), cfg.Lifecycle.Roles["builder"].InstructionFile)
+}
