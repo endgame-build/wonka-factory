@@ -64,10 +64,14 @@ func showStatus(flags CLIFlags, format statusOutputFormat, stdout, stderr io.Wri
 
 	runDir := resolveRunDir(repoPath, branch, flags.RunDir)
 	ledgerDir := filepath.Join(runDir, ledgerSubdir)
-	// Pre-stat: NewStore calls MkdirAll, so without this a typo'd --branch
-	// silently creates an empty ledger and renders an empty table.
+	// Pre-stat: opening the ledger may create the directory via the selected
+	// store backend constructor, so without this a typo'd --branch silently
+	// creates an empty ledger and renders an empty table.
 	if _, err := os.Stat(ledgerDir); err != nil {
-		return die(stderr, exitConfigError, "no ledger at %s — is the branch spelled correctly, or run 'wonka run --branch %s' to create one", ledgerDir, branch)
+		if os.IsNotExist(err) {
+			return die(stderr, exitConfigError, "no ledger at %s — is the branch spelled correctly, or run 'wonka run --branch %s' to create one", ledgerDir, branch)
+		}
+		return die(stderr, exitRuntimeError, "stat ledger %s: %s", ledgerDir, err)
 	}
 
 	ledgerKind, err := parseLedgerKind(flags.Ledger)

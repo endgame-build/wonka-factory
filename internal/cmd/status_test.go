@@ -85,6 +85,29 @@ func TestStatusCmd_NoLedger(t *testing.T) {
 	requireExitCode(t, err, exitConfigError)
 }
 
+// TestStatusCmd_StatError verifies non-ENOENT stat failures surface as a
+// runtime error, not the misleading "no ledger at …" config message. We
+// plant a regular file where runDir should be a directory — stat of
+// <file>/ledger returns ENOTDIR, which os.IsNotExist does not match.
+// Without the split, operators chasing an EIO / permission / ENOTDIR
+// error would be told to fix their --branch spelling instead.
+func TestStatusCmd_StatError(t *testing.T) {
+	tmp := t.TempDir()
+	fakeRunDir := filepath.Join(tmp, "not-a-dir")
+	require.NoError(t, os.WriteFile(fakeRunDir, []byte("file, not a directory"), 0o644))
+
+	err, _, stderr := runStatusCmd(t,
+		"status",
+		"--branch", "anything",
+		"--run-dir", fakeRunDir,
+		"--ledger", "fs",
+	)
+	require.Error(t, err)
+	assert.Contains(t, stderr, "stat ledger")
+	assert.NotContains(t, stderr, "no ledger at")
+	requireExitCode(t, err, exitRuntimeError)
+}
+
 // TestStatusCmd_EmptyLedger runs against a freshly created (empty) store
 // and verifies the header renders and the body is the bare column labels.
 // Exit 0 — empty is a valid state.
