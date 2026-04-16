@@ -14,9 +14,10 @@ import (
 const jqExtractText = `select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text // empty`
 
 // SystemPromptFlag must be --append-system-prompt (body value), not
-// --append-system-prompt-file (path) — orch/agent.go:18-19 hard-codes the
-// body-value contract. --dangerously-skip-permissions is required: without
-// it claude blocks on tool-use prompts and orchestrated sessions hang.
+// --append-system-prompt-file (path) — orch.BuildCommand passes the
+// instruction body literally to this flag (see its doc-comment for the
+// contract). --dangerously-skip-permissions is required: without it
+// claude blocks on tool-use prompts and orchestrated sessions hang.
 var presets = map[string]*orch.Preset{
 	"claude": {
 		Name:             "claude",

@@ -12,8 +12,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Must agree with orch/engine.go:252,275. TODO(phase-8): orch should export
-// this or an OpenLedgerForRun helper.
+// Must agree with the ledger subdirectory orch's Engine opens under RunDir.
+// TODO: orch should export this (or an OpenLedgerForRun helper) so the CLI
+// doesn't hardcode the literal.
 const ledgerSubdir = "ledger"
 
 // statusOutputFormat selects how the status command renders results.
@@ -48,8 +49,8 @@ the lifecycle lock — safe to run while a lifecycle is active.`,
 }
 
 // showStatus opens the store, lists tasks for the branch, and writes the
-// rendered output. Separate from cobra wiring so tests can exercise the
-// full flow without parsing flags.
+// rendered output. Never acquires the lifecycle lock — safe alongside a
+// live run.
 func showStatus(flags CLIFlags, format statusOutputFormat, stdout, stderr io.Writer) error {
 	branch := strings.TrimSpace(flags.Branch)
 	if branch == "" {
@@ -61,11 +62,10 @@ func showStatus(flags CLIFlags, format statusOutputFormat, stdout, stderr io.Wri
 		return die(stderr, exitConfigError, "%s", err)
 	}
 
-	runDir := flags.RunDir
-	if runDir == "" {
-		runDir = filepath.Join(repoPath, ".wonka", sanitizeBranch(branch))
-	}
+	runDir := resolveRunDir(repoPath, branch, flags.RunDir)
 	ledgerDir := filepath.Join(runDir, ledgerSubdir)
+	// Pre-stat: NewStore calls MkdirAll, so without this a typo'd --branch
+	// silently creates an empty ledger and renders an empty table.
 	if _, err := os.Stat(ledgerDir); err != nil {
 		return die(stderr, exitConfigError, "no ledger at %s — is the branch spelled correctly, or run 'wonka run --branch %s' to create one", ledgerDir, branch)
 	}
@@ -79,25 +79,44 @@ func showStatus(flags CLIFlags, format statusOutputFormat, stdout, stderr io.Wri
 	if err != nil {
 		return die(stderr, exitRuntimeError, "open ledger: %s", err)
 	}
-	defer store.Close()
+	defer func() {
+		if cerr := store.Close(); cerr != nil {
+			fmt.Fprintln(stderr, "warning: close ledger:", cerr)
+		}
+	}()
 
 	tasks, err := store.ListTasks(orch.LabelBranch + ":" + branch)
 	if err != nil {
 		return die(stderr, exitRuntimeError, "list tasks: %s", err)
 	}
 
+	// Surface ledger-backend fallback in both output modes. JSON consumers
+	// that pipe 2>/dev/null can opt out; without this, a scripted
+	// `wonka status --json --ledger beads` running on an FS fallback would
+	// see data from the wrong backend with zero signal.
+	if actualKind != ledgerKind {
+		fmt.Fprintf(stderr, "warning: ledger fallback (requested: %s, using: %s)\n", ledgerKind, actualKind)
+	}
+
 	switch format {
 	case statusFormatJSON:
-		// Compact output — scripted consumers can re-indent via `jq .`.
-		if err := json.NewEncoder(stdout).Encode(tasks); err != nil {
+		// Marshal to buffer first: json.NewEncoder(stdout) streams bytes
+		// immediately and a marshal failure mid-array would leave partial
+		// garbage on stdout before die() writes the error to stderr.
+		payload, err := json.Marshal(tasks)
+		if err != nil {
 			return die(stderr, exitRuntimeError, "encode json: %s", err)
 		}
-	default:
-		fmt.Fprintf(stderr, "branch: %s    ledger: %s", branch, actualKind)
-		if actualKind != ledgerKind {
-			fmt.Fprintf(stderr, " (requested: %s, fallback)", ledgerKind)
+		if _, err := stdout.Write(payload); err != nil {
+			return die(stderr, exitRuntimeError, "write json: %s", err)
 		}
-		fmt.Fprintln(stderr)
+		if _, err := stdout.Write([]byte{'\n'}); err != nil {
+			return die(stderr, exitRuntimeError, "write json: %s", err)
+		}
+	default:
+		// Header to stderr so `wonka status | awk` can slice table columns
+		// without stripping a banner line.
+		fmt.Fprintf(stderr, "branch: %s    ledger: %s\n", branch, actualKind)
 		renderTable(stdout, tasks)
 	}
 	return nil

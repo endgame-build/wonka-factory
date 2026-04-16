@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +11,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// requireExitCode asserts err's chain contains *exitError with code want.
+func requireExitCode(t *testing.T, err error, want int) {
+	t.Helper()
+	var ex *exitError
+	require.True(t, errors.As(err, &ex), "expected *exitError in chain, got %T: %v", err, err)
+	assert.Equal(t, want, ex.code)
+}
 
 // seedRepoWithAgents creates a temp "repo" containing an agents dir seeded
 // with all three instruction files — lets cobra tests run the full flag
@@ -64,9 +73,7 @@ func TestRunCmd_InvalidLedger(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, stderr, "dolt")
 	assert.Contains(t, stderr, "beads")
-	ex, ok := err.(*exitError)
-	require.True(t, ok, "expected *exitError, got %T", err)
-	assert.Equal(t, exitConfigError, ex.code)
+	requireExitCode(t, err, exitConfigError)
 }
 
 // TestRunCmd_InvalidWorkers proves the --workers >= 1 guard in

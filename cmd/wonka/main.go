@@ -18,7 +18,10 @@ func main() {
 		if errors.As(err, &ex) {
 			os.Exit(ex.ExitCode())
 		}
+		// Cobra parse failures lose the help-pointer SilenceUsage suppressed.
+		// Re-add it so a typo'd flag tells the user where to look.
 		fmt.Fprintln(os.Stderr, "error:", err)
+		fmt.Fprintln(os.Stderr, "run 'wonka --help' for usage")
 		os.Exit(1)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/endgame/wonka-factory/orch"
 	"github.com/spf13/cobra"
@@ -36,16 +37,18 @@ func newRunCmd(flags *CLIFlags) *cobra.Command {
 		"Start a fresh lifecycle for a branch",
 		`Acquires a per-branch lifecycle lock and dispatches ready tasks from
 the ledger until completion or gap-tolerance abort. Expects the ledger
-to be pre-populated with tasks labeled branch:<name> and role:<role>.
-See Level 2 (Phase 9) for planner-driven task creation.`,
+to be pre-populated with tasks labeled branch:<name> and role:<role> —
+populate via 'bd' or your own tooling.`,
 		(*orch.Engine).Run,
 		flags,
 	)
 }
 
 // runLifecycle is the shared run/resume body. Passes context.Background to
-// the engine because orch.Engine.runLoop owns SIGINT/SIGTERM (engine.go:401);
-// installing a second handler here would race with orch's.
+// the engine because orch.SetupSignalHandler (called from Engine.runLoop)
+// already installs SIGINT/SIGTERM handling for graceful shutdown
+// (BVV-ERR-09); a second signal.Notify here would create two cancellation
+// paths racing each other during shutdown.
 func runLifecycle(flags CLIFlags, invoke lifecycleFn, stderr io.Writer) error {
 	cfg, warnings, err := BuildEngineConfig(flags)
 	if err != nil {
@@ -67,10 +70,10 @@ func runLifecycle(flags CLIFlags, invoke lifecycleFn, stderr io.Writer) error {
 	return nil
 }
 
-// classifyEngineError maps orch sentinel errors to CLI exit codes.
-// ErrLifecycleAborted → exit 0: gap tolerance is expected behavior, not
-// failure (engine.go:452 emits lifecycle_completed for it too).
-// Signal cancellations stay silent per BVV-ERR-09.
+// classifyEngineError maps orch sentinel errors to CLI exit codes. See
+// root.go for the exit-code table and the "why distinct codes" rationale;
+// this function only routes. Signal cancellation stays silent (BVV-ERR-09);
+// gap-tolerance abort collapses to nil (BVV-ERR-04).
 func classifyEngineError(err error, branch string, stderr io.Writer) error {
 	switch {
 	case errors.Is(err, orch.ErrLifecycleAborted):
@@ -83,8 +86,14 @@ func classifyEngineError(err error, branch string, stderr io.Writer) error {
 	case errors.Is(err, orch.ErrResumeNoLedger):
 		return die(stderr, exitConfigError, "no ledger for branch %q — run 'wonka run --branch %s' to start a fresh lifecycle (%s)", branch, branch, err)
 
+	case errors.Is(err, orch.ErrLockContention):
+		return die(stderr, exitLockBusy, "branch %q is already being processed by another wonka process — wait for it to finish, or run 'wonka status --branch %s' to inspect (%s)", branch, branch, err)
+
 	case errors.Is(err, orch.ErrCorruptLock):
 		return die(stderr, exitLockCorrupt, "lifecycle lock corrupt: %s", err)
+
+	case errors.Is(err, os.ErrPermission):
+		return die(stderr, exitConfigError, "permission denied — check ownership/mode of the run directory and its ledger subdirectory (%s)", err)
 
 	default:
 		return die(stderr, exitRuntimeError, "lifecycle failed: %s", err)

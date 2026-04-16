@@ -22,7 +22,7 @@ type CLIFlags struct {
 	Branch   string
 	Ledger   string // "beads" or "fs"
 	AgentDir string
-	RunDir   string // empty => default ./.wonka/<sanitized-branch>/
+	RunDir   string // empty => default <RepoPath>/.wonka/<sanitized-branch>/
 	RepoPath string // empty => os.Getwd()
 
 	// Lifecycle-only flags (run, resume).
@@ -34,7 +34,8 @@ type CLIFlags struct {
 	BaseTimeout  time.Duration
 }
 
-// Default values. Match BVV_IMPLEMENTATION_PLAN.md §7.2 flag defaults.
+// Default values for CLI flags — chosen to match the BVV spec's reference
+// defaults for gap tolerance, retry/handoff budgets, and session timeout.
 const (
 	defaultLedger       = "beads"
 	defaultAgentDir     = "agents"
@@ -50,8 +51,9 @@ const (
 	defaultLockRetryDelay = 2 * time.Second
 )
 
-// Role-to-instruction-file mapping. Fixed set for Phase 7; the "gate" role
-// is deferred to Phase 8 (will be a shell wrapper or a subcommand).
+// Role-to-instruction-file mapping. Tasks labeled role:gate are not
+// dispatched by the CLI today; they escalate via BVV-DSP-03a until a gate
+// role is registered here.
 var roleInstructionFiles = map[string]string{
 	"builder":  "OOMPA.md",
 	"verifier": "LOOMPA.md",
@@ -101,10 +103,7 @@ func BuildEngineConfig(flags CLIFlags) (orch.EngineConfig, []string, error) {
 		return orch.EngineConfig{}, nil, err
 	}
 
-	runDir := flags.RunDir
-	if runDir == "" {
-		runDir = filepath.Join(repoPath, ".wonka", sanitizeBranch(branch))
-	}
+	runDir := resolveRunDir(repoPath, branch, flags.RunDir)
 
 	agentDir := flags.AgentDir
 	if agentDir == "" {
@@ -180,18 +179,23 @@ func resolveRepoPath(raw string) (string, error) {
 }
 
 // buildRoleRegistry stat-checks each role's instruction file under agentDir.
-//   - All three missing → error (operator clearly hasn't run Phase 8; fail fast
-//     before any tmux/lock side effects).
-//   - Some missing → per-role warnings, partial registry returned so runs with
-//     subset workloads (e.g. builders only) keep working during Phase 8 dev.
+// Tasks whose role label has no entry in the returned registry get escalated
+// per BVV-DSP-03a (the dispatcher's "no handler for role" path).
+//
+//   - All three missing → error (operator clearly hasn't set up the agents
+//     directory; fail fast before any tmux/lock side effects).
+//   - Some missing (ENOENT) → per-role warnings, partial registry returned so
+//     runs with subset workloads (e.g. builders only) keep working.
+//   - Stat fails for reasons other than ENOENT (EACCES, ENOTDIR, ELOOP) →
+//     hard error. Flattening these to "missing" would hide fixable operator
+//     problems (wrong mode, symlink loop) behind a benign-sounding warning.
 //   - All present → silent.
 //
 // The preset is shared by every role; MaxTurns stays at zero (preset default)
-// until a flag is added in a later phase.
+// until a flag is added later.
 func buildRoleRegistry(agentDir string, preset *orch.Preset) (map[string]orch.RoleConfig, []string, error) {
 	roles := make(map[string]orch.RoleConfig, len(roleInstructionFiles))
 	var warnings []string
-	presentCount := 0
 
 	// Sort role names for deterministic warning order (stable tests).
 	names := make([]string, 0, len(roleInstructionFiles))
@@ -203,20 +207,23 @@ func buildRoleRegistry(agentDir string, preset *orch.Preset) (map[string]orch.Ro
 	for _, role := range names {
 		basename := roleInstructionFiles[role]
 		path := filepath.Join(agentDir, basename)
-		if _, err := os.Stat(path); err != nil {
+		_, err := os.Stat(path)
+		switch {
+		case err == nil:
+			roles[role] = orch.RoleConfig{
+				InstructionFile: path,
+				Preset:          preset,
+			}
+		case os.IsNotExist(err):
 			warnings = append(warnings, fmt.Sprintf(
 				"role %q instruction file %s missing; tasks with role=%s will escalate per BVV-DSP-03a until the file exists",
 				role, path, role))
-			continue
+		default:
+			return nil, nil, fmt.Errorf("stat role %q instruction file %s: %w", role, path, err)
 		}
-		roles[role] = orch.RoleConfig{
-			InstructionFile: path,
-			Preset:          preset,
-		}
-		presentCount++
 	}
 
-	if presentCount == 0 {
+	if len(roles) == 0 {
 		return nil, nil, fmt.Errorf(
 			"agent directory %q contains none of %v; create them or pass --agent-dir",
 			agentDir, instructionFileBasenames())
@@ -224,10 +231,20 @@ func buildRoleRegistry(agentDir string, preset *orch.Preset) (map[string]orch.Ro
 	return roles, warnings, nil
 }
 
+// resolveRunDir returns the user-specified --run-dir when set, else the
+// default <repo>/.wonka/<sanitized-branch>. Shared by BuildEngineConfig
+// and showStatus so the two derive the same path for a given branch.
+func resolveRunDir(repoPath, branch, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return filepath.Join(repoPath, ".wonka", sanitizeBranch(branch))
+}
+
 // sanitizeBranch duplicates orch's internal sanitizeBranchForLock logic so
 // RunDir and the engine-derived lock path agree on the fragment shape.
-// TODO(phase-8): orch should export this helper (or an OpenLedgerForRun
-// constructor) so the CLI doesn't hardcode the sanitization rule.
+// TODO: orch should export this helper (or an OpenLedgerForRun constructor)
+// so the CLI doesn't hardcode the sanitization rule.
 func sanitizeBranch(branch string) string {
 	safe := strings.NewReplacer("/", "-", "\\", "-").Replace(strings.TrimSpace(branch))
 	if safe == "" || safe == "." || safe == ".." {

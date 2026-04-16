@@ -64,7 +64,9 @@ func TestBuildEngineConfig_Defaults(t *testing.T) {
 // TestBuildEngineConfig_BranchSanitization verifies the raw branch label is
 // preserved in Lifecycle.Branch (so label filters keep finding tasks created
 // with the slashed name) while the RunDir uses the sanitized fragment. Pins
-// the behavior documented at orch/types.go:174 and orch/engine.go:610.
+// the agreement between this CLI's sanitizeBranch and orch's internal
+// sanitizeBranchForLock — if they drift, the lock file and the run dir
+// target different paths.
 func TestBuildEngineConfig_BranchSanitization(t *testing.T) {
 	flags := validFlags(t)
 	flags.Branch = "feat/x"
@@ -132,16 +134,25 @@ func TestBuildEngineConfig_InvalidWorkers(t *testing.T) {
 
 // TestBuildEngineConfig_InvalidTimeout guards against a zero or negative
 // timeout, which would make ScaledTimeout return an immediately-fired timer.
+// Split into subtests so a zero-duration regression doesn't mask a separate
+// negative-duration regression.
 func TestBuildEngineConfig_InvalidTimeout(t *testing.T) {
-	flags := validFlags(t)
-	flags.BaseTimeout = 0
-	_, _, err := BuildEngineConfig(flags)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "timeout")
-
-	flags.BaseTimeout = -1 * time.Second
-	_, _, err = BuildEngineConfig(flags)
-	require.Error(t, err)
+	cases := []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{"zero", 0},
+		{"negative", -1 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			flags := validFlags(t)
+			flags.BaseTimeout = tc.timeout
+			_, _, err := BuildEngineConfig(flags)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "timeout")
+		})
+	}
 }
 
 // TestBuildEngineConfig_NegativeBudgets covers the three ">= 0" guards in a

@@ -9,11 +9,13 @@ import (
 
 // Exit codes returned via *exitError and mapped by main.
 // 130 is the conventional SIGINT exit code — distinguishes a Ctrl-C from
-// an operational failure.
+// an operational failure. Lock contention and corruption use distinct codes
+// so scripts can branch on "wait and retry" vs "human intervention".
 const (
 	exitRuntimeError    = 1
 	exitConfigError     = 2
 	exitLockCorrupt     = 3
+	exitLockBusy        = 4
 	exitSignalInterrupt = 130
 )
 
@@ -33,9 +35,9 @@ func NewRootCmd() *cobra.Command {
 		Short: "DAG-driven orchestrator for autonomous software delivery agents",
 		Long: `wonka dispatches tasks from a ledger to agents, supervising workers
 through a per-branch lifecycle. Expects the ledger to be pre-populated
-with tasks labeled branch:<name> and role:<role>.
-
-For planner-driven task creation, see Level 2 (Phase 9).`,
+with tasks labeled branch:<name> and role:<role>. Planner-driven task
+creation is not yet supported; populate the ledger directly via 'bd'
+or your own tooling.`,
 		SilenceUsage:  true, // engine errors shouldn't dump help text
 		SilenceErrors: true, // main prints the error once in its own style
 	}

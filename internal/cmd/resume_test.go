@@ -40,8 +40,5 @@ func TestResumeCmd_NoLedger(t *testing.T) {
 	// The CLI die() message must name the fix action so operators don't
 	// hunt through logs. classifyEngineError in run.go owns this string.
 	assert.Contains(t, stderr, "wonka run")
-
-	ex, ok := err.(*exitError)
-	require.True(t, ok)
-	assert.Equal(t, exitConfigError, ex.code, "missing ledger is a config error, not a failure")
+	requireExitCode(t, err, exitConfigError)
 }

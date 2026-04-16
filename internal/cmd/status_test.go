@@ -82,9 +82,7 @@ func TestStatusCmd_NoLedger(t *testing.T) {
 	)
 	require.Error(t, err)
 	assert.Contains(t, stderr, "no ledger")
-	ex, ok := err.(*exitError)
-	require.True(t, ok)
-	assert.Equal(t, exitConfigError, ex.code)
+	requireExitCode(t, err, exitConfigError)
 }
 
 // TestStatusCmd_EmptyLedger runs against a freshly created (empty) store
