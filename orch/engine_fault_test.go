@@ -41,7 +41,10 @@ func TestFault_SessionTimeout(t *testing.T) {
 
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
+	var spawnsStarted, spawnsDone atomic.Int64
 	e.SetTestSpawnFunc(func(ctx context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		spawnsStarted.Add(1)
+		defer spawnsDone.Add(1)
 		<-ctx.Done()
 	})
 
@@ -50,12 +53,16 @@ func TestFault_SessionTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Engine must not hang — context timeout is the backstop.
 	err = e.Run(ctx)
 	if err != nil {
 		assert.ErrorIs(t, err, context.DeadlineExceeded,
 			"expected nil or deadline exceeded, got %v", err)
 	}
+
+	assert.GreaterOrEqual(t, spawnsStarted.Load(), int64(1),
+		"at least one spawn must have been invoked to exercise the timeout path")
+	assert.Equal(t, spawnsStarted.Load(), spawnsDone.Load(),
+		"every spawn goroutine must exit before Engine.Run returns")
 }
 
 // TestFault_CircuitBreakerTrip exercises rapid consecutive failure handling
@@ -97,9 +104,10 @@ func TestFault_CircuitBreakerTrip(t *testing.T) {
 			"expected nil, lifecycle aborted, or deadline exceeded, got %v", err)
 	}
 
-	// Rapid failures should have been recorded as gaps.
+	// Require task_failed so the accept-either error policy above can't pass
+	// vacuously when no spawns ran.
 	logPath := filepath.Join(runDir, "events.jsonl")
-	assertEventKinds(t, logPath, orch.EventGapRecorded)
+	assertEventKinds(t, logPath, orch.EventGapRecorded, orch.EventTaskFailed)
 }
 
 // TestFault_ConcurrentLockContention verifies BVV-S-01 + BVV-ERR-06:
@@ -141,7 +149,8 @@ func TestFault_ConcurrentLockContention(t *testing.T) {
 
 	prepopulateLedger(t, runDir2, testTask("lock-t", "feat/lock", "builder"))
 
-	// Race both engines.
+	// Race both engines. Receiving both values from the buffered channel is
+	// itself the completion barrier — no separate counter needed.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -206,6 +215,11 @@ func TestFault_KillTmuxSession(t *testing.T) {
 		assert.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, orch.ErrLifecycleAborted),
 			"expected nil, deadline exceeded, or lifecycle aborted, got %v", err)
 	}
+
+	// Require at least one spawn so the accept-either error policy can't pass
+	// vacuously without exercising the hang-recovery path.
+	assert.GreaterOrEqual(t, spawnCount.Load(), int64(1),
+		"at least one spawn must have been invoked to exercise the hang path")
 }
 
 // TestFault_StoreFailureDuringDispatch verifies graceful degradation when
@@ -230,8 +244,10 @@ func TestFault_StoreFailureDuringDispatch(t *testing.T) {
 		}))
 	}
 
-	// Wrap: allow 5 successful store operations, then fail everything.
-	failing := testutil.NewFailingStore(inner, 5)
+	// Budget chosen empirically — the load-bearing invariant is that the
+	// store failure surfaces (sawError below), not the exact tick it fires.
+	const storeSuccessBudget = 5
+	failing := testutil.NewFailingStore(inner, storeSuccessBudget)
 
 	lifecycle := testutil.MockLifecycleConfig(branch, "builder")
 	pool := orch.NewWorkerPool(failing, nil, 2, "fault-run", "/repo", t.TempDir())
@@ -245,6 +261,10 @@ func TestFault_StoreFailureDuringDispatch(t *testing.T) {
 	)
 	require.NoError(t, err)
 	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	// Drain any in-flight spawns on failure paths — idempotent with the
+	// per-tick d.Wait() inside the loop below.
+	t.Cleanup(func() { d.Wait() })
 
 	ctx := context.Background()
 	// Run ticks until the store failure surfaces. The dispatcher must not panic
@@ -266,35 +286,39 @@ func TestFault_StoreFailureDuringDispatch(t *testing.T) {
 	assert.True(t, sawError, "dispatcher should have encountered store failure within 20 ticks")
 }
 
-// TestFault_WorktreeMergeConflict verifies BVV-DSP-13: when a worktree
-// merge-back fails, the task is treated as exit code 1 (failed) and the
-// retry protocol is invoked.
-func TestFault_WorktreeMergeConflict(t *testing.T) {
+// TestFault_FailureThenRetry exercises BVV-ERR-01 at the Engine level: a task
+// that exits 1 is retried and the retry succeeds. This is the end-to-end
+// companion to the unit-level TestBVV_ERR01_RetryBehavior.
+//
+// Note: BVV-DSP-13 (worktree merge-back failure semantics) is NOT exercised
+// here — the test uses a generic spawn sequence rather than driving the
+// actual worktree/rebase code path. BVV-DSP-13 is tracked as an open
+// coverage gap until worktree merge-back is implemented in the dispatcher.
+func TestFault_FailureThenRetry(t *testing.T) {
 	skipWithoutTmux(t)
 
 	runDir := t.TempDir()
-	lifecycle := testutil.MockLifecycleConfig("feat/conflict", "builder")
+	lifecycle := testutil.MockLifecycleConfig("feat/retry-e2e", "builder")
 	lifecycle.MaxRetries = 1
 	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
 	lifecycle.Lock.RetryCount = 0
 
 	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
-	cfg.RunID = "fault-conflict"
+	cfg.RunID = "fault-retry"
 	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
 
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
-	// First call: exit 1 (simulates merge conflict → treated as failure).
-	// Second call: exit 0 (retry succeeds).
+	// First call exits 1 (retryable failure); second call exits 0 (retry succeeds).
 	e.SetTestSpawnFunc(testutil.SequenceSpawnFunc([]int{1, 0}))
 
-	prepopulateLedger(t, runDir, testTask("conflict-t", "feat/conflict", "builder"))
+	prepopulateLedger(t, runDir, testTask("retry-t", "feat/retry-e2e", "builder"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	err = e.Run(ctx)
-	assert.NoError(t, err, "retry after conflict should succeed")
+	assert.NoError(t, err, "retry after failure should succeed")
 
 	logPath := filepath.Join(runDir, "events.jsonl")
 	assertEventKinds(t, logPath, orch.EventTaskRetried, orch.EventTaskCompleted)

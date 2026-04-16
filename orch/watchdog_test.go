@@ -425,13 +425,21 @@ func TestBVV_S02_WatchdogNeverMutatesTaskStatus(t *testing.T) {
 }
 
 // readEvents parses the JSONL event log into a slice for assertion.
+// If the file does not end with a newline, the last split fragment is dropped:
+// a concurrent writer may be mid-flush, and parsing a partial line would hard-fail
+// callers that poll during a live run (see waitForTaskEvent).
 func readEvents(t *testing.T, logPath string) []orch.Event {
 	t.Helper()
 	data, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 
+	lines := bytes.Split(data, []byte{'\n'})
+	if len(lines) > 0 && !bytes.HasSuffix(data, []byte{'\n'}) {
+		lines = lines[:len(lines)-1]
+	}
+
 	var events []orch.Event
-	for _, line := range bytes.Split(data, []byte{'\n'}) {
+	for _, line := range lines {
 		if len(line) == 0 {
 			continue
 		}
@@ -440,6 +448,25 @@ func readEvents(t *testing.T, logPath string) []orch.Event {
 		events = append(events, ev)
 	}
 	return events
+}
+
+// waitForTaskEvent polls the JSONL event log until a (kind, taskID) event
+// appears or the timeout elapses. Lets tests sequence on a specific lifecycle
+// milestone instead of sleeping for a fixed duration.
+func waitForTaskEvent(t *testing.T, logPath string, kind orch.EventKind, taskID string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(logPath); err == nil {
+			for _, e := range readEvents(t, logPath) {
+				if e.Kind == kind && e.TaskID == taskID {
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("event %q for task %q did not appear in %s within %s", kind, taskID, logPath, timeout)
 }
 
 // TestWatchdogCheckOnceAccumulatesGetTaskErrors verifies that a worker

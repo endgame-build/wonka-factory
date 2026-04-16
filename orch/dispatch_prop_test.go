@@ -246,8 +246,8 @@ func TestProp_GapBoundedOvershoot(t *testing.T) {
 
 // TestProp_ConcurrentOutcomeProcessing verifies that concurrent outcome
 // submissions (simulating multiple runAgent goroutines completing simultaneously)
-// never violate gap count bounds, terminal count monotonicity, or worker pool
-// conservation (BVV-S-02, BVV-S-03, BVV-ERR-04).
+// never violate terminal count monotonicity (BVV-S-02) or single-assignment
+// (BVV-S-03 — at most one worker per task).
 func TestProp_ConcurrentOutcomeProcessing(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		store := testutil.NewMockStore()
@@ -324,7 +324,7 @@ func TestProp_ConcurrentOutcomeProcessing(t *testing.T) {
 			}
 			prevTerminal = terminal
 
-			// Check worker conservation (BVV-S-03).
+			// Check single-assignment (BVV-S-03) — at most one worker per task.
 			workers, wErr := store.ListWorkers()
 			if wErr != nil {
 				rt.Fatalf("ListWorkers: %v", wErr)

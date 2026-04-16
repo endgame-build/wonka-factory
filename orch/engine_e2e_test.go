@@ -66,7 +66,7 @@ func TestE2E_HappyPath(t *testing.T) {
 
 	store2, _, err := orch.NewStore("", ledgerDir)
 	require.NoError(t, err)
-	defer store2.Close()
+	t.Cleanup(func() { require.NoError(t, store2.Close()) })
 	tasks, err := store2.ListTasks("branch:feat/happy")
 	require.NoError(t, err)
 	for _, task := range tasks {
@@ -185,6 +185,53 @@ func TestE2E_GapAbort(t *testing.T) {
 	assertEventKinds(t, logPath, orch.EventGapRecorded, orch.EventEscalationCreated)
 }
 
+// TestE2E_HandoffSuccess verifies the happy-path handoff at the Engine level
+// (BVV-DSP-14): exit 3 then exit 0 completes cleanly with the expected event
+// sequence and no failure/block/limit events.
+func TestE2E_HandoffSuccess(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	lifecycle := testutil.MockLifecycleConfig("feat/hoff-ok", "builder")
+	lifecycle.MaxHandoffs = 3
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "e2e-hoff-ok"
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	// First call exits 3 (handoff), second call exits 0 (success).
+	e.SetTestSpawnFunc(testutil.SequenceSpawnFunc([]int{3, 0}))
+
+	prepopulateLedger(t, runDir, testTask("hoff-ok-t", "feat/hoff-ok", "builder"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	err = e.Run(ctx)
+	assert.NoError(t, err, "handoff followed by success should complete cleanly")
+
+	logPath := filepath.Join(runDir, "events.jsonl")
+	assertEventKinds(t, logPath, orch.EventTaskHandoff, orch.EventTaskCompleted)
+	validateEventSequence(t, logPath, []orch.EventKind{
+		orch.EventTaskDispatched,
+		orch.EventTaskHandoff,
+		orch.EventTaskCompleted,
+	})
+
+	for _, ev := range readEvents(t, logPath) {
+		assert.NotEqual(t, orch.EventTaskFailed, ev.Kind,
+			"happy-path handoff must not emit task_failed (ev=%+v)", ev)
+		assert.NotEqual(t, orch.EventTaskBlocked, ev.Kind,
+			"happy-path handoff must not emit task_blocked (ev=%+v)", ev)
+		assert.NotEqual(t, orch.EventHandoffLimitReached, ev.Kind,
+			"handoff within budget must not reach the limit (ev=%+v)", ev)
+	}
+}
+
 // TestE2E_HandoffLimit verifies BVV-L-04: a task that keeps requesting
 // handoffs (exit 3) is eventually failed when the limit is reached.
 func TestE2E_HandoffLimit(t *testing.T) {
@@ -218,7 +265,8 @@ func TestE2E_HandoffLimit(t *testing.T) {
 }
 
 // TestE2E_ResumeAfterCrash verifies that an interrupted lifecycle can be
-// resumed: state is reconciled and remaining tasks are dispatched.
+// resumed. Guards against vacuous passes: Phase 1 must be interrupted while at
+// least one task is still non-terminal, otherwise Resume has no work to do.
 func TestE2E_ResumeAfterCrash(t *testing.T) {
 	skipWithoutTmux(t)
 
@@ -234,7 +282,6 @@ func TestE2E_ResumeAfterCrash(t *testing.T) {
 
 	e1, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
-	// First spawn completes, context cancels before second task dispatches.
 	spawnFn, ch := testutil.ChannelSpawnFunc()
 	e1.SetTestSpawnFunc(spawnFn)
 
@@ -247,24 +294,37 @@ func TestE2E_ResumeAfterCrash(t *testing.T) {
 	testutil.LinearGraph(t, store, "feat/resume", "builder", 2)
 	require.NoError(t, store.Close())
 
+	logPath := filepath.Join(runDir, "events.jsonl")
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 15*time.Second)
 
 	// Run in a goroutine so we can simulate the crash.
 	done := make(chan error, 1)
 	go func() { done <- e1.Run(ctx1) }()
 
-	// Complete the first task.
+	// Poll instead of sleeping — removes the prior 100ms race window.
 	ch <- 0
-	// Then cancel to simulate crash before second task completes.
-	time.Sleep(100 * time.Millisecond)
+	waitForTaskEvent(t, logPath, orch.EventTaskCompleted, "t-0", 10*time.Second)
 	cancel1()
 
-	// First run should exit via context cancellation only.
 	runErr := <-done
 	if runErr != nil {
 		assert.ErrorIs(t, runErr, context.Canceled,
 			"Phase 1 should exit via cancellation, got: %v", runErr)
 	}
+
+	store2, _, err := orch.NewStore("", ledgerDir)
+	require.NoError(t, err)
+	phase1Tasks, err := store2.ListTasks("branch:feat/resume")
+	require.NoError(t, err)
+	require.NoError(t, store2.Close())
+	nonTerminalAfterPhase1 := 0
+	for _, task := range phase1Tasks {
+		if !task.Status.Terminal() {
+			nonTerminalAfterPhase1++
+		}
+	}
+	require.Greater(t, nonTerminalAfterPhase1, 0,
+		"Phase 1 must be interrupted mid-lifecycle — resume path is untested otherwise")
 
 	// Phase 2: resume and complete remaining task.
 	cfg2 := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
@@ -281,16 +341,17 @@ func TestE2E_ResumeAfterCrash(t *testing.T) {
 	assert.NoError(t, err, "resume should complete successfully")
 
 	// Verify all tasks are terminal.
-	store2, _, err := orch.NewStore("", ledgerDir)
+	store3, _, err := orch.NewStore("", ledgerDir)
 	require.NoError(t, err)
-	defer store2.Close()
-	tasks, err := store2.ListTasks("branch:feat/resume")
+	t.Cleanup(func() { require.NoError(t, store3.Close()) })
+	tasks, err := store3.ListTasks("branch:feat/resume")
 	require.NoError(t, err)
 	for _, task := range tasks {
 		assert.True(t, task.Status.Terminal(),
 			"task %s should be terminal after resume, got %s", task.ID, task.Status)
 	}
 }
+
 
 // --- Helpers ---
 

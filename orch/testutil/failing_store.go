@@ -14,8 +14,11 @@ var ErrInjectedFailure = errors.New("injected store failure")
 // Compile-time assertion: FailingStore implements Store.
 var _ orch.Store = (*FailingStore)(nil)
 
-// FailingStore wraps a Store and returns errors after N successful calls.
-// Used to test degraded-mode behaviour (graceful degradation under store failure).
+// FailingStore wraps a Store and returns ErrInjectedFailure after N successful
+// calls (Close excepted). The budget decrements atomically before the inner
+// call, so under concurrent callers the observed success count is approximate.
+// Seed the inner store before wrapping — once the budget is exhausted, the
+// inner store is never invoked.
 type FailingStore struct {
 	inner     orch.Store
 	remaining atomic.Int64
@@ -119,6 +122,7 @@ func (f *FailingStore) GetDeps(taskID string) ([]string, error) {
 	return f.inner.GetDeps(taskID)
 }
 
+// Close bypasses fault injection so teardown is deterministic.
 func (f *FailingStore) Close() error {
 	return f.inner.Close()
 }

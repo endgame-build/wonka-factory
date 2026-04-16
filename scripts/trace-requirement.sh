@@ -17,25 +17,30 @@ fi
 REQ="$1"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# report runs grep and prints results or "(not found)". We capture into a
+# variable so we can test for empty output explicitly — piping to `sed | head`
+# swallows grep's no-match exit and the `|| echo` branch never fires.
+#
+# Delimiter note: sed uses `#` (rare in paths) rather than `|` because `$ROOT`
+# is injected verbatim; a `|` in the path would corrupt the s-command.
+report() {
+    local label="$1"
+    local out
+    # grep's exit 1 on no-match would trigger `set -e`; tolerate it explicitly.
+    out="$(grep -rFn "$REQ" "${@:2}" 2>/dev/null | head -5 | sed "s#${ROOT}/##" || true)"
+    echo "$label:"
+    if [ -z "$out" ]; then
+        echo "  (not found)"
+    else
+        echo "$out"
+    fi
+    echo ""
+}
+
 echo "=== $REQ ==="
 echo ""
 
-# Spec
-echo "SPEC:"
-grep -rn "$REQ" "$ROOT/docs/specs/"*.md 2>/dev/null | head -5 | sed "s|$ROOT/||" || echo "  (not found)"
-echo ""
-
-# TLA+
-echo "TLA+:"
-grep -rn "$REQ" "$ROOT/docs/specs/tla/"*.tla 2>/dev/null | head -5 | sed "s|$ROOT/||" || echo "  (not found)"
-echo ""
-
-# Runtime invariants
-echo "INVARIANT:"
-grep -n "$REQ" "$ROOT/orch/invariant.go" 2>/dev/null | sed "s|$ROOT/||" || echo "  (not found)"
-echo ""
-
-# Tests
-echo "TESTS:"
-grep -rn "$REQ" "$ROOT/orch/"*_test.go 2>/dev/null | sed "s|$ROOT/||" || echo "  (not found)"
-echo ""
+report "SPEC" "$ROOT/docs/specs/"*.md
+report "TLA+" "$ROOT/docs/specs/tla/"*.tla
+report "INVARIANT" "$ROOT/orch/invariant.go"
+report "TESTS" "$ROOT/orch/"*_test.go
