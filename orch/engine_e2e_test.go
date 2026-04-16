@@ -354,6 +354,27 @@ func TestE2E_ResumeAfterCrash(t *testing.T) {
 
 // --- Helpers ---
 
+// waitForTaskEvent polls the JSONL event log until a (kind, taskID) event
+// appears or the timeout elapses. Lets tests sequence on a specific lifecycle
+// milestone instead of sleeping for a fixed duration. Lives here (not in
+// watchdog_test.go alongside readEvents) because CI lints with just the
+// `verify` tag — placing it there would flag it as unused.
+func waitForTaskEvent(t *testing.T, logPath string, kind orch.EventKind, taskID string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(logPath); err == nil {
+			for _, e := range readEvents(t, logPath) {
+				if e.Kind == kind && e.TaskID == taskID {
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("event %q for task %q did not appear in %s within %s", kind, taskID, logPath, timeout)
+}
+
 // validateEventSequence checks that the event log contains the specified
 // event kinds in order (not necessarily contiguous — other events may appear
 // between them).
