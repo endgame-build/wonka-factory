@@ -45,7 +45,7 @@ Capture both outputs. The task body names the **verification scope**: spec refer
 ### Step C — Load context
 
 - `$ORCH_PROJECT/CLAUDE.md` — architecture, error patterns, test commands.
-- `$ORCH_PROJECT/PROGRESS.md` — grep for `$ORCH_TASK_ID`. If a `pending-handoff` entry exists, you are **resuming** — follow its "Notes for next session" instead of restarting.
+- `$ORCH_PROJECT/PROGRESS.md` — agent memory for this branch. If the file is absent, create it with the schema under Memory Format. Once it exists, grep for `$ORCH_TASK_ID`: if a `pending-handoff` entry appears, you are **resuming** — follow its "Notes for next session" instead of restarting.
 - For each predecessor task from `bd deps`: `bd show <dep-id> --json` — you must understand **what was built** to verify it.
 - Specification source named in the task body. Read only the sections the task scopes to.
 

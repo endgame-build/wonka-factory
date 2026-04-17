@@ -57,14 +57,7 @@ If the work package path does not exist or is unreadable, exit 2.
 git -C "$ORCH_PROJECT" rev-parse --abbrev-ref HEAD
 ```
 
-If not on `$ORCH_BRANCH`: create from `main` if absent, then checkout. Branch creation is **your** responsibility (BVV-TG-06), not the orchestrator's. Commit message, if you create the branch:
-
-```
-chore(planner): initialize branch <branch-name> for <work-package-name>
-
-Task: ORCH_TASK_ID=<value of $ORCH_TASK_ID>
-Branch: <value of $ORCH_BRANCH>
-```
+If not on `$ORCH_BRANCH`: create from `main` if absent (`git -C "$ORCH_PROJECT" checkout -b "$ORCH_BRANCH" main`), otherwise checkout the existing branch. Branch creation is **your** responsibility (BVV-TG-06), not the orchestrator's. No commit is needed — `git checkout -b` persists the branch locally without one; builders will be the first to put commits on it.
 
 ### Step D — Query existing tasks (idempotency precheck)
 
@@ -241,7 +234,7 @@ If any check fails, `bd update` to repair the graph before exiting. A malformed 
 
 ## Phase 5: REPORT
 
-Append a summary entry to `$ORCH_PROJECT/PROGRESS.md` (see Memory Format) and exit.
+If `$ORCH_PROJECT/PROGRESS.md` is absent — which it will be on the first lifecycle of a new branch, since you run first — create it with the schema under Memory Format. Then append a summary entry for this session and exit.
 
 ---
 
