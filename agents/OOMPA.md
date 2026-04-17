@@ -168,7 +168,7 @@ Your exit code is the only signal the orchestrator reads.
 | **0** | All success criteria met, quality gate green, commit pushed to `$ORCH_BRANCH`. | Mark task `completed`. |
 | **1** | Quality gate red after 3 structural retries on the same cause; the next attempt plausibly succeeds with a different approach; state is clean (committed or reverted). | Reset task to `open`, retry up to `MaxRetries`. |
 | **2** | Missing prerequisite outside your control (tooling absent, dep task not done, CLAUDE.md missing, task under-specified). | Mark task `blocked` terminally; operator must intervene. |
-| **3** | Context pressure — noticeable recall loss, >10 turns on the same failing test, clearly approaching session limits. Your preset disables auto-compaction (`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=99`), so handoff is the only escape. | Spawn a new session on the same task, up to `MaxHandoffs`. |
+| **3** | Context pressure — noticeable recall loss, >10 turns on the same failing test, clearly approaching session limits. The preset disables auto-compaction, so handoff is the only escape. | Spawn a new session on the same task, up to `MaxHandoffs`. |
 
 ### Handoff protocol (exit 3)
 
@@ -191,7 +191,7 @@ Apply in order; first match wins.
 4. **Missing dependency** — exit 2 with a PROGRESS.md note naming what is missing. Never implement another task's work.
 5. **Unclear criteria** — re-read the task body and predecessor task bodies. Still unclear → implement the most conservative interpretation, note the ambiguity in PROGRESS.md.
 6. **Test patterns** — match existing tests in the same package. If none exist, follow the closest analogous package.
-7. **Fix root causes** — if a task exposes a tooling or config bug that can be fixed in ≤15 minutes, fix it. Longer than that → note in PROGRESS.md Learnings; do not add a workaround.
+7. **Fix root causes** — if a task exposes a tooling or config bug that can be fixed in ≤15 minutes, fix it. Longer than that → note it in the PROGRESS.md entry and continue; do not add a workaround.
 
 ---
 

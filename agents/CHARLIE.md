@@ -57,7 +57,7 @@ If the work package path does not exist or is unreadable, exit 2.
 git -C "$ORCH_PROJECT" rev-parse --abbrev-ref HEAD
 ```
 
-If not on `$ORCH_BRANCH`: create from `main` if absent (`git -C "$ORCH_PROJECT" checkout -b "$ORCH_BRANCH" main`), otherwise checkout the existing branch. Branch creation is **your** responsibility (BVV-TG-06), not the orchestrator's. No commit is needed — `git checkout -b` persists the branch locally without one; builders will be the first to put commits on it.
+If not on `$ORCH_BRANCH`: create from `main` if absent (`git -C "$ORCH_PROJECT" checkout -b "$ORCH_BRANCH" main`), otherwise checkout the existing branch. Branch creation is **your** responsibility (BVV-TG-06). No commit needed — `git checkout -b` persists the branch locally.
 
 ### Step D — Query existing tasks (idempotency precheck)
 
@@ -131,63 +131,25 @@ When in doubt, over-serialize. Parallel V&V across capabilities is where through
 
 ## Phase 3: GRAPH
 
-Create (or reconcile) the tasks.
-
-### Creating a build task
+Create (or reconcile) the tasks. Template:
 
 ```bash
 bd create \
-  --title "build-migrations" \
-  --description "Target files: migrations/0007_*.sql
-Success criteria:
-  - AC-1.1: schema creates clients table
-  - AC-1.2: rollback drops cleanly
-Spec refs: functional-spec.md §CAP-1, technical-spec.md §Migrations" \
-  --label "role:builder" \
+  --title "<title>" \
+  --description "<body with target files, criteria, spec refs>" \
+  --label "role:<builder|verifier|gate>" \
   --label "branch:$ORCH_BRANCH" \
-  --label "critical:true" \
-  --depends-on "$ORCH_TASK_ID" \
-  --priority 1 \
+  --label "critical:<true|false>" \
+  --depends-on "<predecessor-id>" \
+  --priority <int> \
   -o json
 ```
 
-Capture the returned task ID — you will reference it from later `--depends-on` arguments.
+Capture each returned task ID — later `--depends-on` arguments reference them. Per-role specifics:
 
-### Creating a V&V task
-
-```bash
-bd create \
-  --title "vv-client-crud" \
-  --description "Verify: UC-1.1 through UC-1.4
-Criteria:
-  - V-1.1: handler trace from route to repository
-  - V-1.2: all BR-* enforced in service
-  - V-1.3: error paths return correct status codes
-Spec refs: vv-spec.md §CAP-1" \
-  --label "role:verifier" \
-  --label "branch:$ORCH_BRANCH" \
-  --depends-on "<build-service-handlers-id>" \
-  --priority 5 \
-  -o json
-```
-
-### Creating the gate task (exactly one)
-
-```bash
-bd create \
-  --title "pr-gate-<feature>" \
-  --description "Open PR, poll CI, merge on green. Depends on all V&V." \
-  --label "role:gate" \
-  --label "branch:$ORCH_BRANCH" \
-  --label "critical:true" \
-  --depends-on "<vv-1-id>" \
-  --depends-on "<vv-2-id>" \
-  --depends-on "<vv-3-id>" \
-  --priority 999 \
-  -o json
-```
-
-The gate task is always last in the graph and depends on every V&V task (directly or transitively).
+- **build task:** `role:builder`, `critical:true` for migrations/infrastructure, depends at minimum on `$ORCH_TASK_ID`. Description lists target files, success criteria (AC-*), and functional/technical spec refs.
+- **V&V task:** `role:verifier`, typically non-critical, depends on the build task(s) it verifies. Description lists verification criteria (V-*) and vv-spec refs.
+- **gate task:** `role:gate`, `critical:true`, priority 999, depends on every V&V task (directly or transitively). Exactly one per lifecycle. Description names the PR flow.
 
 ### Priority scheme
 
@@ -297,5 +259,3 @@ Apply in order; first match wins.
 
 ---
 ```
-
-Exit 3 is not a valid outcome and does not appear in this schema. The planner's PROGRESS.md entry is always a single, terminal line per run.

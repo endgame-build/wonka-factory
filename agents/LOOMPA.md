@@ -32,6 +32,7 @@ When your instruction file, the target repo's `CLAUDE.md`, and the task body app
 1. `command -v bd` — `bd` CLI must be on `$PATH`.
 2. `test -f "$ORCH_PROJECT/CLAUDE.md"` — target architecture must be documented.
 3. `git -C "$ORCH_PROJECT" rev-parse --git-dir` — target must be a git repo.
+4. `git -C "$ORCH_PROJECT" rev-parse --verify main` — `main` must exist (Step D may create `$ORCH_BRANCH` from it).
 
 ### Step B — Load the task
 
@@ -212,7 +213,7 @@ Apply in order; first match wins.
 
 - One task per session. Exit after Phase 4.
 - All file paths from `$ORCH_PROJECT` root.
-- Never modify files outside the verification scope. A defect adjacent to your scope is noted in PROGRESS.md Learnings, not fixed.
+- Never modify files outside the verification scope. A defect adjacent to your scope is noted in the PROGRESS.md entry, not fixed.
 - Never modify `.wonka/` run artifacts.
 - Stdout tags are diagnostic only. Exit code is authoritative.
 
