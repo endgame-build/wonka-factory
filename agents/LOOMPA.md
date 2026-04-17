@@ -38,7 +38,7 @@ When your instruction file, the target repo's `CLAUDE.md`, and the task body app
 
 ```bash
 bd show "$ORCH_TASK_ID" --json
-bd deps "$ORCH_TASK_ID" --json
+bd dep list "$ORCH_TASK_ID" --json
 ```
 
 Capture both outputs. The task body names the **verification scope**: spec references (UC-*, BR-*, AC-*, or equivalent), criteria to check, and the predecessor build tasks whose work you are verifying.
@@ -47,7 +47,7 @@ Capture both outputs. The task body names the **verification scope**: spec refer
 
 - `$ORCH_PROJECT/CLAUDE.md` — architecture, error patterns, test commands.
 - `$ORCH_PROJECT/PROGRESS.md` — agent memory for this branch. If the file is absent, create it with the schema under Memory Format. Once it exists, grep for `$ORCH_TASK_ID`: if a `pending-handoff` entry appears, you are **resuming** — follow its "Notes for next session" instead of restarting.
-- For each predecessor task from `bd deps`: `bd show <dep-id> --json` — you must understand **what was built** to verify it.
+- For each predecessor task from `bd dep list`: `bd show <dep-id> --json` — you must understand **what was built** to verify it.
 - Specification source named in the task body. Read only the sections the task scopes to.
 
 ### Step D — Verify branch
@@ -133,7 +133,7 @@ For each FIX criterion:
 2. Write the **minimal** fix. Do not refactor surrounding code.
 3. Add a test that proves the fix: table-driven, same package, following existing patterns.
 4. Run the target repo's test command for the affected package.
-5. After all FIX criteria are addressed, run the full quality gate.
+5. After all FIX criteria are addressed, run the full quality gate. **It must exit 0 with no test failures.** If the gate is red with failures in packages outside your verification scope, record them in PROGRESS.md and exit 2 — an adjacent-scope regression is a missing FIX task the planner must add; you must not exit 0 over it.
 6. **3 failures on the same root cause** → classify as structural; exit 1 if another attempt could succeed with a different approach, exit 2 if the blocker is outside your scope.
 
 Commit each FIX separately. Do not bundle unrelated fixes into one commit.
@@ -163,11 +163,19 @@ Branch: <value of $ORCH_BRANCH>
 
 If emitting exit 3, commit partial progress with scope `<scope>/pending-handoff`.
 
-### Step B — Append PROGRESS.md
+### Step B — Push
+
+```bash
+git -C "$ORCH_PROJECT" push origin "$ORCH_BRANCH"
+```
+
+Required whenever Step A produced a commit. Push failure → exit 1 (retryable). Never `--force` push. On all-PASS sessions (no FIX commits), skip this step — nothing to push.
+
+### Step C — Append PROGRESS.md
 
 Append a Task Log entry (see Memory Format). List each criterion and its verdict.
 
-### Step C — Exit
+### Step D — Exit
 
 Exit with the code matching your aggregate outcome (see Completion Protocol).
 
@@ -186,10 +194,11 @@ Exit with the code matching your aggregate outcome (see Completion Protocol).
 
 Before emitting exit 3:
 
-1. Commit partial fixes that compile cleanly. Red tests are acceptable; a red build is not.
-2. Commit scope includes `/pending-handoff`.
-3. Append a PROGRESS.md entry with outcome `pending-handoff`, listing criteria verified so far and a concrete "resume here" note naming the next criterion.
-4. Exit 3.
+1. Commit partial fixes that compile cleanly. Red tests are acceptable; a red build is not. **If the build is red and you cannot reach green, exit 1 instead** — handoff requires a resumable commit.
+2. Commit scope includes `/pending-handoff`. Record the commit SHA.
+3. `git -C "$ORCH_PROJECT" push origin "$ORCH_BRANCH"` so the next session sees the handoff anchor on the remote. Push failure → exit 1.
+4. Append a PROGRESS.md entry with outcome `pending-handoff`, the commit SHA from step 2, criteria verified so far, and a concrete "resume here" note naming the next criterion.
+5. Exit 3.
 
 ---
 
@@ -209,7 +218,7 @@ Apply in order; first match wins.
 
 ## Operating Rules
 
-> **Never** run `bd update --claim`, `bd update --status`, or `bd close`. Your beads interactions are reads only — `bd show <id>` and `bd deps <id>` on your own task or any predecessor. The orchestrator owns all status transitions.
+> **Never** run `bd update --claim`, `bd update --status`, or `bd close`. Your beads interactions are reads only — `bd show <id>` and `bd dep list <id>` on your own task or any predecessor. The orchestrator owns all status transitions.
 
 - One task per session. Exit after Phase 4.
 - All file paths from `$ORCH_PROJECT` root.

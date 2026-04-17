@@ -44,7 +44,7 @@ Capture the full JSON output; reuse throughout — do not re-fetch. Parse:
 
 - `title`, `body` — what to build
 - `labels` — `role:builder`, `branch:<name>`, `critical:true|false`
-- `deps` (via `bd deps "$ORCH_TASK_ID" --json`) — predecessors you depend on
+- `deps` (via `bd dep list "$ORCH_TASK_ID" --json`) — predecessors you depend on
 
 Parse success criteria from the task body. If the body has an explicit `Success Criteria` section, use it. Otherwise infer from the body prose. If you cannot identify any criteria, exit 2 — the task is under-specified.
 
@@ -66,7 +66,7 @@ git -C "$ORCH_PROJECT" rev-parse --abbrev-ref HEAD
 
 If not on `$ORCH_BRANCH`: create from `main` if it does not exist, then checkout. All your commits go to `$ORCH_BRANCH` — never to `main`, never to a per-task branch.
 
-If the working tree is dirty with changes unrelated to this task (from a prior failed run whose artifacts were not committed), exit 2 — an operator must inspect.
+If the working tree is dirty, check PROGRESS.md for a `pending-handoff` entry for `$ORCH_TASK_ID`. If one exists and its listed files match the dirty paths, the dirty state is your handoff resume — proceed to Phase 2. Otherwise exit 2 — an operator must inspect.
 
 ---
 
@@ -121,7 +121,7 @@ Verify each success criterion against the built artifacts — not by inspecting 
 
 Classify each failure before retrying.
 
-- **Transient** (Docker not running, flaky network test, port conflict, stale build cache): apply the obvious remediation, re-run. Up to 5 transient retries on distinct root causes.
+- **Transient** (Docker not running, flaky network test, port conflict, stale build cache): apply the obvious remediation, re-run. Up to 5 transient retries on distinct root causes. After the 5th, treat the gate as persistently red and route via the structural branch below.
 - **Structural** (wrong architecture, missing upstream code, test asserts spec you cannot satisfy): read the error, fix the root cause. Three structural failures on the *same* root cause → stop retrying. Choose exit 2 if the blocker is outside your scope to fix (missing upstream code, broken tooling, impossible spec); otherwise exit 1 so a fresh session can try a different approach.
 
 **Rollback:** if a fix makes things worse, reset individual files with `git checkout HEAD -- <file>`. Never `git reset --hard` — you may destroy prior iterations' commits.
@@ -147,11 +147,19 @@ Branch: <value of $ORCH_BRANCH>
 
 If you are emitting exit 3 (handoff), use scope `<scope>/pending-handoff` so the commit is greppable: `feat(billing/pending-handoff): partial handler scaffold`.
 
-### Step B — Append PROGRESS.md
+### Step B — Push
+
+```bash
+git -C "$ORCH_PROJECT" push origin "$ORCH_BRANCH"
+```
+
+Push failure (auth, network, non-fast-forward) is transient — exit 1 so the next session retries. Never `--force` push.
+
+### Step C — Append PROGRESS.md
 
 Append a Task Log entry (see Memory Format). Newest first. Never overwrite prior entries.
 
-### Step C — Exit
+### Step D — Exit
 
 Use the exit code matching your outcome (see Completion Protocol). Exit immediately — do not select another task.
 
@@ -172,10 +180,11 @@ Your exit code is the only signal the orchestrator reads.
 
 Before emitting exit 3:
 
-1. Stage and commit whatever compiles cleanly. Red tests are acceptable; a red build is not.
-2. Commit scope includes `/pending-handoff` (see Step A above).
-3. Append a PROGRESS.md entry with outcome `pending-handoff`, listing files touched, phase reached, and a **concrete** "resume here" note naming the next step (for example: *"handler skeleton written; implement ValidateTransition() in service_validation.go, then wire into handler Update()"*).
-4. Exit 3.
+1. Stage and commit whatever compiles cleanly. Red tests are acceptable; a red build is not. **If the build is red and you cannot reach green, exit 1 instead** — handoff requires a resumable commit, and retry on a fresh session beats handoff with non-resumable state.
+2. Commit scope includes `/pending-handoff` (see Step A above). Record the commit SHA.
+3. `git -C "$ORCH_PROJECT" push origin "$ORCH_BRANCH"` so the next session sees the handoff anchor on the remote. Push failure → exit 1.
+4. Append a PROGRESS.md entry with outcome `pending-handoff`, listing files touched, the commit SHA from step 2, phase reached, and a **concrete** "resume here" note naming the next step (for example: *"handler skeleton written; implement ValidateTransition() in service_validation.go, then wire into handler Update()"*).
+5. Exit 3.
 
 ---
 
@@ -195,7 +204,7 @@ Apply in order; first match wins.
 
 ## Operating Rules
 
-> **Never** run `bd update --claim`, `bd update --status`, or `bd close`. Your beads interactions are reads only — `bd show <id>` and `bd deps <id>` on your own task or any predecessor. The orchestrator owns all status transitions.
+> **Never** run `bd update --claim`, `bd update --status`, or `bd close`. Your beads interactions are reads only — `bd show <id>` and `bd dep list <id>` on your own task or any predecessor. The orchestrator owns all status transitions.
 
 - One task per session. Exit after Phase 5 — do not loop, do not select another task.
 - All file paths from `$ORCH_PROJECT` root.

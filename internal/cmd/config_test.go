@@ -274,3 +274,32 @@ func TestBuildEngineConfig_RelativeAgentDirResolvesUnderRepo(t *testing.T) {
 	require.NotNil(t, cfg.Lifecycle)
 	assert.Equal(t, filepath.Join(agents, "OOMPA.md"), cfg.Lifecycle.Roles["builder"].InstructionFile)
 }
+
+// TestBuildEngineConfig_ProductionAgents exercises BuildEngineConfig against
+// the real agents/ directory rather than a synthetic fixture. Closes the
+// drift gap between roleInstructionFiles (internal/cmd/config.go) and the
+// files actually checked into agents/ — a rename that updates only one side
+// would otherwise produce silent BVV-DSP-03a escalations at runtime with no
+// failing test.
+func TestBuildEngineConfig_ProductionAgents(t *testing.T) {
+	realAgents, err := filepath.Abs(filepath.Join("..", "..", "agents"))
+	require.NoError(t, err)
+
+	flags := validFlags(t)
+	flags.AgentDir = realAgents
+
+	cfg, warnings, err := BuildEngineConfig(flags)
+	require.NoError(t, err)
+	assert.Empty(t, warnings, "every role in config.roleInstructionFiles must resolve to a real file in agents/")
+
+	require.NotNil(t, cfg.Lifecycle)
+	for role, basename := range roleInstructionFiles {
+		rc, ok := cfg.Lifecycle.Roles[role]
+		require.Truef(t, ok, "role %q missing from registry", role)
+		want := filepath.Join(realAgents, basename)
+		assert.Equal(t, want, rc.InstructionFile,
+			"role %q → %s drift between roleInstructionFiles and agents/", role, basename)
+		_, statErr := os.Stat(rc.InstructionFile)
+		assert.NoError(t, statErr, "registered instruction file must exist on disk")
+	}
+}

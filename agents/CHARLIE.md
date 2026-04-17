@@ -123,7 +123,7 @@ V&V tasks depend on the build tasks in their scope; the gate task depends on all
 
 This orchestrator dispatches from a DAG — parallel workers share one branch and one working tree. Dependency edges are the **only** mechanism preventing parallel writes from clobbering each other.
 
-> **Rule:** if two build tasks write to overlapping files (same package, same migration directory, same config file), add an explicit `--depends-on` edge to serialize them, even if no logical dependency exists.
+> **Rule:** if two build tasks write to overlapping files (same package, same migration directory, same config file), add an explicit `--deps` edge to serialize them, even if no logical dependency exists.
 
 When in doubt, over-serialize. Parallel V&V across capabilities is where throughput comes from — parallel builds on the same branch are where conflicts come from. V&V tasks typically do not write (except for FIX commits), so they parallelize safely once their build deps are satisfied.
 
@@ -137,15 +137,13 @@ Create (or reconcile) the tasks. Template:
 bd create \
   --title "<title>" \
   --description "<body with target files, criteria, spec refs>" \
-  --label "role:<builder|verifier|gate>" \
-  --label "branch:$ORCH_BRANCH" \
-  --label "critical:<true|false>" \
-  --depends-on "<predecessor-id>" \
+  --labels "role:<builder|verifier|gate>,branch:$ORCH_BRANCH,critical:<true|false>" \
+  --deps "<predecessor-id>" \
   --priority <int> \
-  -o json
+  --json
 ```
 
-Capture each returned task ID — later `--depends-on` arguments reference them. Per-role specifics:
+`--labels` takes one comma-separated string (repeating the flag is not supported on `bd create`). `--deps` takes one or more predecessor IDs (repeat the flag or comma-separate). Capture each returned task ID — later `--deps` arguments reference them. Per-role specifics:
 
 - **build task:** `role:builder`, `critical:true` for migrations/infrastructure, depends at minimum on `$ORCH_TASK_ID`. Description lists target files, success criteria (AC-*), and functional/technical spec refs.
 - **V&V task:** `role:verifier`, typically non-critical, depends on the build task(s) it verifies. Description lists verification criteria (V-*) and vv-spec refs.
@@ -173,11 +171,13 @@ Without these references, the lifecycle is untraceable after the fact.
 If Phase 1 found existing tasks for this branch, reconcile rather than create:
 
 - For each task that should exist per the current decomposition:
-  - If a matching `open` task exists, compare its body and deps to the new decomposition. If they differ, run `bd update <id>` to change the body or dependencies. Do **not** change its labels.
-  - If a matching `failed` or `blocked` task exists and the blocker is resolved (the failure was transient or the missing dependency is now present), `bd update <id> --status open` to retry.
+  - If a matching `open` task exists, compare its body and deps to the new decomposition. For body changes, run `bd update <id> --description '<new body>'`. For dependency changes, use `bd dep add <blocked> <blocker>` to add edges and `bd dep remove <blocked> <blocker>` to drop them. Do **not** change its labels.
+  - If a matching `failed` or `blocked` task exists and the blocker is resolved (the failure was transient or the missing dependency is now present), `bd update <id> --status open` to retry. The only `--status` value you set is `open`; never `in_progress`, `completed`, `failed`, or `blocked`.
   - If no matching task exists, create it.
 - For each existing task that no longer appears in the current decomposition: **leave it alone**. Do not close it, do not modify it. An operator will review orphans.
 - If a task is `in_progress` or `completed`, you do not touch it under any circumstance (BVV-TG-03), even if the spec has changed. Note the mismatch in PROGRESS.md for operator review.
+
+**Failure handling:** any `bd create`, `bd update`, or `bd dep` command that returns nonzero exits Phase 3 immediately with exit 1. Do not retry inline. Do not proceed to Phase 4. Partial graphs reconcile idempotently on the next invocation (BVV-TG-02, BVV-TG-11).
 
 ---
 
@@ -187,7 +187,7 @@ Before exit, verify the graph is well-formed:
 
 1. **Acyclic** — the ledger's `AddDep` enforces this; if you received an error during Phase 3, treat it as an exit 1.
 2. **Exactly one `role:gate` task** — `bd list --label "branch:$ORCH_BRANCH" --label "role:gate" --json` returns a single task. More than one, or zero, is a planning error.
-3. **All tasks reachable from the plan task** — walk `bd deps` from the plan task and confirm every created task is reachable. Orphans indicate missing edges.
+3. **All tasks reachable from the plan task** — use `bd dep tree "$ORCH_TASK_ID"` (or iterate `bd dep list`) to confirm every created task is reachable. Orphans indicate missing edges.
 4. **Every task has a valid `role:` label** — one of `role:planner`, `role:builder`, `role:verifier`, `role:gate`.
 
 If any check fails, `bd update` to repair the graph before exiting. A malformed graph blocks the whole lifecycle — do not leave it for the orchestrator to stumble over.
@@ -233,7 +233,7 @@ Apply in order; first match wins.
 > **You write to beads.** `bd create` to add tasks and `bd update` to reconcile existing `open` or recover `failed`/`blocked` ones. You MUST NOT: `bd close`, `bd update --claim`, `bd update --status` on `in_progress` or `completed` tasks, or `bd delete`. The orchestrator owns status transitions during dispatch; you own graph shape before dispatch.
 
 - One session per lifecycle. Exit after Phase 5.
-- Tasks written outside of `$ORCH_BRANCH` scope are a protocol violation. Every `bd create` must include `--label "branch:$ORCH_BRANCH"`.
+- Tasks written outside of `$ORCH_BRANCH` scope are a protocol violation. Every `bd create` must include `branch:$ORCH_BRANCH` in its `--labels` argument.
 - The only filesystem writes you make are branch creation (Phase 1 Step C) and the PROGRESS.md append (Phase 5). You do not write code.
 - Stdout tags are diagnostic only. Exit code is authoritative.
 - **Exit 3 is forbidden.**
