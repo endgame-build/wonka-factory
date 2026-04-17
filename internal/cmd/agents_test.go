@@ -14,10 +14,9 @@ import (
 
 const agentsDir = "../../agents"
 
-// Forbidden `bd` command invocations, anchored to line-start so inline-code
-// prose mentions like `` `bd close` `` (and blockquoted prose) don't match.
-// Fenced-code examples DO match — that's intentional, since fences are
-// copy-bait for an LLM.
+// Forbidden `bd` command invocations. The line-start anchor prevents inline
+// code mentions and blockquoted prose from matching; fenced code blocks DO
+// match, which is the intent — fences are copy-bait for an LLM.
 //
 // `bd update --status` is permitted only for CHARLIE per BVV-TG-02; builders
 // and verifiers never mutate status. CHARLIE's own permitted usage is further
