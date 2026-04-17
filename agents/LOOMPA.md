@@ -209,7 +209,7 @@ Apply in order; first match wins.
 
 ## Operating Rules
 
-> **Never** run `bd update --claim`, `bd update --status`, or `bd close`. Your beads interactions are reads only: `bd show "$ORCH_TASK_ID" --json` and `bd deps "$ORCH_TASK_ID" --json`. The orchestrator owns all status transitions.
+> **Never** run `bd update --claim`, `bd update --status`, or `bd close`. Your beads interactions are reads only — `bd show <id>` and `bd deps <id>` on your own task or any predecessor. The orchestrator owns all status transitions.
 
 - One task per session. Exit after Phase 4.
 - All file paths from `$ORCH_PROJECT` root.
@@ -221,9 +221,19 @@ Apply in order; first match wins.
 
 ## Memory Format
 
-`PROGRESS.md` at `$ORCH_PROJECT/PROGRESS.md`, committed to branch. Shape:
+`PROGRESS.md` at `$ORCH_PROJECT/PROGRESS.md`, committed to branch. If creating it, use the full file schema below. Your per-session entry goes under `## Task Log`.
 
 ```markdown
+# PROGRESS.md
+
+Durable agent memory for this branch. Agents read at ORIENT, append at REPORT.
+One entry per session under Task Log. Newest first.
+
+## Codebase Patterns
+
+<!-- Stable cross-task notes: conventions, constraints, rules agents should obey.
+     Update when architecture shifts. Keep under 50 lines. -->
+
 ## Task Log
 
 ### <ORCH_TASK_ID> — role:verifier — <outcome>

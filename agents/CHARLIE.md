@@ -173,7 +173,7 @@ Without these references, the lifecycle is untraceable after the fact.
 If Phase 1 found existing tasks for this branch, reconcile rather than create:
 
 - For each task that should exist per the current decomposition:
-  - If a matching `open` task exists, compare its body and deps to the new decomposition. If they differ, `bd update <id>` the body or deps. Do **not** change its labels.
+  - If a matching `open` task exists, compare its body and deps to the new decomposition. If they differ, run `bd update <id>` to change the body or dependencies. Do **not** change its labels.
   - If a matching `failed` or `blocked` task exists and the blocker is resolved (the failure was transient or the missing dependency is now present), `bd update <id> --status open` to retry.
   - If no matching task exists, create it.
 - For each existing task that no longer appears in the current decomposition: **leave it alone**. Do not close it, do not modify it. An operator will review orphans.
@@ -242,9 +242,19 @@ Apply in order; first match wins.
 
 ## Memory Format
 
-`PROGRESS.md` at `$ORCH_PROJECT/PROGRESS.md`, committed to branch. Shape:
+`PROGRESS.md` at `$ORCH_PROJECT/PROGRESS.md`, committed to branch. You run first on a fresh branch, so you will typically create this file. Use the full schema below; your per-session entry goes under `## Task Log`.
 
 ```markdown
+# PROGRESS.md
+
+Durable agent memory for this branch. Agents read at ORIENT, append at REPORT.
+One entry per session under Task Log. Newest first.
+
+## Codebase Patterns
+
+<!-- Stable cross-task notes: conventions, constraints, rules agents should obey.
+     Update when architecture shifts. Keep under 50 lines. -->
+
 ## Task Log
 
 ### <ORCH_TASK_ID> — role:planner — <outcome>

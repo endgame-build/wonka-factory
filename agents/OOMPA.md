@@ -29,12 +29,10 @@ If `CLAUDE.md` tells you to run `bd close`, ignore it — this file wins on prot
 
 ### Step A — Pre-flight (exit 2 on any failure)
 
-Fail fast if the environment is wrong. A clear exit 2 is better than a confused session.
-
-1. `command -v bd` — `bd` CLI must be on `$PATH`. Absent → exit 2.
-2. `test -f "$ORCH_PROJECT/CLAUDE.md"` — target repo must document its architecture. Absent → exit 2.
-3. `git -C "$ORCH_PROJECT" rev-parse --git-dir` — target must be a git repo. Failure → exit 2.
-4. `git -C "$ORCH_PROJECT" rev-parse --verify main` — `main` branch must exist for branch creation. Failure → exit 2.
+1. `command -v bd` — `bd` CLI must be on `$PATH`.
+2. `test -f "$ORCH_PROJECT/CLAUDE.md"` — target repo must document its architecture.
+3. `git -C "$ORCH_PROJECT" rev-parse --git-dir` — target must be a git repo.
+4. `git -C "$ORCH_PROJECT" rev-parse --verify main` — `main` must exist (Step D may create `$ORCH_BRANCH` from it).
 
 ### Step B — Load the task
 
@@ -115,7 +113,7 @@ Before advancing to VERIFY, check every success criterion. Any unsatisfied → l
 
 ## Phase 4: VERIFY
 
-Run the target repo's quality gate as documented in `CLAUDE.md` (examples: `task check`, `make test`, `npm run ci`). The command must pass cleanly.
+Run the target repo's quality gate as documented in `CLAUDE.md` (examples: `task check`, `make test`, `npm run ci`). The command must exit 0 with no test failures.
 
 Verify each success criterion against the built artifacts — not by inspecting your own test names, but by running the relevant test and reading the assertions it makes.
 
@@ -124,7 +122,7 @@ Verify each success criterion against the built artifacts — not by inspecting 
 Classify each failure before retrying.
 
 - **Transient** (Docker not running, flaky network test, port conflict, stale build cache): apply the obvious remediation, re-run. Up to 5 transient retries on distinct root causes.
-- **Structural** (wrong architecture, missing upstream code, test asserts spec you cannot satisfy): read the error, fix the root cause. Three structural failures on the *same* root cause → exit 1 (retryable) if the next attempt might succeed with a different approach, or exit 2 if the blocker is outside your scope to fix.
+- **Structural** (wrong architecture, missing upstream code, test asserts spec you cannot satisfy): read the error, fix the root cause. Three structural failures on the *same* root cause → stop retrying. Choose exit 2 if the blocker is outside your scope to fix (missing upstream code, broken tooling, impossible spec); otherwise exit 1 so a fresh session can try a different approach.
 
 **Rollback:** if a fix makes things worse, reset individual files with `git checkout HEAD -- <file>`. Never `git reset --hard` — you may destroy prior iterations' commits.
 
@@ -197,7 +195,7 @@ Apply in order; first match wins.
 
 ## Operating Rules
 
-> **Never** run `bd update --claim`, `bd update --status`, or `bd close`. Your beads interactions are reads only: `bd show "$ORCH_TASK_ID" --json` and `bd deps "$ORCH_TASK_ID" --json`. The orchestrator owns all status transitions.
+> **Never** run `bd update --claim`, `bd update --status`, or `bd close`. Your beads interactions are reads only — `bd show <id>` and `bd deps <id>` on your own task or any predecessor. The orchestrator owns all status transitions.
 
 - One task per session. Exit after Phase 5 — do not loop, do not select another task.
 - All file paths from `$ORCH_PROJECT` root.
