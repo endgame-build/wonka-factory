@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,95 +15,87 @@ import (
 
 const agentsDir = "../../agents"
 
-// Forbidden `bd` command invocations. The line-start anchor prevents inline
-// code mentions and blockquoted prose from matching; fenced code blocks DO
-// match, which is the intent — fences are copy-bait for an LLM.
+// Forbidden `bd` invocations. The line-start anchor permits blockquoted
+// callouts ("> **Never** run `bd close`...") to survive while catching any
+// copy-bait fenced shell line.
 //
-// `bd update --status` is permitted only for CHARLIE per BVV-TG-02; builders
-// and verifiers never mutate status. CHARLIE's own permitted usage is further
-// constrained below to `--status open` only (see forbiddenCharlieStatusRe).
+// `bd update --status` is permitted only for CHARLIE per BVV-TG-02 (further
+// constrained to `--status open` by forbiddenCharlieStatusRe below).
 var (
 	forbiddenBdCloseRe  = regexp.MustCompile(`(?m)^\s*bd\s+close\b`)
 	forbiddenBdClaimRe  = regexp.MustCompile(`(?m)^\s*bd\s+update\b.*--claim\b`)
 	forbiddenBdStatusRe = regexp.MustCompile(`(?m)^\s*bd\s+update\b.*--status\b`)
 
-	// CHARLIE may explain in prose why exit 3 is forbidden, but MUST NOT list
-	// it as a row in its Completion Protocol table (spec §6.2). A table row
-	// looks like `| 3 |` or `| **3** |`.
-	charlieExit3AsOutcomeRe = regexp.MustCompile(`(?mi)^\|\s*\*?\*?\s*3\s*\*?\*?\s*\|`)
-
-	// CHARLIE's only permitted `--status` target is `open` (BVV-TG-02). Any
-	// other target violates BVV-TG-03 or re-terminalizes a terminal task.
+	// CHARLIE's only permitted `--status` target is `open`. Any other target
+	// re-terminalizes a terminal task (BVV-TG-03) or grabs status ownership
+	// from the orchestrator.
 	forbiddenCharlieStatusRe = regexp.MustCompile(
 		`(?m)^\s*bd\s+update\b[^\n]*--status\s+(?:closed|completed|in_progress|failed|blocked)\b`)
 
 	frontmatterNameRe = regexp.MustCompile(`(?m)^name:\s*(\S+)`)
-
-	// Spec §6.1 mandated section headings. The trailing `\b` distinguishes
-	// `## Phase 1:` (1 followed by non-word `:`) from `## Phase 10:`.
-	sectionHeadingREs = map[string]*regexp.Regexp{
-		"Phase 1":             regexp.MustCompile(`(?m)^## Phase 1\b`),
-		"Decision Rules":      regexp.MustCompile(`(?m)^## Decision Rules\b`),
-		"Operating Rules":     regexp.MustCompile(`(?m)^## Operating Rules\b`),
-		"Completion Protocol": regexp.MustCompile(`(?m)^## Completion Protocol\b`),
-		"Memory Format":       regexp.MustCompile(`(?m)^## Memory Format\b`),
-	}
-
-	// Completion Protocol table-row regexes for each exit code. Matches
-	// `| 0 |` or `| **0** |` at line start.
-	exitCodeRowREs = map[int]*regexp.Regexp{
-		0: regexp.MustCompile(`(?m)^\|\s*\*?\*?\s*0\s*\*?\*?\s*\|`),
-		1: regexp.MustCompile(`(?m)^\|\s*\*?\*?\s*1\s*\*?\*?\s*\|`),
-		2: regexp.MustCompile(`(?m)^\|\s*\*?\*?\s*2\s*\*?\*?\s*\|`),
-		3: regexp.MustCompile(`(?m)^\|\s*\*?\*?\s*3\s*\*?\*?\s*\|`),
-	}
 )
 
-// TestAgentInstructionFiles exercises every production instruction file
-// through the live ReadAgentPrompt path, enforcing BVV spec §6.1 structural
-// requirements plus the forbidden/required pattern matrices.
+// requiredSections are the spec §6.1 mandated top-level headings. Each must
+// appear exactly once per file — duplicates signal a bad merge.
+var requiredSections = []string{
+	"## Phase 1",
+	"## Decision Rules",
+	"## Operating Rules",
+	"## Completion Protocol",
+	"## Memory Format",
+}
+
+// exitCodeRows[n] matches a Completion Protocol table row for exit code n,
+// e.g. `| 0 |` or `| **0** |` at line start.
+var exitCodeRows = func() map[int]*regexp.Regexp {
+	m := make(map[int]*regexp.Regexp, 4)
+	for code := 0; code <= 3; code++ {
+		m[code] = regexp.MustCompile(fmt.Sprintf(`(?m)^\|\s*\*?\*?\s*%d\s*\*?\*?\s*\|`, code))
+	}
+	return m
+}()
+
 func TestAgentInstructionFiles(t *testing.T) {
-	// Use the production source of role→file mappings so renaming a role in
-	// config.go propagates here automatically — the historical drift trap.
-	for _, name := range instructionFileBasenames() {
-		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(agentsDir, name)
+	t.Parallel()
+
+	// Iterate the production role→file registry so a rename propagates to
+	// the test automatically; the switch below still keys on role, not
+	// basename, so a BUILDER.md rename doesn't fall through to default.
+	for role, basename := range roleInstructionFiles {
+		t.Run(basename, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(agentsDir, basename)
 			body, model, err := orch.ReadAgentPrompt(path)
 			require.NoError(t, err)
-			// Promoted to require: a truncated file should produce one clear
-			// diagnostic, not a cascade of fifteen section-missing asserts.
 			require.Greater(t, len(body), 500,
 				"instruction body suspiciously short (%d bytes) — corruption or truncation", len(body))
-			// ReadAgentPrompt's frontmatter parser silently falls through if
-			// the closing `\n---` delimiter is missing, returning the entire
-			// file (including the YAML block) as the body. Catch that here.
+			// ReadAgentPrompt's frontmatter parser silently falls through
+			// when the closing `\n---` delimiter is missing, returning the
+			// entire file (including the YAML block) as the body.
 			require.False(t, strings.HasPrefix(body, "---"),
 				"body starts with `---` — frontmatter parser fell through; check delimiter shape")
 
-			// D3: model stays empty so preset default wins. Pinning a model
-			// in frontmatter ages badly — update the design doc before
-			// removing this line.
+			// D3: model must be empty so preset default wins. Pinning a
+			// model in frontmatter ages badly — update the design doc
+			// before removing this assertion.
 			assert.Empty(t, model,
 				"model must be empty per D3; update the design doc first if pinning")
 
-			// Frontmatter `name:` must match the lowercased basename stem.
-			// ReadAgentPrompt discards the name field, so we re-read the raw
-			// file to inspect it.
 			raw, err := os.ReadFile(path)
 			require.NoError(t, err)
 			m := frontmatterNameRe.FindStringSubmatch(string(raw))
 			require.NotNil(t, m, "frontmatter `name:` key not found")
-			wantName := strings.ToLower(strings.TrimSuffix(name, ".md"))
+			wantName := strings.ToLower(strings.TrimSuffix(basename, ".md"))
 			assert.Equal(t, wantName, m[1],
 				"frontmatter name %q does not match basename stem %q", m[1], wantName)
 
-			// Spec §6.1 mandates these five section headings. Count exactly
-			// one of each to catch duplicate-section regressions (bad merges)
-			// and `## Phase 1` vs `## Phase 10` prefix collisions.
-			for heading, re := range sectionHeadingREs {
-				matches := re.FindAllStringIndex(body, -1)
+			for _, heading := range requiredSections {
+				// Trailing `\b` distinguishes `## Phase 1` from `## Phase 10`.
+				re := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(heading) + `\b`)
+				matches := re.FindAllStringIndex(body, 2)
 				require.Equal(t, 1, len(matches),
-					"spec §6.1: expected exactly one `## %s` heading, got %d", heading, len(matches))
+					"spec §6.1: expected exactly one `%s` heading, got %d", heading, len(matches))
 			}
 
 			// Environment contract + task-discovery protocol (spec §8.4.1).
@@ -113,55 +106,47 @@ func TestAgentInstructionFiles(t *testing.T) {
 				"PROGRESS.md",
 				"bd show",
 			} {
-				assert.Contains(t, body, pat,
-					"env contract requires %q", pat)
+				assert.Contains(t, body, pat, "env contract requires %q", pat)
 			}
 
-			// Instruction-file rule (stricter than BVV-DSP-09, which requires
-			// orchestrator authority but permits agent-side closure for
-			// backward compatibility): no agent invokes these at all.
+			// Stricter than BVV-DSP-09 (which allows agent-side closure for
+			// backward compatibility): no production agent invokes these.
 			assert.False(t, forbiddenBdCloseRe.MatchString(body),
-				"%s must not invoke `bd close` (orchestrator owns closure)", name)
+				"%s must not invoke `bd close` (orchestrator owns closure)", basename)
 			assert.False(t, forbiddenBdClaimRe.MatchString(body),
-				"%s must not invoke `bd update --claim` (dispatcher assigns)", name)
+				"%s must not invoke `bd update --claim` (dispatcher assigns)", basename)
 
-			switch name {
-			case "OOMPA.md", "LOOMPA.md":
+			switch role {
+			case "builder", "verifier":
 				// BVV-TG-02: only the planner may reset task status.
 				assert.False(t, forbiddenBdStatusRe.MatchString(body),
-					"%s must not invoke `bd update --status`", name)
-				// §6.2: builder and verifier have four valid exit codes —
-				// every row must appear in the Completion Protocol table. A
-				// dropped row would leave the agent without guidance for
-				// that failure class.
+					"%s must not invoke `bd update --status`", basename)
+				// §6.2: builder/verifier have four valid exit codes — each
+				// must appear in the Completion Protocol table.
 				for code := 0; code <= 3; code++ {
-					assert.Regexp(t, exitCodeRowREs[code], body,
-						"%s must list exit %d as a Completion Protocol row", name, code)
+					assert.Regexp(t, exitCodeRows[code], body,
+						"%s must list exit %d as a Completion Protocol row", basename, code)
 				}
 				// D9: commits carry the Task: trailer for audit grep.
 				assert.Contains(t, body, "Task: ORCH_TASK_ID=",
-					"%s must carry the D9 commit template trailer", name)
+					"%s must carry the D9 commit template trailer", basename)
 
-			case "CHARLIE.md":
-				// CHARLIE writes tasks, not code.
+			case "planner":
 				assert.Contains(t, body, "bd create",
 					"CHARLIE must reference `bd create`")
-				// §6.2: planner has 0/1/2 only — exit 3 must not be a row,
-				// and 0/1/2 must each be a row.
-				assert.False(t, charlieExit3AsOutcomeRe.MatchString(body),
+				// §6.2: planner exits 0/1/2 only — exit 3 must not be a row.
+				assert.False(t, exitCodeRows[3].MatchString(body),
 					"CHARLIE must not list exit 3 as a Completion Protocol row")
 				for code := 0; code <= 2; code++ {
-					assert.Regexp(t, exitCodeRowREs[code], body,
+					assert.Regexp(t, exitCodeRows[code], body,
 						"CHARLIE must list exit %d as a Completion Protocol row", code)
 				}
-				// BVV-TG-02: CHARLIE's only permitted --status target is
-				// `open`. Any other target violates BVV-TG-03 or re-
-				// terminalizes terminal state.
+				// BVV-TG-02: CHARLIE's only permitted --status target is `open`.
 				assert.False(t, forbiddenCharlieStatusRe.MatchString(body),
 					"CHARLIE may only set --status open; found an invalid target")
 
 			default:
-				t.Fatalf("no role-specific rules defined for %s — update agents_test.go switch", name)
+				t.Fatalf("no role-specific rules defined for role %q — update agents_test.go switch", role)
 			}
 		})
 	}
