@@ -531,13 +531,14 @@ func (e *Engine) replayPlannerValidation(result *ResumeResult) error {
 // callers can surface it in the graph_invalid audit-trail anchor.
 //
 // Differs from dispatch.go's createEscalation in three ways:
-//   (1) distinct ID prefix ("escalation-graph-") so operators can
-//       grep-classify without parsing payload;
-//   (2) does NOT mutate the plan task's status — the plan completed;
-//       it's the graph it produced that's the problem, and abort is
-//       handled by the caller via d.AbortLifecycle;
-//   (3) does NOT emit EventEscalationCreated — the caller emits
-//       EventGraphInvalid to pin the specific failure mode.
+//
+//	(1) distinct ID prefix ("escalation-graph-") so operators can
+//	    grep-classify without parsing payload;
+//	(2) does NOT mutate the plan task's status — the plan completed;
+//	    it's the graph it produced that's the problem, and abort is
+//	    handled by the caller via d.AbortLifecycle;
+//	(3) does NOT emit EventEscalationCreated — the caller emits
+//	    EventGraphInvalid to pin the specific failure mode.
 func (e *Engine) createGraphInvalidEscalation(planTask *Task, ve *GraphValidationError) error {
 	escID := "escalation-graph-" + planTask.ID
 	escTask := &Task{
