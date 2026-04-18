@@ -232,7 +232,8 @@ func (e *Engine) Resume(ctx context.Context) error {
 		return err
 	}
 
-	// 6. Emit lifecycle_started with resume detail — fatal on failure.
+	// 6. Emit lifecycle_started — must precede step 7 so replayed
+	// graph_invalid events land inside a lifecycle boundary (§10.3).
 	summary := fmt.Sprintf("lifecycle resumed (run %s, branch %s, reconciled=%d, orphans=%d, gaps=%d, reopens=%d)",
 		e.cfg.RunID, e.cfg.Lifecycle.Branch,
 		result.Reconciled, result.OrphanedSessions,
@@ -241,7 +242,16 @@ func (e *Engine) Resume(ctx context.Context) error {
 		return err
 	}
 
-	// 7. Run dispatch loop.
+	// 7. Re-fire post-planner validation for completed planner tasks
+	// whose hook never emitted graph_validated / graph_invalid (BVV-TG-07..10
+	// crash resilience). Idempotent: the validator is a read-only scan, and
+	// ErrTaskExists on the escalation path is tolerated.
+	if err := e.replayPlannerValidation(result); err != nil {
+		Cleanup(e.tmux, e.lock, e.log, e.store)
+		return fmt.Errorf("engine: replay planner validation: %w", err)
+	}
+
+	// 8. Run dispatch loop.
 	return e.runLoop(ctx)
 }
 
@@ -390,8 +400,168 @@ func (e *Engine) buildDispatchAndWatchdog() error {
 	if e.testSpawnFunc != nil {
 		disp.SetSpawnFunc(e.testSpawnFunc)
 	}
+	// BVV-TG-07..10: post-planner task-graph well-formedness validation.
+	// Hook runs on the dispatch goroutine (single-threaded) after a
+	// role:planner task successfully completes. Other roles flow through
+	// unchanged — the Dispatcher stays role-agnostic (BVV-DSN-04).
+	disp.SetPostSuccessHook(e.onTaskCompleted)
 	e.disp = disp
 
+	return nil
+}
+
+// onTaskCompleted is the post-success dispatch router. Called either from
+// the dispatcher's post-success hook (dispatch goroutine) or from
+// replayPlannerValidation during Resume (main goroutine, pre-dispatch) —
+// both single-active, so callees may call d.AbortLifecycle without sync.
+func (e *Engine) onTaskCompleted(task *Task) {
+	if task == nil {
+		return
+	}
+	if task.Role() == RolePlanner {
+		e.onPlannerCompleted(task)
+	}
+}
+
+// onPlannerCompleted runs BVV-TG-07..10 task-graph validation immediately
+// after a role:planner task transitions to completed. On success, emits
+// EventGraphValidated. On failure, emits EventGraphInvalid, creates an
+// escalation task, and aborts via d.AbortLifecycle(reason) — the reason
+// carries the specific requirement ID onto the terminal anchor.
+//
+// Gated by LifecycleConfig.ValidateGraph — when false, returns immediately
+// without side effects (Level 1 compatibility). The CLI escape hatch is
+// `--no-validate-graph`.
+func (e *Engine) onPlannerCompleted(task *Task) {
+	if !e.cfg.Lifecycle.ValidateGraph {
+		return
+	}
+	branch := e.cfg.Lifecycle.Branch
+
+	err := ValidateLifecycleGraph(e.store, branch, e.cfg.Lifecycle.Roles)
+	if err == nil {
+		// Well-formed — emit the positive audit-trail anchor. Emit errors
+		// surface on stderr (matching emitLifecycleCompleted's convention)
+		// so a failed write is visible post-incident even if the lifecycle
+		// otherwise proceeds; the anchor matters for replay detection.
+		if emitErr := emitAndNotify(e.log, e.cfg.Progress, Event{
+			Kind:    EventGraphValidated,
+			TaskID:  task.ID,
+			Summary: fmt.Sprintf("task graph validated post-planner (branch %s)", branch),
+		}); emitErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: emit graph_validated for %s: %v\n", task.ID, emitErr)
+		}
+		return
+	}
+
+	// Malformed graph: create escalation, emit graph_invalid, abort.
+	// Ordering: create-before-emit so the event's Detail can record
+	// whether the escalation task landed.
+	var ve *GraphValidationError
+	if !errors.As(err, &ve) {
+		// Non-validator error (e.g. store scan failure) — synthesize a
+		// GraphValidationError so downstream handling is uniform. Use the
+		// reserved ReqTG00 ("BVV-TG-00") so the abort reason still matches
+		// the BVV-TG-NN shape operator tooling greps for, while staying
+		// distinct from spec-defined TG-07..10 violations.
+		ve = &GraphValidationError{Requirement: ReqTG00, Reason: err.Error()}
+	}
+	escErr := e.createGraphInvalidEscalation(task, ve)
+	// Stable key=value encoding for log scrapers: %q on strings.Join avoids
+	// the bracketed `[a b]` shape that %v prints for slices.
+	detail := fmt.Sprintf("requirement=%s reason=%q tasks=%q",
+		ve.Requirement, ve.Reason, strings.Join(ve.TaskIDs, ","))
+	if escErr != nil {
+		detail += fmt.Sprintf(" escalation_creation_failed=%q", escErr.Error())
+		fmt.Fprintf(os.Stderr, "warning: create graph-invalid escalation for %s: %v\n", task.ID, escErr)
+	}
+	if emitErr := emitAndNotify(e.log, e.cfg.Progress, Event{
+		Kind:    EventGraphInvalid,
+		TaskID:  task.ID,
+		Summary: fmt.Sprintf("task graph invalid post-planner (%s)", ve.Requirement),
+		Detail:  detail,
+	}); emitErr != nil {
+		// graph_invalid emit failed: the abort reason still reaches the
+		// audit trail via AbortLifecycle → lifecycle_completed below.
+		fmt.Fprintf(os.Stderr, "warning: emit graph_invalid for %s: %v — abort reason recoverable from lifecycle_completed\n", task.ID, emitErr)
+	}
+	e.disp.AbortLifecycle("graph_invalid:" + string(ve.Requirement))
+}
+
+// replayPlannerValidation enforces BVV-TG-07..10 across crash boundaries.
+// Re-fires onPlannerCompleted for any role:planner task whose status is
+// completed but for which the audit trail contains no graph_validated or
+// graph_invalid event. Called during Resume after Reconcile and before
+// the dispatch loop starts (BVV-ERR-07).
+//
+// Crash scenarios this closes:
+//   - Engine completed the planner task (store write landed) but crashed
+//     before onPlannerCompleted ran — e.g. SIGKILL between handleSuccess's
+//     terminateAndRelease and the hook call.
+//   - Engine emitted task_completed but crashed during validation (e.g.
+//     store read failure while building the forward/reverse adjacency).
+//
+// Without this replay, the next dispatch tick would proceed on an
+// unvalidated graph, potentially dispatching from a malformed graph.
+func (e *Engine) replayPlannerValidation(result *ResumeResult) error {
+	if !e.cfg.Lifecycle.ValidateGraph {
+		return nil
+	}
+	branchLabel := LabelBranch + ":" + e.cfg.Lifecycle.Branch
+	tasks, err := e.store.ListTasks(branchLabel)
+	if err != nil {
+		return fmt.Errorf("list tasks: %w", err)
+	}
+	for _, t := range tasks {
+		if t.Role() != RolePlanner {
+			continue
+		}
+		if t.Status != StatusCompleted {
+			continue
+		}
+		if result != nil && result.GraphValidationSeen[t.ID] {
+			continue
+		}
+		// Completed planner with no graph_* event — replay the hook.
+		e.onPlannerCompleted(t)
+	}
+	return nil
+}
+
+// createGraphInvalidEscalation creates an escalation task for a
+// post-planner validation failure. Returns nil on success and on
+// ErrTaskExists (the operator-facing artifact is present either way,
+// which keeps replay idempotent). Any other store error is returned so
+// callers can surface it in the graph_invalid audit-trail anchor.
+//
+// Differs from dispatch.go's createEscalation in three ways:
+//
+//	(1) distinct ID prefix ("escalation-graph-") so operators can
+//	    grep-classify without parsing payload;
+//	(2) does NOT mutate the plan task's status — the plan completed;
+//	    it's the graph it produced that's the problem, and abort is
+//	    handled by the caller via d.AbortLifecycle;
+//	(3) does NOT emit EventEscalationCreated — the caller emits
+//	    EventGraphInvalid to pin the specific failure mode.
+func (e *Engine) createGraphInvalidEscalation(planTask *Task, ve *GraphValidationError) error {
+	escID := "escalation-graph-" + planTask.ID
+	escTask := &Task{
+		ID:    escID,
+		Title: fmt.Sprintf("Task graph invalid post-planner (%s)", ve.Requirement),
+		Body: fmt.Sprintf(
+			"The planner task %s completed but the resulting task graph violates %s: %s.\n"+
+				"Lifecycle aborted. Fix the work package or task graph, then re-open the plan task to retry.",
+			planTask.ID, ve.Requirement, ve.Reason),
+		Status: StatusOpen,
+		Labels: map[string]string{
+			LabelBranch:      planTask.Branch(),
+			LabelRole:        RoleEscalation,
+			LabelCriticality: string(Critical),
+		},
+	}
+	if err := e.store.CreateTask(escTask); err != nil && !errors.Is(err, ErrTaskExists) {
+		return fmt.Errorf("create escalation task %s: %w", escID, err)
+	}
 	return nil
 }
 
@@ -467,12 +637,22 @@ func (e *Engine) runLoop(ctx context.Context) error {
 // and runs the BVV-ERR-10a drain check. The Check runs in any build; the
 // Assert panics only under -tags verify. Without the Check, a release build
 // would hide BVV-ERR-10a violations entirely.
+//
+// Abort reason is pulled from Dispatcher.AbortReason() so the terminal
+// anchor faithfully records what caused the abort (e.g. "graph_invalid:
+// BVV-TG-09" vs. "gap_tolerance_exceeded" vs. "critical_task_failure:...").
+// Legacy callers that never set a reason fall through to the historical
+// gap-tolerance default.
 func (e *Engine) emitLifecycleCompleted(err error) {
 	var summary, detail string
 	if errors.Is(err, ErrLifecycleAborted) {
-		summary = fmt.Sprintf("lifecycle aborted: gap tolerance reached (run %s, branch %s)",
-			e.cfg.RunID, e.cfg.Lifecycle.Branch)
-		detail = "outcome=aborted reason=gap_tolerance_exceeded"
+		reason := "gap_tolerance_exceeded"
+		if e.disp != nil && e.disp.AbortReason() != "" {
+			reason = e.disp.AbortReason()
+		}
+		summary = fmt.Sprintf("lifecycle aborted: %s (run %s, branch %s)",
+			reason, e.cfg.RunID, e.cfg.Lifecycle.Branch)
+		detail = "outcome=aborted reason=" + reason
 	} else {
 		summary = fmt.Sprintf("lifecycle completed (run %s, branch %s)",
 			e.cfg.RunID, e.cfg.Lifecycle.Branch)

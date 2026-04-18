@@ -12,11 +12,12 @@ import (
 	"time"
 )
 
-// TestEventKinds_Count verifies exactly 17 event kinds are defined,
-// matching BVV spec §10.3.
+// TestEventKinds_Count verifies exactly 19 event kinds are defined:
+// 17 from BVV spec §10.3 plus graph_validated and graph_invalid for
+// BVV-TG-07..10 enforcement.
 func TestEventKinds_Count(t *testing.T) {
-	if got := len(AllEventKinds); got != 17 {
-		t.Errorf("len(AllEventKinds) = %d, want 17", got)
+	if got := len(AllEventKinds); got != 19 {
+		t.Errorf("len(AllEventKinds) = %d, want 19", got)
 	}
 
 	// Verify all kinds are distinct.

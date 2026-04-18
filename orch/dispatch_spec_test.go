@@ -91,7 +91,7 @@ func TestBVV_DSP03_RoleBasedRouting(t *testing.T) {
 	var dispatched []string
 	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		mu.Lock()
-		dispatched = append(dispatched, task.ID+":"+task.Role())
+		dispatched = append(dispatched, task.ID+":"+string(task.Role()))
 		mu.Unlock()
 		outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeSuccess, 0, roleCfg)
 	})
@@ -129,6 +129,42 @@ func TestBVV_DSP03a_UnknownRoleEscalation(t *testing.T) {
 	assert.Equal(t, orch.StatusOpen, esc.Status)
 	assert.Equal(t, "escalation", esc.Labels["role"])
 	assert.Contains(t, esc.Title, "unknown_role")
+}
+
+// TestBVV_DSP03a_NoEscalationOfEscalation verifies that the dispatcher does
+// not recursively escalate its own escalation tasks (BVV-DSP-03a regression).
+//
+// Without the role=="escalation" skip in dispatch(), an escalation task created
+// on tick N becomes "ready" on tick N+1, gets routed through the role map,
+// misses (no "escalation" role is ever configured), and produces a second-
+// generation escalation-escalation-<orig> task — blocking the previous one.
+// Repeats every tick, flooding the ledger. Escalation tasks are human-facing
+// and must remain `open` until manually resolved.
+func TestBVV_DSP03a_NoEscalationOfEscalation(t *testing.T) {
+	d, store, _ := newTestDispatcher(t, "feat/x", 3, "builder")
+
+	// Seed an escalation task directly — simulates state after a prior
+	// unknown-role escalation, but without running the first tick.
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID: "escalation-orig", Status: orch.StatusOpen, Priority: 0,
+		Labels: map[string]string{"branch": "feat/x", "role": "escalation", "criticality": "critical"},
+	}))
+	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	// Run several ticks — pre-fix, each would spawn escalation-escalation-*.
+	for i := 0; i < 3; i++ {
+		d.Tick(context.Background())
+	}
+
+	// The seeded escalation must remain untouched: open, un-assigned.
+	esc, err := store.GetTask("escalation-orig")
+	require.NoError(t, err)
+	assert.Equal(t, orch.StatusOpen, esc.Status, "escalation task must not be mutated by dispatch")
+	assert.Empty(t, esc.Assignee, "escalation task must not be assigned")
+
+	// No recursive escalation should have been created.
+	_, err = store.GetTask("escalation-escalation-orig")
+	assert.Error(t, err, "dispatcher must not escalate its own escalation tasks")
 }
 
 // TestBVV_DSP05_OneTaskPerSession verifies that each task gets exactly one
@@ -1115,7 +1151,7 @@ func TestBVV_S05_RoutingUsesLabelsOnly(t *testing.T) {
 		},
 	}))
 
-	var routedRole string
+	var routedRole orch.Role
 	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		routedRole = task.Role()
 		outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(0), 0, roleCfg)
@@ -1125,7 +1161,7 @@ func TestBVV_S05_RoutingUsesLabelsOnly(t *testing.T) {
 	d.Tick(ctx)
 	d.Wait()
 
-	assert.Equal(t, "builder", routedRole,
+	assert.Equal(t, orch.Role("builder"), routedRole,
 		"routing uses Role() label, not Title or Body content")
 }
 

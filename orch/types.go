@@ -92,6 +92,64 @@ const (
 	LabelCriticality = "criticality"
 )
 
+// Role is the typed label value carried in Task.Labels[LabelRole]. A typed
+// string type (rather than bare string) catches a class of mistakes at
+// compile time: mixing a Role into a non-Role function signature, or
+// passing a free-form string where a Role is expected.
+//
+// Constants below are declared untyped so they remain assignable to both
+// Role-typed variables and string-typed map literals (e.g.
+// map[string]string{LabelRole: RolePlanner}) without explicit conversion.
+// See `AllRoles` / `(Role).Valid()` for closed-set enforcement helpers.
+type Role string
+
+// Role value constants carried in Task.Labels[LabelRole]. Centralised so
+// dispatch/validate/engine role checks cannot drift from the CLI's role-to-
+// instruction-file map (internal/cmd/config.go:roleInstructionFiles).
+//
+// The CLI maps only the dispatchable subset (planner/builder/verifier) to
+// instruction files. Gate is dispatchable (BVV spec §7.3) but lacks a
+// default instruction file — it escalates via BVV-DSP-03a until registered.
+// RoleEscalation is orchestrator-created (not CLI-configured) — escalation
+// tasks are human-facing inboxes, not dispatchable work.
+const (
+	RolePlanner    = "planner"
+	RoleBuilder    = "builder"
+	RoleVerifier   = "verifier"
+	RoleGate       = "gate"
+	RoleEscalation = "escalation"
+)
+
+// AllRoles enumerates every Role value the orchestrator recognises. It is
+// the canonical list for tests and for any code that needs to iterate roles
+// without coupling to their spellings.
+//
+// Note: TG-07 role-map validation in ValidateLifecycleGraph checks task
+// role labels against the *configured* LifecycleConfig.Roles map — not this
+// list — because the configured subset is tighter (a spec-known role that
+// the operator hasn't wired up is still a malformed graph).
+var AllRoles = []Role{
+	RolePlanner,
+	RoleBuilder,
+	RoleVerifier,
+	RoleGate,
+	RoleEscalation,
+}
+
+// Valid reports whether r is one of the recognised Role values. An empty
+// Role is invalid — tasks missing the role label fail BVV-TG-07.
+func (r Role) Valid() bool {
+	switch r {
+	case RolePlanner, RoleBuilder, RoleVerifier, RoleGate, RoleEscalation:
+		return true
+	}
+	return false
+}
+
+// String satisfies fmt.Stringer so Role renders identically to its
+// underlying string in logs and error messages.
+func (r Role) String() string { return string(r) }
+
 // --- Runtime types ---
 
 // Task is the BVV unit of work. Role, branch, and criticality live in Labels
@@ -111,7 +169,9 @@ type Task struct {
 
 // Role returns the role tag from labels. Empty if unset.
 // BVV-AI-02: the role label drives instruction file and preset selection.
-func (t *Task) Role() string { return t.Labels[LabelRole] }
+// Callers that need the closed-set guarantee should check (Role).Valid();
+// the orchestrator treats an unknown role as an escalation path (BVV-DSP-03a).
+func (t *Task) Role() Role { return Role(t.Labels[LabelRole]) }
 
 // Branch returns the lifecycle branch from labels. Empty if unset.
 // Used for per-branch lifecycle scoping (BVV-S-01).
@@ -178,6 +238,19 @@ type LifecycleConfig struct {
 	BaseTimeout  time.Duration         // BVV-ERR-02a
 	Lock         LockConfig            // per-branch exclusive lifecycle lock; see lock.go
 	Roles        map[string]RoleConfig // role tag → binding
+	// ValidateGraph controls post-planner task-graph validation per BVV-TG-07..10.
+	// When true, the engine runs ValidateLifecycleGraph after each role:planner
+	// task transitions to completed; a malformed graph creates an escalation
+	// task and aborts the lifecycle. When false, validation is skipped entirely
+	// (Level 1 compatibility: pre-populated ledgers without a planner task).
+	//
+	// Zero value is false. The CLI's BuildEngineConfig wires this as
+	// `!flags.NoValidateGraph`, so the field is true by default (the
+	// `--no-validate-graph` flag defaults to false) — Level 2 operators get
+	// validation without explicit opt-in. Direct library consumers constructing
+	// LifecycleConfig{} literals must set this explicitly for Level 2 behavior
+	// (see docs/BVV_PHASE_9_PLAN.md for the rationale behind the default).
+	ValidateGraph bool
 }
 
 // --- Agent outcome (exit code protocol) ---

@@ -15,7 +15,11 @@ import (
 // Returns tasks in creation order (topological order by construction).
 func RandomDAG(t *rapid.T, store orch.Store, branch string) []*orch.Task {
 	n := rapid.IntRange(2, 20).Draw(t, "numTasks")
-	roles := []string{"builder", "verifier"}
+	// Typed Role slice prevents this generator from fabricating role values
+	// outside the closed set — exactly the property TG-07 relies on. Using
+	// bare strings here would let a typo slip past the compile-time closed
+	// set ({RolePlanner, ...}) the orchestrator enforces elsewhere.
+	roles := []orch.Role{orch.RoleBuilder, orch.RoleVerifier}
 	crits := []string{string(orch.Critical), string(orch.NonCritical)}
 
 	tasks := make([]*orch.Task, n)
@@ -30,7 +34,7 @@ func RandomDAG(t *rapid.T, store orch.Store, branch string) []*orch.Task {
 			Priority: rapid.IntRange(0, 5).Draw(t, fmt.Sprintf("prio_%d", i)),
 			Labels: map[string]string{
 				orch.LabelBranch:      branch,
-				orch.LabelRole:        role,
+				orch.LabelRole:        string(role),
 				orch.LabelCriticality: crit,
 			},
 		}

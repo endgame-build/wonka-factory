@@ -29,6 +29,7 @@ type MockStore struct {
 	// matching operation returns the error instead of succeeding. Each
 	// independent hook lets tests pin the exact step under Reconcile that
 	// surfaces a store failure. Thread-safe: guarded by mu.
+	CreateTaskErr   error
 	UpdateTaskErr   error
 	UpdateWorkerErr error
 	ListTasksErr    error
@@ -46,6 +47,15 @@ func NewMockStore() *MockStore {
 		workers: make(map[string]*orch.Worker),
 		deps:    make(map[string][]string),
 	}
+}
+
+// SetCreateTaskErr sets (or clears) the error returned by CreateTask.
+// Thread-safe: acquires the store mutex. Used to simulate durable-store
+// failures in the escalation-creation path (silent-failure audit I-3).
+func (s *MockStore) SetCreateTaskErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CreateTaskErr = err
 }
 
 // SetUpdateTaskErr sets (or clears) the error returned by UpdateTask.
@@ -116,6 +126,9 @@ func (s *MockStore) CreateTask(t *orch.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.CreateTaskErr != nil {
+		return s.CreateTaskErr
+	}
 	if _, exists := s.tasks[t.ID]; exists {
 		return fmt.Errorf("task %q: %w", t.ID, orch.ErrTaskExists)
 	}
@@ -336,6 +349,19 @@ func (s *MockStore) AddDep(taskID, dependsOn string) error {
 
 	s.deps[taskID] = append(s.deps[taskID], dependsOn)
 	return nil
+}
+
+// InjectDep appends a dependency edge WITHOUT running AddDep's cycle check.
+// Test-only: used by BVV-TG-08 spec tests that need to construct cyclic
+// graphs to verify ValidateLifecycleGraph catches raw-DB tampering that
+// legitimate AddDep would reject. Do not use in production code paths.
+func (s *MockStore) InjectDep(taskID, dependsOn string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if slices.Contains(s.deps[taskID], dependsOn) {
+		return
+	}
+	s.deps[taskID] = append(s.deps[taskID], dependsOn)
 }
 
 func (s *MockStore) GetDeps(taskID string) ([]string, error) {

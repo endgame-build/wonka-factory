@@ -53,9 +53,9 @@ func SetupSignalHandler() (context.Context, context.CancelFunc) {
 // KillServer failure can leave zombie tmux sessions that race the next
 // run and double-commit against the ledger.
 //
-// No shutdown event is emitted. BVV's 17 event kinds don't include one —
-// the last entry in the log is whatever the dispatcher emitted before the
-// signal arrived, which is semantically correct (the lifecycle didn't
+// No shutdown event is emitted. BVV's canonical event kinds don't include
+// one — the last entry in the log is whatever the dispatcher emitted before
+// the signal arrived, which is semantically correct (the lifecycle didn't
 // complete; it was interrupted).
 func Cleanup(tmux *TmuxClient, lock *LifecycleLock, log *EventLog, store Store) {
 	if tmux != nil {

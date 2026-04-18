@@ -140,6 +140,103 @@ func TestDiagnosticsDetail_DefaultLedgerKindFallback(t *testing.T) {
 		"default LedgerKind must surface fallback in audit trail (C2)")
 }
 
+// --- Internal tests for createGraphInvalidEscalation (I-3 fix) ---
+
+// TestCreateGraphInvalidEscalation_ReturnsStoreErr pins the silent-failure
+// audit I-3 fix: when Store.CreateTask fails with anything other than
+// ErrTaskExists, the failure must propagate up to onPlannerCompleted so
+// it can record escalation_creation_failed=<err> in the graph_invalid
+// event's Detail. Prior to this fix, the error was logged to stderr
+// only — the audit trail was silent about the missing escalation task.
+func TestCreateGraphInvalidEscalation_ReturnsStoreErr(t *testing.T) {
+	store, err := NewFSStore(filepath.Join(t.TempDir(), "ledger"))
+	require.NoError(t, err)
+	defer store.Close()
+
+	// Seed a task with the escalation ID to force ErrTaskExists won't fire;
+	// instead we use an FS store that works normally, then create a task
+	// with an invalid ID via the sentinel path. To avoid plumbing a mock
+	// here, use a validated-out ID instead: "." (rejected by ValidateID).
+	e := &Engine{
+		cfg:   EngineConfig{Lifecycle: &LifecycleConfig{Branch: "feat/x"}},
+		store: store,
+	}
+	// Plan task with path-separator ID → createGraphInvalidEscalation will
+	// synthesize "escalation-graph-" + ".." which ValidateID rejects.
+	plan := &Task{ID: "..", Labels: map[string]string{
+		LabelBranch: "feat/x",
+		LabelRole:   RolePlanner,
+	}}
+
+	err = e.createGraphInvalidEscalation(plan, &GraphValidationError{Requirement: ReqTG09, Reason: "missing gate"})
+	require.Error(t, err, "invalid escalation ID must propagate as error")
+	assert.Contains(t, err.Error(), "create escalation task",
+		"error must identify the operation for audit-trail diagnostics")
+}
+
+// TestCreateGraphInvalidEscalation_IdempotentOnExists verifies the
+// documented idempotency contract: ErrTaskExists is treated as success
+// because the operator-facing artifact (the escalation task) is present
+// either way. Replay-after-crash paths rely on this so re-firing the hook
+// from replayPlannerValidation does not produce duplicate errors.
+func TestCreateGraphInvalidEscalation_IdempotentOnExists(t *testing.T) {
+	store, err := NewFSStore(filepath.Join(t.TempDir(), "ledger"))
+	require.NoError(t, err)
+	defer store.Close()
+
+	// Pre-create the escalation so CreateTask returns ErrTaskExists.
+	existing := &Task{
+		ID:     "escalation-graph-plan-1",
+		Status: StatusOpen,
+		Labels: map[string]string{
+			LabelBranch: "feat/x",
+			LabelRole:   RoleEscalation,
+		},
+	}
+	require.NoError(t, store.CreateTask(existing))
+
+	e := &Engine{
+		cfg:   EngineConfig{Lifecycle: &LifecycleConfig{Branch: "feat/x"}},
+		store: store,
+	}
+	plan := &Task{ID: "plan-1", Labels: map[string]string{
+		LabelBranch: "feat/x",
+		LabelRole:   RolePlanner,
+	}}
+
+	err = e.createGraphInvalidEscalation(plan, &GraphValidationError{Requirement: ReqTG09, Reason: "missing gate"})
+	assert.NoError(t, err, "ErrTaskExists must be treated as success (idempotent)")
+}
+
+// TestCreateGraphInvalidEscalation_SuccessShape verifies the created
+// escalation task carries the expected labels so operator tooling that
+// filters by label (e.g. `wonka status --role escalation`) can reliably
+// surface the artifact.
+func TestCreateGraphInvalidEscalation_SuccessShape(t *testing.T) {
+	store, err := NewFSStore(filepath.Join(t.TempDir(), "ledger"))
+	require.NoError(t, err)
+	defer store.Close()
+
+	e := &Engine{
+		cfg:   EngineConfig{Lifecycle: &LifecycleConfig{Branch: "feat/x"}},
+		store: store,
+	}
+	plan := &Task{ID: "plan-1", Labels: map[string]string{
+		LabelBranch: "feat/x",
+		LabelRole:   RolePlanner,
+	}}
+
+	require.NoError(t, e.createGraphInvalidEscalation(plan, &GraphValidationError{Requirement: ReqTG09, Reason: "missing gate"}))
+
+	esc, err := store.GetTask("escalation-graph-plan-1")
+	require.NoError(t, err, "escalation task must be created")
+	assert.Equal(t, "feat/x", esc.Labels[LabelBranch])
+	assert.Equal(t, RoleEscalation, esc.Labels[LabelRole])
+	assert.Equal(t, string(Critical), esc.Labels[LabelCriticality])
+	assert.Contains(t, esc.Title, "BVV-TG-09")
+	assert.Contains(t, esc.Body, "missing gate")
+}
+
 // readSingleEvent returns the first event of the given kind from the log,
 // or nil if none matched. Kept local to this file to avoid pulling a big
 // helper set into the internal-test namespace.

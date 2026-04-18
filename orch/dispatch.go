@@ -76,12 +76,20 @@ type Dispatcher struct {
 
 	branchLabel string // "branch:<name>" for ReadyTasks filter
 	aborted     bool   // lifecycle abort flag
+	abortReason string // machine-readable reason for the terminal anchor (e.g. "graph_invalid:BVV-TG-09")
 	testMode    bool   // skip SpawnSession (set by SetSpawnFunc)
 
 	spawnFunc SpawnFunc
 	outcomes  chan TaskOutcome
 	agentWg   sync.WaitGroup
 	progress  ProgressReporter
+
+	// postSuccessHook, if non-nil, is called after each task transitions to
+	// completed AND the store write persisted. Used by the engine for role-
+	// specific post-completion work (e.g. graph validation after the planner
+	// finishes). The dispatcher itself remains role-agnostic (BVV-DSN-04):
+	// any semantic inspection happens in the hook, not in the dispatcher.
+	postSuccessHook func(*Task)
 }
 
 // NewDispatcher creates a dispatcher wired to all subsystems. The spawnFunc
@@ -160,6 +168,58 @@ func (d *Dispatcher) SetSpawnFunc(fn SpawnFunc) {
 	d.testMode = true
 }
 
+// SetPostSuccessHook installs a callback fired from processOutcome after a
+// task transitions to completed AND the store write persists. Single-
+// threaded (runs on the dispatch goroutine) so the hook body does not need
+// synchronization against other outcome processing.
+//
+// The hook may call d.AbortLifecycle(reason) to stop further dispatch —
+// useful for post-completion validators (e.g. BVV-TG-07..10 graph
+// well-formedness check that runs after the planner completes).
+func (d *Dispatcher) SetPostSuccessHook(fn func(*Task)) {
+	d.postSuccessHook = fn
+}
+
+// AbortLifecycle sets the abort flag and runs cleanup (blocks all remaining
+// open tasks so they stop appearing in ReadyTasks). Safe to call from
+// postSuccessHook on the dispatch goroutine. For caller-driven aborts
+// that don't come from a terminal failure path (BVV-ERR-03/04), the
+// caller is responsible for emitting the appropriate audit-trail event
+// before invoking this method.
+//
+// The reason is stamped on the terminal lifecycle_completed anchor. Use a
+// short, machine-parseable token (e.g. "graph_invalid:BVV-TG-09") so
+// operator tooling can classify aborts without parsing free-form prose.
+//
+// First-wins: once a reason is set (by this method or by handleTerminalFailure),
+// subsequent calls do not overwrite it. This gives operators the earliest
+// and typically most-specific cause when multiple abort paths race within
+// a single dispatch Drain. An empty reason is always a no-op.
+func (d *Dispatcher) AbortLifecycle(reason string) {
+	d.setAbortReason(reason)
+	d.aborted = true
+	d.abortCleanup()
+}
+
+// setAbortReason applies first-wins semantics to d.abortReason. Centralises
+// the guard so AbortLifecycle and handleTerminalFailure cannot drift.
+func (d *Dispatcher) setAbortReason(reason string) {
+	if reason != "" && d.abortReason == "" {
+		d.abortReason = reason
+	}
+}
+
+// AbortReason returns the stored abort reason when one was recorded by
+// AbortLifecycle or handleTerminalFailure, or empty if no reason was
+// captured. Emitted on the terminal lifecycle_completed anchor so an
+// operator can distinguish abort causes without timestamp correlation.
+// emitLifecycleCompleted treats an empty string as "no specific reason
+// recorded" and falls back to the historical "gap_tolerance_exceeded"
+// default, so the empty-string semantics are load-bearing.
+func (d *Dispatcher) AbortReason() string {
+	return d.abortReason
+}
+
 // Wait blocks until all runAgent goroutines have completed.
 func (d *Dispatcher) Wait() {
 	d.agentWg.Wait()
@@ -225,10 +285,17 @@ func (d *Dispatcher) terminateAndRelease(task *Task, workerName string, newStatu
 }
 
 func (d *Dispatcher) handleSuccess(o TaskOutcome) {
-	d.terminateAndRelease(o.Task, o.Worker.Name, StatusCompleted, Event{
+	persisted := d.terminateAndRelease(o.Task, o.Worker.Name, StatusCompleted, Event{
 		Kind: EventTaskCompleted, TaskID: o.Task.ID, Worker: o.Worker.Name,
 		Outcome: OutcomeSuccess, Summary: fmt.Sprintf("task %s completed", o.Task.ID),
 	})
+	// Fire the post-success hook only after the completion is durably
+	// persisted. Otherwise a store-write retry would trigger the hook
+	// twice — unsafe for hooks with side effects (graph validation emits
+	// an event, may create an escalation task).
+	if persisted && d.postSuccessHook != nil {
+		d.postSuccessHook(o.Task)
+	}
 }
 
 func (d *Dispatcher) handleFailure(o TaskOutcome) {
@@ -314,6 +381,7 @@ func (d *Dispatcher) handleHandoff(ctx context.Context, o TaskOutcome) {
 // BVV-ERR-04: non-critical task → gap counter → abort at tolerance.
 func (d *Dispatcher) handleTerminalFailure(task *Task) {
 	if task.IsCritical() {
+		d.setAbortReason("critical_task_failure:" + task.ID)
 		d.aborted = true
 		d.abortCleanup()
 		d.emit(Event{Kind: EventEscalationCreated, TaskID: task.ID,
@@ -329,6 +397,7 @@ func (d *Dispatcher) handleTerminalFailure(task *Task) {
 	d.emit(Event{Kind: EventGapRecorded, TaskID: task.ID,
 		Summary: fmt.Sprintf("gap %d/%d recorded for task %s", d.gaps.Count(), d.lifecycle.GapTolerance, task.ID)})
 	if abort {
+		d.setAbortReason("gap_tolerance_exceeded")
 		d.aborted = true
 		d.abortCleanup()
 		d.emit(Event{Kind: EventEscalationCreated, TaskID: task.ID,
@@ -459,7 +528,20 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 	for _, task := range ready {
 		// BVV-DSP-03: role-based routing from task metadata.
 		role := task.Role()
-		roleCfg, ok := d.lifecycle.Roles[role]
+		// Escalation tasks are human-facing artifacts — not dispatchable work.
+		// Without this skip, each tick would route the escalation through the
+		// role map, miss (no RoleEscalation RoleConfig by design), and call
+		// createEscalation on it, producing escalation-escalation-<orig> and
+		// blocking the previous escalation. The cycle repeats every tick,
+		// flooding the ledger. They stay `open` until a human resolves them.
+		if role == RoleEscalation {
+			continue
+		}
+		// Role map is keyed by string (CLI-configured) — convert the typed
+		// Role to string at the lookup boundary. The CLI builds this map
+		// with string keys derived from our untyped Role constants, so the
+		// round-trip is lossless.
+		roleCfg, ok := d.lifecycle.Roles[string(role)]
 		if !ok {
 			// BVV-DSP-03a: unknown role → create escalation, block original.
 			d.createEscalation(task, role)
@@ -551,7 +633,7 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 
 // createEscalation creates an escalation task for an unknown role and blocks
 // the original task (BVV-DSP-03a).
-func (d *Dispatcher) createEscalation(task *Task, role string) {
+func (d *Dispatcher) createEscalation(task *Task, role Role) {
 	escID := "escalation-" + task.ID
 	escTask := &Task{
 		ID:     escID,
@@ -560,7 +642,7 @@ func (d *Dispatcher) createEscalation(task *Task, role string) {
 		Status: StatusOpen,
 		Labels: map[string]string{
 			LabelBranch:      task.Branch(),
-			LabelRole:        "escalation",
+			LabelRole:        RoleEscalation,
 			LabelCriticality: string(Critical),
 		},
 		Priority: 0,
