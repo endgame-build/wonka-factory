@@ -108,8 +108,9 @@ Forked from `facet-scan/orch` and simplified per BVV Appendix B:
 | `resume.go` | State reconciliation: stale assignments, orphan cleanup, counter recovery | BVV-ERR-07..08 |
 | `gate.go` | PR gate: create PR, poll CI, exit code protocol | BVV-GT-01..03 |
 | `watchdog.go` | Tmux liveness detection + circuit breaker | BVV-ERR-11..11a, SUP-05..06 |
-| `eventlog.go` | Append-only JSONL audit trail (17 event kinds) | BVV-SS, Section 10.3 |
+| `eventlog.go` | Append-only JSONL audit trail (19 event kinds) | BVV-SS, Section 10.3, BVV-TG-07..10 |
 | `invariant.go` | Runtime assertions (build tag `verify`) | BVV-S-01..10 |
+| `validate.go` | Post-planner task-graph well-formedness check | BVV-TG-07..10 |
 | `signal.go` | Graceful shutdown (SIGINT/SIGTERM), no status modification | BVV-ERR-09..10a |
 
 ### What was removed from facet-scan/orch

@@ -338,6 +338,19 @@ func (s *MockStore) AddDep(taskID, dependsOn string) error {
 	return nil
 }
 
+// InjectDep appends a dependency edge WITHOUT running AddDep's cycle check.
+// Test-only: used by BVV-TG-08 spec tests that need to construct cyclic
+// graphs to verify ValidateLifecycleGraph catches raw-DB tampering that
+// legitimate AddDep would reject. Do not use in production code paths.
+func (s *MockStore) InjectDep(taskID, dependsOn string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if slices.Contains(s.deps[taskID], dependsOn) {
+		return
+	}
+	s.deps[taskID] = append(s.deps[taskID], dependsOn)
+}
+
 func (s *MockStore) GetDeps(taskID string) ([]string, error) {
 	if err := ValidateID(taskID); err != nil {
 		return nil, err

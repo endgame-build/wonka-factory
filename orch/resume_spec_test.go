@@ -158,6 +158,88 @@ func TestReconcile_OrphanSessionKilled(t *testing.T) {
 
 // TestReconcile_GapRecovery verifies §11a.2 step 3: gap_recorded events
 // are recovered from the event log (BVV-ERR-05 monotonic).
+// TestReconcile_GraphValidationRecovery verifies that Reconcile records
+// plan-task IDs for which graph_validated or graph_invalid events exist in
+// the log. Engine.Resume uses this set to detect completed planner tasks
+// whose post-planner validation hook never fired (crash between
+// task.completed and the graph_* anchor).
+func TestReconcile_GraphValidationRecovery(t *testing.T) {
+	store := testutil.NewMockStore()
+	tmux := newMockSession("run-1")
+	logPath := filepath.Join(t.TempDir(), "events.jsonl")
+
+	writeEvents(t, logPath, []orch.Event{
+		{Kind: orch.EventTaskCompleted, TaskID: "plan-A"},
+		{Kind: orch.EventGraphValidated, TaskID: "plan-A"},
+		{Kind: orch.EventTaskCompleted, TaskID: "plan-B"},
+		{Kind: orch.EventGraphInvalid, TaskID: "plan-B"},
+		{Kind: orch.EventTaskCompleted, TaskID: "plan-C"}, // no graph_* — must not be recovered
+	})
+
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", logPath)
+	require.NoError(t, err)
+	assert.True(t, result.GraphValidationSeen["plan-A"], "graph_validated must record plan-A")
+	assert.True(t, result.GraphValidationSeen["plan-B"], "graph_invalid must record plan-B")
+	assert.False(t, result.GraphValidationSeen["plan-C"], "completion alone does not imply validation")
+}
+
+// TestReconcile_GraphValidationInvalidatedByHumanReopen verifies that a
+// human re-open (escalation_resolved event) invalidates a stale graph_*
+// anchor for the re-opened task. Without this invalidation, a planner
+// task that was validated in a prior run, then re-opened and re-completed,
+// would skip re-validation on the next Resume — dispatching from an
+// unvalidated graph.
+//
+// Timeline in the event log:
+//  1. plan-A completes (run N)
+//  2. graph_validated plan-A (run N)
+//  3. [crash; human re-opens plan-A via bd]
+//  4. escalation_resolved plan-A (emitted on next Resume)
+//  5. plan-A completes again (run N+1) — this time with a DIFFERENT graph
+//
+// After reconcile, GraphValidationSeen[plan-A] must be false — the stale
+// run-N validation cannot vouch for run-N+1's potentially-different graph.
+func TestReconcile_GraphValidationInvalidatedByHumanReopen(t *testing.T) {
+	store := testutil.NewMockStore()
+	tmux := newMockSession("run-1")
+	logPath := filepath.Join(t.TempDir(), "events.jsonl")
+
+	writeEvents(t, logPath, []orch.Event{
+		{Kind: orch.EventTaskCompleted, TaskID: "plan-A"},
+		{Kind: orch.EventGraphValidated, TaskID: "plan-A"},
+		{Kind: orch.EventEscalationResolved, TaskID: "plan-A"}, // human re-opens plan-A
+		// plan-A has NOT yet re-completed — next run must re-validate.
+	})
+
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", logPath)
+	require.NoError(t, err)
+	assert.False(t, result.GraphValidationSeen["plan-A"],
+		"escalation_resolved must invalidate prior graph_validated anchor")
+}
+
+// TestReconcile_GraphValidationRepopulatedAfterReopen verifies the full
+// cycle: after a human re-open and subsequent graph_validated emission on
+// the NEW graph, the seen set correctly reflects the new anchor. Chronology
+// matters: delete-on-reopen applies only to events BEFORE the next graph_*.
+func TestReconcile_GraphValidationRepopulatedAfterReopen(t *testing.T) {
+	store := testutil.NewMockStore()
+	tmux := newMockSession("run-1")
+	logPath := filepath.Join(t.TempDir(), "events.jsonl")
+
+	writeEvents(t, logPath, []orch.Event{
+		{Kind: orch.EventTaskCompleted, TaskID: "plan-A"},
+		{Kind: orch.EventGraphValidated, TaskID: "plan-A"},
+		{Kind: orch.EventEscalationResolved, TaskID: "plan-A"},
+		{Kind: orch.EventTaskCompleted, TaskID: "plan-A"},
+		{Kind: orch.EventGraphValidated, TaskID: "plan-A"}, // new graph vouched for
+	})
+
+	result, err := orch.Reconcile(store, tmux, "run-1", "feat/x", logPath)
+	require.NoError(t, err)
+	assert.True(t, result.GraphValidationSeen["plan-A"],
+		"post-reopen graph_validated must repopulate the seen set")
+}
+
 func TestReconcile_GapRecovery(t *testing.T) {
 	store := testutil.NewMockStore()
 	tmux := newMockSession("run-1")

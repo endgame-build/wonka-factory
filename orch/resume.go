@@ -33,6 +33,12 @@ type ResumeResult struct {
 	// recovery (BVV-ERR-01 / BVV-L-04 monotonic guarantees), and the
 	// single-pass scan makes Reconcile the only chance to notice.
 	EventLogCorruptLines int
+
+	// GraphValidationSeen records plan-task IDs that already have a
+	// graph_validated or graph_invalid event in the audit trail. Engine.Resume
+	// uses this to detect completed planner tasks whose validation hook
+	// never ran (crash between task.completed and graph_* emission).
+	GraphValidationSeen map[string]bool
 }
 
 // Reconcile reconstructs lifecycle state from the ledger, tmux, and event log
@@ -62,8 +68,9 @@ func Reconcile(
 	logPath string,
 ) (*ResumeResult, error) {
 	result := &ResumeResult{
-		RetriesRecovered:  make(map[string]int),
-		HandoffsRecovered: make(map[string]int),
+		RetriesRecovered:    make(map[string]int),
+		HandoffsRecovered:   make(map[string]int),
+		GraphValidationSeen: make(map[string]bool),
 	}
 	branchLabel := LabelBranch + ":" + branch
 
@@ -157,6 +164,7 @@ func Reconcile(
 		result.RetriesRecovered = rec.retries
 		result.HandoffsRecovered = rec.handoffs
 		result.EventLogCorruptLines = rec.corruptLines
+		result.GraphValidationSeen = rec.graphValidationSeen
 
 		// Step 6: Human re-open detection (BVV-S-02a).
 		// A task that was terminal in the event log but is now open was
@@ -211,6 +219,12 @@ type eventLogRecovery struct {
 	handoffs        map[string]int        // taskID → handoff count
 	terminalHistory map[string]TaskStatus // taskID → last terminal status
 	corruptLines    int                   // unparseable JSONL lines
+	// graphValidationSeen records plan-task IDs for which a graph_validated
+	// or graph_invalid event was previously emitted. Used by Engine.Resume
+	// to detect the crash-between-complete-and-validate window: a planner
+	// task in status=completed but with no graph-validation anchor means
+	// onPlannerCompleted never finished its side effects.
+	graphValidationSeen map[string]bool
 }
 
 // maxEventLogLine bounds the per-line buffer for the event-log scanner.
@@ -229,9 +243,10 @@ const maxEventLogLine = 16 * 1024 * 1024
 // must surface eventLogRecovery.corruptLines.
 func recoverFromEventLog(logPath string) (*eventLogRecovery, error) {
 	rec := &eventLogRecovery{
-		retries:         make(map[string]int),
-		handoffs:        make(map[string]int),
-		terminalHistory: make(map[string]TaskStatus),
+		retries:             make(map[string]int),
+		handoffs:            make(map[string]int),
+		terminalHistory:     make(map[string]TaskStatus),
+		graphValidationSeen: make(map[string]bool),
 	}
 
 	f, err := os.Open(logPath)
@@ -267,6 +282,18 @@ func recoverFromEventLog(logPath string) (*eventLogRecovery, error) {
 			rec.terminalHistory[e.TaskID] = StatusFailed
 		case EventTaskBlocked:
 			rec.terminalHistory[e.TaskID] = StatusBlocked
+		case EventGraphValidated, EventGraphInvalid:
+			rec.graphValidationSeen[e.TaskID] = true
+		case EventEscalationResolved:
+			// A human re-open invalidates the prior graph-validation anchor:
+			// the planner task will re-run, potentially producing a different
+			// graph. Without this reset, replayPlannerValidation would see
+			// the stale graph_validated from the previous lifecycle and skip
+			// re-validation on the next Resume — dispatching from an
+			// unvalidated graph. Chronological scan order guarantees this
+			// reset only applies to events BEFORE a subsequent graph_*
+			// emission, which is exactly the semantics we want.
+			delete(rec.graphValidationSeen, e.TaskID)
 		}
 	}
 	if err := scanner.Err(); err != nil {

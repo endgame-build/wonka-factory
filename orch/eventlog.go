@@ -8,7 +8,8 @@ import (
 	"time"
 )
 
-// EventKind enumerates the 17 mandatory emission points (BVV spec §10.3).
+// EventKind enumerates the 19 mandatory emission points: 17 from BVV spec
+// §10.3 plus graph_validated and graph_invalid for BVV-TG-07..10.
 type EventKind string
 
 const (
@@ -29,6 +30,13 @@ const (
 	EventGateFailed          EventKind = "gate_failed"
 	EventEscalationResolved  EventKind = "escalation_resolved"
 	EventHandoffLimitReached EventKind = "handoff_limit_reached"
+	// EventGraphValidated is emitted when ValidateLifecycleGraph succeeds after
+	// a role:planner task completes. BVV-TG-07..10.
+	EventGraphValidated EventKind = "graph_validated"
+	// EventGraphInvalid is emitted when ValidateLifecycleGraph rejects the
+	// task graph after a role:planner task completes. Accompanied by an
+	// escalation task and lifecycle abort. BVV-TG-07..10.
+	EventGraphInvalid EventKind = "graph_invalid"
 )
 
 // AllEventKinds is the canonical set of BVV event kinds, used by tests
@@ -39,6 +47,7 @@ var AllEventKinds = []EventKind{
 	EventGapRecorded, EventEscalationCreated, EventLifecycleStarted,
 	EventLifecycleCompleted, EventGateCreated, EventGatePassed, EventGateFailed,
 	EventEscalationResolved, EventHandoffLimitReached,
+	EventGraphValidated, EventGraphInvalid,
 }
 
 // Event is a single JSONL audit record (BVV spec §10.3).

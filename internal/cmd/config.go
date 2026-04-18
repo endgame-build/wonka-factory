@@ -26,12 +26,13 @@ type CLIFlags struct {
 	RepoPath string // empty => os.Getwd()
 
 	// Lifecycle-only flags (run, resume).
-	AgentPreset  string
-	Workers      int
-	GapTolerance int
-	MaxRetries   int
-	MaxHandoffs  int
-	BaseTimeout  time.Duration
+	AgentPreset     string
+	Workers         int
+	GapTolerance    int
+	MaxRetries      int
+	MaxHandoffs     int
+	BaseTimeout     time.Duration
+	NoValidateGraph bool // when true, disables BVV-TG-07..10 post-planner validation
 }
 
 // Default values for CLI flags — chosen to match the BVV spec's reference
@@ -55,9 +56,9 @@ const (
 // dispatched by the CLI today; they escalate via BVV-DSP-03a until a gate
 // role is registered here.
 var roleInstructionFiles = map[string]string{
-	"builder":  "OOMPA.md",
-	"verifier": "LOOMPA.md",
-	"planner":  "CHARLIE.md",
+	orch.RoleBuilder:  "OOMPA.md",
+	orch.RoleVerifier: "LOOMPA.md",
+	orch.RolePlanner:  "CHARLIE.md",
 }
 
 // BuildEngineConfig assembles an orch.EngineConfig from CLI flag values.
@@ -145,6 +146,9 @@ func BuildEngineConfig(flags CLIFlags) (orch.EngineConfig, []string, error) {
 			RetryDelay:         defaultLockRetryDelay,
 		},
 		Roles: roles,
+		// BVV-TG-07..10: default-on at Level 2. --no-validate-graph flips
+		// this off for Level 1 compatibility against pre-populated ledgers.
+		ValidateGraph: !flags.NoValidateGraph,
 	}
 
 	cfg := orch.DefaultEngineConfig(lifecycle, runDir, repoPath)
@@ -279,4 +283,5 @@ func addLifecycleFlags(cmd *cobra.Command, flags *CLIFlags) {
 	cmd.Flags().IntVar(&flags.MaxRetries, "retry-count", defaultMaxRetries, "retries per task on exit-code-1 failure (BVV-ERR-01)")
 	cmd.Flags().IntVar(&flags.MaxHandoffs, "handoff-limit", defaultMaxHandoffs, "session restarts per task on exit-code-3 handoff (BVV-L-04)")
 	cmd.Flags().DurationVar(&flags.BaseTimeout, "timeout", defaultBaseTimeout, "base session timeout, scales with retry attempt (BVV-ERR-02a)")
+	cmd.Flags().BoolVar(&flags.NoValidateGraph, "no-validate-graph", false, "disable post-planner task-graph validation (BVV-TG-07..10); required for Level 1 operation against pre-populated ledgers")
 }

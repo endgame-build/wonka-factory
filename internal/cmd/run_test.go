@@ -91,3 +91,57 @@ func TestRunCmd_InvalidWorkers(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, stderr, "workers")
 }
+
+// TestBuildEngineConfig_ValidateGraphDefault verifies BVV-TG-07..10 validation
+// is ON by default — Level 2 conformance requires it.
+func TestBuildEngineConfig_ValidateGraphDefault(t *testing.T) {
+	repo := seedRepoWithAgents(t)
+	flags := CLIFlags{
+		Branch: "feat/x", Ledger: "fs", RepoPath: repo,
+		AgentDir: filepath.Join(repo, "agents"), AgentPreset: defaultAgentPreset,
+		Workers: defaultWorkers, GapTolerance: defaultGapTolerance,
+		MaxRetries: defaultMaxRetries, MaxHandoffs: defaultMaxHandoffs,
+		BaseTimeout: defaultBaseTimeout,
+		// NoValidateGraph left at zero value (false) — default-on path.
+	}
+	cfg, _, err := BuildEngineConfig(flags)
+	require.NoError(t, err)
+	assert.True(t, cfg.Lifecycle.ValidateGraph, "default must enable graph validation (Level 2)")
+}
+
+// TestBuildEngineConfig_NoValidateGraph verifies --no-validate-graph plumbs
+// through as ValidateGraph=false (Level 1 compatibility escape hatch).
+func TestBuildEngineConfig_NoValidateGraph(t *testing.T) {
+	repo := seedRepoWithAgents(t)
+	flags := CLIFlags{
+		Branch: "feat/x", Ledger: "fs", RepoPath: repo,
+		AgentDir: filepath.Join(repo, "agents"), AgentPreset: defaultAgentPreset,
+		Workers: defaultWorkers, GapTolerance: defaultGapTolerance,
+		MaxRetries: defaultMaxRetries, MaxHandoffs: defaultMaxHandoffs,
+		BaseTimeout:     defaultBaseTimeout,
+		NoValidateGraph: true,
+	}
+	cfg, _, err := BuildEngineConfig(flags)
+	require.NoError(t, err)
+	assert.False(t, cfg.Lifecycle.ValidateGraph, "--no-validate-graph must disable validation")
+}
+
+// TestRunCmd_NoValidateGraphFlag exercises the cobra path end-to-end by
+// parsing --no-validate-graph through a real root command. Exits with a
+// non-zero code because we don't actually run the engine, but flag parsing
+// must succeed (no "unknown flag" error).
+func TestRunCmd_NoValidateGraphFlag(t *testing.T) {
+	repo := seedRepoWithAgents(t)
+	// Use an unrecognized ledger to short-circuit before engine init; we only
+	// care that --no-validate-graph parses cleanly.
+	err, stderr := runCobra(t,
+		"run",
+		"--branch", "test",
+		"--repo", repo,
+		"--agent-dir", filepath.Join(repo, "agents"),
+		"--no-validate-graph",
+		"--ledger", "dolt", // triggers exitConfigError — flag parsing happened first
+	)
+	require.Error(t, err)
+	assert.NotContains(t, stderr, "unknown flag", "--no-validate-graph must parse")
+}

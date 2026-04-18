@@ -92,6 +92,20 @@ const (
 	LabelCriticality = "criticality"
 )
 
+// Role value constants carried in Task.Labels[LabelRole]. Centralised so
+// dispatch/validate/engine role checks use the same strings the CLI's
+// role-to-instruction-file map uses. A typo in a bare literal would
+// silently misdirect dispatch; these constants make the compiler catch it.
+// RoleEscalation is orchestrator-created (not CLI-configured) — escalation
+// tasks are human-facing inboxes, not dispatchable work.
+const (
+	RolePlanner    = "planner"
+	RoleBuilder    = "builder"
+	RoleVerifier   = "verifier"
+	RoleGate       = "gate"
+	RoleEscalation = "escalation"
+)
+
 // --- Runtime types ---
 
 // Task is the BVV unit of work. Role, branch, and criticality live in Labels
@@ -178,6 +192,13 @@ type LifecycleConfig struct {
 	BaseTimeout  time.Duration         // BVV-ERR-02a
 	Lock         LockConfig            // per-branch exclusive lifecycle lock; see lock.go
 	Roles        map[string]RoleConfig // role tag → binding
+	// ValidateGraph controls post-planner task-graph validation per BVV-TG-07..10.
+	// When true (Level 2 default), the engine runs ValidateLifecycleGraph after
+	// each role:planner task transitions to completed; a malformed graph creates
+	// an escalation task and aborts the lifecycle. When false, validation is
+	// skipped entirely (Level 1 compatibility: pre-populated ledgers without a
+	// planner task).
+	ValidateGraph bool
 }
 
 // --- Agent outcome (exit code protocol) ---

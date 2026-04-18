@@ -211,8 +211,9 @@ func NewWatchdog(
 }
 
 // Run starts the watchdog loop. Blocks until ctx is cancelled. Tick errors
-// are logged to stderr — BVV's 17 event kinds (§10.3) have no diagnostic
-// category, so stderr is the approved sink for watchdog infra failures.
+// are logged to stderr — BVV's canonical event kinds (§10.3) have no
+// diagnostic category, so stderr is the approved sink for watchdog infra
+// failures.
 func (w *Watchdog) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.cfg.Interval)
 	defer ticker.Stop()

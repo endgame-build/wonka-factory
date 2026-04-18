@@ -758,22 +758,36 @@ Stable identifiers (CAP-1, UC-1.1, V-1.1) provide BVV-TG-04 traceability anchors
 
 ---
 
-## Phase 9: Level 2 — Planner Integration
+## Phase 9: Level 2 — Planner Integration ✓ Complete
 
-After Level 1 is solid:
+### 9.1 Task graph well-formedness validation ✓
 
-### 9.1 Task graph well-formedness validation
+Implemented in `orch/validate.go`:
+- `ValidateLifecycleGraph(store, branch, roles)` — checks BVV-TG-07..10 after planner completes
+- Every task has valid role tag (TG-07)
+- Graph is acyclic (TG-08 — redundant DFS defense-in-depth vs. AddDep)
+- Exactly one gate task, reachable from all verifiers (TG-09)
+- All tasks reachable from plan task (TG-10), including multi-planner rejection
+- Skip path inside the validator: returns nil when the branch has zero `role:planner` tasks (legitimate Level 1 pre-populated ledger)
 
-Add to `orch/` (optional, RECOMMENDED per spec):
-- `ValidateLifecycleGraph(store, branchLabel)` — checks BVV-TG-07..10 after planner completes
-- Every task has valid role tag
-- Graph is acyclic (already enforced by AddDep)
-- Exactly one gate task
-- All tasks reachable from plan task
+Engine integration:
+- `Engine.onPlannerCompleted` fires via dispatcher's post-success hook
+- Engine-level skip: when `LifecycleConfig.ValidateGraph == false`, the hook returns without calling the validator (Level 1 compatibility; CLI flag `--no-validate-graph`)
+- On success: emits `EventGraphValidated`
+- On failure: emits `EventGraphInvalid`, creates escalation task, aborts lifecycle
+- Crash resilience: `Engine.Resume` replays validation for completed planner tasks whose audit trail lacks a graph_* event (`replayPlannerValidation`). Human re-opens (tracked via `EscalationResolved`) invalidate prior graph-validation anchors so re-validated graphs are re-checked.
 
-### 9.2 Planner-to-dispatch integration
+CLI:
+- `--no-validate-graph` escape hatch for Level 1 operation against pre-populated ledgers (default: validation ON)
 
-The dispatch loop already handles this: after the planner exits 0 (plan task completed), its dependent build tasks become ready via the DAG. No special planner-aware logic needed in the orchestrator — that's the whole point of BVV-DSN-04.
+### 9.2 Planner-to-dispatch integration ✓
+
+The dispatch loop already handles this: after the planner exits 0 (plan task completed), its dependent build tasks become ready via the DAG. No special planner-aware logic in the dispatcher — the validation hook lives in the engine's post-success callback to keep BVV-DSN-04 intact.
+
+### 9.3 Related gap fixes ✓
+
+- `dispatch()` now skips `role == "escalation"` tasks before the role-map lookup. Pre-Phase-9 bug: the dispatcher would recursively escalate its own escalation tasks every tick (`escalation-escalation-escalation-...`). Regression test: `TestBVV_DSP03a_NoEscalationOfEscalation`.
+- `eventlog.go` bumped from 17 to 19 event kinds (`EventGraphValidated`, `EventGraphInvalid`).
 
 ---
 
@@ -791,7 +805,7 @@ The dispatch loop already handles this: after the planner exits 0 (plan task com
 | 8. Tests | *_spec_test.go, *_prop_test.go, contract, e2e | Step 7 | XL |
 | 9. CLI | cmd/wonka/, internal/cmd/ | Step 7 | M |
 | 10. Agent instructions | agents/OOMPA.md, LOOMPA.md | Step 9 | M |
-| 11. Level 2 planner | agents/CHARLIE.md, validation | Step 10 | L |
+| 11. Level 2 planner | agents/CHARLIE.md, validation | Step 10 | L ✓ Phase 9 |
 
 ---
 
