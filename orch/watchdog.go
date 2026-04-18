@@ -242,12 +242,18 @@ func (w *Watchdog) Run(ctx context.Context) {
 // Per-worker infrastructure errors (IsAlive/GetTask) are accumulated via
 // errors.Join and returned at end-of-tick so Run can surface them; other
 // workers in the same tick are still checked.
+//
+// BVV-S-10 enforcement: the watchdog body issues zero direct task-status
+// Store mutations — only ListWorkers / GetTask reads, EventLog emits, and
+// HandoffState increments. The single indirect mutation path is
+// pool.RestartSession → SpawnSession, which writes StatusInProgress. That
+// write is guarded at the call site by AssertTerminalIrreversibility in
+// SpawnSession (see session.go), so any race where the dispatcher
+// transitioned the task to terminal between the Terminal() check above
+// and the SpawnSession UpdateTask is caught at the mutation point. A
+// snapshot-diff approach over the entire tick would race with legitimate
+// concurrent dispatcher transitions and produce false positives.
 func (w *Watchdog) CheckOnce() error {
-	// BVV-S-10: snapshot task statuses at entry so the exit check can assert
-	// the watchdog never mutated them.
-	branchLabel := LabelBranch + ":" + w.branch
-	before := snapshotBranchTasks(w.store, branchLabel)
-
 	workers, err := w.store.ListWorkers()
 	if err != nil {
 		return fmt.Errorf("watchdog: list workers: %w", err)
@@ -349,9 +355,6 @@ func (w *Watchdog) CheckOnce() error {
 			tickErrs = append(tickErrs, fmt.Errorf("restart %s (task %s): %w", worker.Name, task.ID, err))
 		}
 	}
-
-	// BVV-S-10: verify the watchdog tick did not change any task status.
-	AssertWatchdogNoStatusChange(before, snapshotBranchTasks(w.store, branchLabel))
 
 	return errors.Join(tickErrs...)
 }

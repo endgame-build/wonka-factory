@@ -563,12 +563,17 @@ Runtime assertions (build tag `verify`) that panic with requirement IDs. All 9 l
 | `AssertZeroContentInspection` | BVV-S-05 | dispatch (before test-mode/SpawnSession split) | Routing uses only task metadata |
 | `AssertBoundedDegradation` | BVV-S-07 | **(test-only)** | Gap count never exceeds tolerance |
 | `AssertWorkerConservation` | WC | `WorkerPool.Allocate` + `Release` (via `guardWorkerConservation`) + once per Tick | idle + active <= maxWorkers |
-| `AssertWatchdogNoStatusChange` | BVV-S-10 | `Watchdog.CheckOnce` entry/exit snapshots | Watchdog never changes task status |
+| `AssertWatchdogNoStatusChange` | BVV-S-10 | **(test-only — see note)** | Watchdog never changes task status |
 | `AssertLifecycleReleaseDrained` | BVV-ERR-10a | `Engine.runLoop` lock release | No active workers at voluntary lock release |
 
 Internal helpers (unexported):
 - `guardWorkerConservation(store, max)` — loads workers and calls `AssertWorkerConservation`; used where the caller doesn't already have a workers slice. No-op in non-verify builds (zero I/O).
-- `snapshotBranchTasks(store, branchLabel)` — snapshot helper for the BVV-S-10 before/after comparison. No-op in non-verify builds.
+
+**BVV-S-10 enforcement note.** The original wiring (entry/exit snapshots in `Watchdog.CheckOnce`) raced with the dispatch goroutine: any legitimate dispatcher transition during a 30s tick would falsely panic. Production enforcement is now twofold:
+1. **Structural** — `Watchdog.CheckOnce` issues zero direct task-mutation `Store` calls (only `ListWorkers` / `GetTask` reads, `EventLog` emits, `HandoffState` increments). Easily auditable: `grep -E 'w\.store\.(Update|Create|Assign)' orch/watchdog.go` returns empty.
+2. **Dynamic backstop** — the only indirect task write the watchdog can cause is `pool.RestartSession → SpawnSession`'s `UpdateTask(StatusInProgress)`. `SpawnSession` calls `AssertTerminalIrreversibility(task.Status, StatusInProgress)` immediately before that write, catching any race where the dispatcher transitioned the task to terminal between the watchdog's `Terminal()` check and the SpawnSession write.
+
+`AssertWatchdogNoStatusChange` itself remains correct as a snapshot-diff and is exercised by `TestBVV_S10_WatchdogNoStatusChange` in a controlled, single-writer setup; the watchdog→dispatcher race scenario is covered by `TestBVV_S10_SpawnSessionTerminalRace`.
 
 ---
 

@@ -126,9 +126,17 @@ func AssertWorkerConservation(workers []*Worker, maxWorkers int) {
 // before and after snapshots. BVV-S-10: the watchdog must never mutate task
 // status — it emits events and manipulates HandoffState only.
 //
-// Call at the end of watchdog.check() with snapshots taken at entry and
-// exit. Tasks that appear in one snapshot but not the other are ignored
-// (new tasks may have been created by the dispatcher between snapshots).
+// Single-threaded helper: this is a snapshot-diff that attributes ANY
+// observed status change to the caller. It is unsafe to use across a
+// window in which a concurrent writer (e.g. the dispatch goroutine)
+// might legitimately transition tasks — false positives are guaranteed
+// in that case. In production, BVV-S-10 is enforced structurally inside
+// Watchdog.CheckOnce (no direct task-status Store calls in the watchdog
+// body) and dynamically by AssertTerminalIrreversibility inside
+// SpawnSession (which catches any race where the dispatcher transitioned
+// the task to terminal between the watchdog's Terminal() check and the
+// indirect StatusInProgress write). This function is retained for spec
+// tests that exercise the property in a controlled, single-writer setup.
 func AssertWatchdogNoStatusChange(before, after []*Task) {
 	statusMap := make(map[string]TaskStatus, len(before))
 	for _, t := range before {
@@ -139,16 +147,6 @@ func AssertWatchdogNoStatusChange(before, after []*Task) {
 			panic(fmt.Sprintf("[BVV-S-10] watchdog changed task %q status from %q to %q", t.ID, prev, t.Status))
 		}
 	}
-}
-
-// snapshotBranchTasks returns all tasks for a branch label, used to capture
-// task status for BVV-S-10 before/after comparison in the watchdog tick.
-func snapshotBranchTasks(store Store, branchLabel string) []*Task {
-	tasks, err := store.ListTasks(branchLabel)
-	if err != nil {
-		return nil // store error — skip the check rather than panic on infra failure
-	}
-	return tasks
 }
 
 // guardWorkerConservation loads workers from the store and asserts WC. It

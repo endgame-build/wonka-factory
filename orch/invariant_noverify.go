@@ -14,5 +14,4 @@ func AssertLifecycleReleaseDrained(_ Store)               {}
 func AssertZeroContentInspection(_ *Task, _ string)       {}
 func AssertWorkerConservation(_ []*Worker, _ int)         {}
 func AssertWatchdogNoStatusChange(_, _ []*Task)           {}
-func snapshotBranchTasks(_ Store, _ string) []*Task       { return nil }
 func guardWorkerConservation(_ Store, _ int)              {}
