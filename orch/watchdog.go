@@ -242,6 +242,17 @@ func (w *Watchdog) Run(ctx context.Context) {
 // Per-worker infrastructure errors (IsAlive/GetTask) are accumulated via
 // errors.Join and returned at end-of-tick so Run can surface them; other
 // workers in the same tick are still checked.
+//
+// BVV-S-10 enforcement: the watchdog body issues zero direct task-status
+// Store mutations — only ListWorkers / GetTask reads, EventLog emits, and
+// HandoffState increments. The single indirect mutation path is
+// pool.RestartSession → SpawnSession, which writes StatusInProgress. That
+// write is guarded at the call site by AssertTerminalIrreversibility in
+// SpawnSession (see session.go), so any race where the dispatcher
+// transitioned the task to terminal between the Terminal() check above
+// and the SpawnSession UpdateTask is caught at the mutation point. A
+// snapshot-diff approach over the entire tick would race with legitimate
+// concurrent dispatcher transitions and produce false positives.
 func (w *Watchdog) CheckOnce() error {
 	workers, err := w.store.ListWorkers()
 	if err != nil {

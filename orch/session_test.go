@@ -284,6 +284,43 @@ func TestBVV_DSP05_SpawnSessionNilPresetError(t *testing.T) {
 	assert.Contains(t, err.Error(), "nil preset")
 }
 
+// TestBVV_S10_SpawnSessionTerminalRace verifies the BVV-S-10 dynamic
+// backstop in SpawnSession: AssertTerminalIrreversibility panics if the
+// task's status is terminal at the moment of the StatusInProgress write.
+//
+// Scenario modelled: the watchdog reads task.Status as in_progress at
+// watchdog.go:280, then the dispatcher transitions the task to completed
+// before the watchdog's pool.RestartSession → pool.SpawnSession reaches
+// step 7. Without the backstop, SpawnSession would silently reverse the
+// terminal status with StatusInProgress (BVV-S-02 violation). With the
+// backstop, the panic surfaces the race instead. This is the production
+// enforcement that replaced the racy entry/exit snapshot in
+// Watchdog.CheckOnce — see invariant.go AssertWatchdogNoStatusChange
+// godoc for context.
+func TestBVV_S10_SpawnSessionTerminalRace(t *testing.T) {
+	pool, store, _ := newTestSessionPool(t)
+
+	// Plant a worker and a task whose store status is already terminal
+	// (simulating the race outcome where the dispatcher won).
+	require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w-01", Status: orch.WorkerIdle}))
+	task := &orch.Task{
+		ID:     "task-terminal-race",
+		Status: orch.StatusCompleted,
+		Labels: map[string]string{
+			orch.LabelRole:   "builder",
+			orch.LabelBranch: "feature-x",
+		},
+	}
+	require.NoError(t, store.CreateTask(task))
+
+	roleCfg := mockRoleConfig(t, "ok.sh")
+	assert.PanicsWithValue(t,
+		"[BVV-S-02] terminal irreversibility violated: completed → in_progress",
+		func() { _ = pool.SpawnSession("w-01", task, roleCfg, "feature-x") },
+		"SpawnSession must panic before reversing a terminal status with StatusInProgress",
+	)
+}
+
 // TestBVV_ERR11_RestartSessionReplacesExisting verifies the watchdog
 // happy-path: an existing session is killed and a new one takes its place.
 // Task assignment is unchanged (CTY-06). The HandoffState counter is NOT

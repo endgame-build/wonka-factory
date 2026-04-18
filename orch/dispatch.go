@@ -495,6 +495,11 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 			continue
 		}
 
+		// BVV-S-05: verify routing was metadata-derived. Runs for both
+		// test-mode and production paths so regressions can't sneak in via
+		// a test-only bypass.
+		AssertZeroContentInspection(task, role)
+
 		if d.testMode {
 			// Test mode: transition task to in_progress and worker to active
 			// without tmux. The test SpawnFunc handles the "session".
@@ -617,11 +622,20 @@ func (d *Dispatcher) checkTermination() bool {
 
 // --- Tick and Run ---
 
-// Tick executes one dispatch cycle: drain outcomes, handle orphans, dispatch
-// ready tasks, check termination, refresh lock.
+// Tick executes one dispatch cycle in 6 numbered steps:
+//  1. PROCESS OUTCOMES   — drain completed agent outcomes from the channel.
+//  2. HANDLE ORPHANS     — recover CB-tripped + stuck tasks (BVV-ERR-11a).
+//  3. CHECK ABORT        — if the lifecycle aborted, exit with GapAbort.
+//  4. DISPATCH           — assign ready tasks to idle workers (BVV-DSP-01/02).
+//  5. CHECK TERMINATION  — if all tasks terminal and no workers active, done.
+//  6. LOCK REFRESH       — refresh the per-branch lifecycle lock (BVV-S-01).
 func (d *Dispatcher) Tick(ctx context.Context) DispatchResult {
 	// 1. Process completed agent outcomes.
 	d.Drain(ctx)
+
+	// WC invariant — tick-boundary check complements the pool-mutation
+	// guards in WorkerPool.Allocate/Release.
+	guardWorkerConservation(d.store, d.pool.MaxWorkers())
 
 	// 2. Handle CB-tripped orphans.
 	orphans := d.orphanCk()

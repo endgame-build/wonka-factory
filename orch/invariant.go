@@ -78,3 +78,83 @@ func AssertLifecycleReleaseDrained(store Store) {
 		panic(fmt.Sprintf("[BVV-ERR-10a] release with active workers: %v", busy))
 	}
 }
+
+// AssertZeroContentInspection panics if the role used to dispatch a task was
+// not derived from its labels. BVV-S-05: routing uses task metadata only —
+// the orchestrator never inspects task.Body (agent-owned) for routing.
+//
+// Called immediately before SpawnSession. The check is a tautology for
+// correct callers — it compares the resolved role against task.Role(), which
+// reads from Labels. The value of the guard is that any regression that
+// resolves a role from task.Body or another content source will produce a
+// (resolvedRole != task.Role()) mismatch and panic. The second check
+// (resolvedRole != "") catches callers that dispatch without a real role
+// decision (e.g. defaulting instead of escalating on unknown role per
+// BVV-DSP-03a).
+func AssertZeroContentInspection(task *Task, resolvedRole string) {
+	if task == nil {
+		panic("[BVV-S-05] zero content inspection: nil task")
+	}
+	if resolvedRole == "" {
+		panic(fmt.Sprintf("[BVV-S-05] zero content inspection: empty role for task %q (label path bypassed)", task.ID))
+	}
+	if got := task.Role(); got != resolvedRole {
+		panic(fmt.Sprintf("[BVV-S-05] zero content inspection: task %q routed as %q but label role is %q", task.ID, resolvedRole, got))
+	}
+}
+
+// AssertWorkerConservation panics if idle + active exceeds maxWorkers.
+// Ported from the fork: the TLA+ model showed double-decrement races
+// between watchdog and dispatch can corrupt pool accounting.
+func AssertWorkerConservation(workers []*Worker, maxWorkers int) {
+	idle, active := 0, 0
+	for _, w := range workers {
+		switch w.Status {
+		case WorkerIdle:
+			idle++
+		case WorkerActive:
+			active++
+		}
+	}
+	total := idle + active
+	if total > maxWorkers {
+		panic(fmt.Sprintf("[WC] worker count %d (idle=%d, active=%d) exceeds max %d", total, idle, active, maxWorkers))
+	}
+}
+
+// AssertWatchdogNoStatusChange panics if any task's status differs between
+// before and after snapshots. BVV-S-10: the watchdog must never mutate task
+// status — it emits events and manipulates HandoffState only.
+//
+// Single-threaded helper: this is a snapshot-diff that attributes ANY
+// observed status change to the caller. It is unsafe to use across a
+// window in which a concurrent writer (e.g. the dispatch goroutine)
+// might legitimately transition tasks — false positives are guaranteed
+// in that case. In production, BVV-S-10 is enforced structurally inside
+// Watchdog.CheckOnce (no direct task-status Store calls in the watchdog
+// body) and dynamically by AssertTerminalIrreversibility inside
+// SpawnSession (which catches any race where the dispatcher transitioned
+// the task to terminal between the watchdog's Terminal() check and the
+// indirect StatusInProgress write). This function is retained for spec
+// tests that exercise the property in a controlled, single-writer setup.
+func AssertWatchdogNoStatusChange(before, after []*Task) {
+	statusMap := make(map[string]TaskStatus, len(before))
+	for _, t := range before {
+		statusMap[t.ID] = t.Status
+	}
+	for _, t := range after {
+		if prev, ok := statusMap[t.ID]; ok && prev != t.Status {
+			panic(fmt.Sprintf("[BVV-S-10] watchdog changed task %q status from %q to %q", t.ID, prev, t.Status))
+		}
+	}
+}
+
+// guardWorkerConservation loads workers from the store and asserts WC. It
+// exists so call sites outside the pool that don't already have a workers
+// slice (dispatch Tick, WorkerPool.Release) incur zero I/O in non-verify
+// builds — the noverify stub does nothing.
+func guardWorkerConservation(store Store, maxWorkers int) {
+	if workers, err := store.ListWorkers(); err == nil {
+		AssertWorkerConservation(workers, maxWorkers)
+	}
+}
