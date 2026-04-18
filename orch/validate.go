@@ -25,10 +25,17 @@ const (
 	ReqTG10 = "BVV-TG-10" // every non-escalation task is reachable from the plan task
 )
 
-// AllTGRequirements enumerates every recognised BVV-TG-* requirement ID.
+// ReqTG00 tags orchestrator operational failures during graph validation
+// (e.g. store read errors) — not a spec requirement, so excluded from
+// AllTGRequirements. Matches the BVV-TG-NN shape pinned by
+// TestValidate_GraphValidationErrorFormat so it parses consistently alongside
+// real spec violations on the abort-reason field.
+const ReqTG00 = "BVV-TG-00"
+
+// AllTGRequirements enumerates every spec-defined BVV-TG-* requirement ID.
 // Tests iterate this to pin the closed set; adding a new requirement
 // without updating this slice yields a test failure at the TGRequirement
-// boundary rather than a silent drift.
+// boundary rather than a silent drift. ReqTG00 is intentionally excluded.
 var AllTGRequirements = []TGRequirement{ReqTG07, ReqTG08, ReqTG09, ReqTG10}
 
 // GraphValidationError reports a BVV-TG-07..10 violation discovered by

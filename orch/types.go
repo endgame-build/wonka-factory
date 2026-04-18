@@ -120,9 +120,14 @@ const (
 	RoleEscalation = "escalation"
 )
 
-// AllRoles enumerates every Role value the orchestrator recognises. Used
-// by validators to enforce the closed set (TG-07) and by test helpers to
-// iterate roles without coupling to their spellings.
+// AllRoles enumerates every Role value the orchestrator recognises. It is
+// the canonical list for tests and for any code that needs to iterate roles
+// without coupling to their spellings.
+//
+// Note: TG-07 role-map validation in ValidateLifecycleGraph checks task
+// role labels against the *configured* LifecycleConfig.Roles map — not this
+// list — because the configured subset is tighter (a spec-known role that
+// the operator hasn't wired up is still a malformed graph).
 var AllRoles = []Role{
 	RolePlanner,
 	RoleBuilder,
@@ -239,8 +244,9 @@ type LifecycleConfig struct {
 	// task and aborts the lifecycle. When false, validation is skipped entirely
 	// (Level 1 compatibility: pre-populated ledgers without a planner task).
 	//
-	// Zero value is false. The CLI's BuildEngineConfig sets this to true by
-	// default via `--no-validate-graph=false`, so Level 2 operators get
+	// Zero value is false. The CLI's BuildEngineConfig wires this as
+	// `!flags.NoValidateGraph`, so the field is true by default (the
+	// `--no-validate-graph` flag defaults to false) — Level 2 operators get
 	// validation without explicit opt-in. Direct library consumers constructing
 	// LifecycleConfig{} literals must set this explicitly for Level 2 behavior
 	// (see docs/BVV_PHASE_9_PLAN.md for the rationale behind the default).

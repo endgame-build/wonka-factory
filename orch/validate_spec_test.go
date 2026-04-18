@@ -299,7 +299,7 @@ func TestAllTGRequirements(t *testing.T) {
 
 // TestValidate_GraphValidationErrorFormat verifies the Error() string carries
 // both the requirement ID and the offending task IDs — operators grep audit
-// trails for [BVV-TG-* patterns, so format stability matters.
+// trails for BVV-TG-* patterns, so format stability matters.
 func TestValidate_GraphValidationErrorFormat(t *testing.T) {
 	ve := &orch.GraphValidationError{
 		Requirement: orch.ReqTG09,

@@ -460,15 +460,19 @@ func (e *Engine) onPlannerCompleted(task *Task) {
 	var ve *GraphValidationError
 	if !errors.As(err, &ve) {
 		// Non-validator error (e.g. store scan failure) — synthesize a
-		// GraphValidationError so downstream handling is uniform. "BVV-TG"
-		// (un-numbered) flags the category without implying a specific
-		// requirement since we can't attribute the failure to one.
-		ve = &GraphValidationError{Requirement: TGRequirement("BVV-TG"), Reason: err.Error()}
+		// GraphValidationError so downstream handling is uniform. Use the
+		// reserved ReqTG00 ("BVV-TG-00") so the abort reason still matches
+		// the BVV-TG-NN shape operator tooling greps for, while staying
+		// distinct from spec-defined TG-07..10 violations.
+		ve = &GraphValidationError{Requirement: ReqTG00, Reason: err.Error()}
 	}
 	escErr := e.createGraphInvalidEscalation(task, ve)
-	detail := fmt.Sprintf("requirement=%s reason=%q tasks=%v", ve.Requirement, ve.Reason, ve.TaskIDs)
+	// Stable key=value encoding for log scrapers: %q on strings.Join avoids
+	// the bracketed `[a b]` shape that %v prints for slices.
+	detail := fmt.Sprintf("requirement=%s reason=%q tasks=%q",
+		ve.Requirement, ve.Reason, strings.Join(ve.TaskIDs, ","))
 	if escErr != nil {
-		detail += fmt.Sprintf(" escalation_creation_failed=%v", escErr)
+		detail += fmt.Sprintf(" escalation_creation_failed=%q", escErr.Error())
 		fmt.Fprintf(os.Stderr, "warning: create graph-invalid escalation for %s: %v\n", task.ID, escErr)
 	}
 	if emitErr := emitAndNotify(e.log, e.cfg.Progress, Event{

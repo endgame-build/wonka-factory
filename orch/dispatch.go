@@ -209,10 +209,13 @@ func (d *Dispatcher) setAbortReason(reason string) {
 	}
 }
 
-// AbortReason returns the reason passed to AbortLifecycle, or empty if the
-// dispatcher aborted via the gap-tolerance path (BVV-ERR-04) which sets the
-// flag directly. Emitted on the terminal lifecycle_completed anchor so an
+// AbortReason returns the stored abort reason when one was recorded by
+// AbortLifecycle or handleTerminalFailure, or empty if no reason was
+// captured. Emitted on the terminal lifecycle_completed anchor so an
 // operator can distinguish abort causes without timestamp correlation.
+// emitLifecycleCompleted treats an empty string as "no specific reason
+// recorded" and falls back to the historical "gap_tolerance_exceeded"
+// default, so the empty-string semantics are load-bearing.
 func (d *Dispatcher) AbortReason() string {
 	return d.abortReason
 }

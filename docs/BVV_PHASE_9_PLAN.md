@@ -32,7 +32,7 @@ These are NOT new Phase 9 work items — they're already-shipped issues discover
 5. **Event-log kinds** — Add `EventGraphValidated` and `EventGraphInvalid` to `eventlog.go` (bumps the canonical set from 17 to 19; update `AllEventKinds` and any tests that assert the cardinality).
 6. **Runtime invariants (P2)** — Add `AssertPostPlannerWellFormed` in `invariant.go`, called from the engine hook under build tag `verify`.
 7. **`orch/validate_spec_test.go`** — Unit tests per BVV-TG-* (07, 08, 09, 10, and negatives for 05, 11, 12).
-8. **Skip semantics** — Validation is a no-op when (a) `ValidateGraph=false`, or (b) the branch has zero `role:planner` tasks (legitimate Level 1 pre-populated ledger). Codify in `ValidateLifecycleGraph`: return `nil` early in these cases and log the skip via an event.
+8. **Skip semantics** — Validation is a no-op when (a) `ValidateGraph=false`, or (b) the branch has zero `role:planner` tasks (legitimate Level 1 pre-populated ledger). Codify in `ValidateLifecycleGraph`: return `nil` early in these cases. The skip is silent (no `EventGraphSkipped` event) — it is the expected Level 1 path, not an anomaly worth burning an audit-trail anchor on.
 9. **Multi-planner guard** — Reject branches with >1 `role:planner` task (TG-10 "the plan task" is singular). Covered in the TG-10 reachability check.
 10. **Mock planner + work-package fixture** — `orch/testdata/mock-agents/planner.sh` + `orch/testdata/work-packages/example/` (minimal functional/technical/vv specs). Deterministic E2E testing without a real LLM.
 11. **`TestE2E_PlannerThenDispatch`** in `engine_e2e_test.go` — Seeds one plan task, runs engine, asserts build→verify→gate ordering and final completion state.
