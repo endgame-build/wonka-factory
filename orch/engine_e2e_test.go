@@ -593,6 +593,16 @@ func TestE2E_PlannerGraphInvalid(t *testing.T) {
 	assert.Contains(t, esc.Title, "BVV-TG-09",
 		"escalation title must name the failed requirement so operators grep-classify")
 
+	// Happy-path escalation creation: the graph_invalid event's Detail
+	// must NOT carry escalation_creation_failed (that field only appears
+	// when the store rejects the CreateTask — silent-failure audit I-3).
+	for _, ev := range readEvents(t, logPath) {
+		if ev.Kind == orch.EventGraphInvalid && ev.TaskID == "plan-1" {
+			assert.NotContains(t, ev.Detail, "escalation_creation_failed",
+				"happy-path escalation creation must leave Detail clean")
+		}
+	}
+
 	// Planner completed (store write persisted before hook fired), but no
 	// build/verify/gate tasks should have dispatched — the abort blocks
 	// further dispatch via abortCleanup's status=Blocked sweep.
@@ -706,4 +716,259 @@ func malformedGraphNoGate() []seededTask {
 		{id: "build-1", role: "builder", criticality: orch.NonCritical, dependsOn: "plan-1"},
 		{id: "verify-1", role: "verifier", criticality: orch.NonCritical, dependsOn: "build-1"},
 	}
+}
+
+// --- Engine-level crash-replay tests (BVV-TG-07..10 crash resilience) ---
+//
+// These tests stage ledger + event log state simulating a crash mid-way
+// through post-planner validation, then verify Engine.Resume closes the
+// window by re-firing the hook. Without these, the crash-resilience claim
+// is only verified at the reconcile-reader layer (TestReconcile_Graph*).
+//
+// None of these tests write a lock file: Engine.Resume's initForResume
+// tolerates a missing lock (treats it as fresh-resume; keeps cfg.RunID),
+// which keeps the scaffolding focused on the replay path. BVV-ERR-08
+// lock-recovery behavior is covered by separate tests.
+
+// seedCompletedPlannerWithGraph populates the ledger with a completed
+// planner task plus the downstream graph, simulating the state where the
+// planner succeeded (store write persisted) but the validation hook never
+// ran. Delegates to prepopulateLedger for task creation, then re-opens
+// the store to wire dependency edges (AddDep can't be issued through
+// prepopulateLedger's close-after-create contract).
+func seedCompletedPlannerWithGraph(t *testing.T, runDir, branch string, graph []seededTask) {
+	t.Helper()
+	tasks := make([]*orch.Task, 0, len(graph)+1)
+	tasks = append(tasks, &orch.Task{
+		ID: "plan-1", Title: "plan", Status: orch.StatusCompleted,
+		Labels: map[string]string{
+			orch.LabelBranch:      branch,
+			orch.LabelRole:        "planner",
+			orch.LabelCriticality: string(orch.NonCritical),
+		},
+	})
+	for _, s := range graph {
+		tasks = append(tasks, &orch.Task{
+			ID: s.id, Status: orch.StatusOpen,
+			Labels: map[string]string{
+				orch.LabelBranch:      branch,
+				orch.LabelRole:        s.role,
+				orch.LabelCriticality: string(s.criticality),
+			},
+		})
+	}
+	prepopulateLedger(t, runDir, tasks...)
+
+	store, _, err := orch.NewStore("", filepath.Join(runDir, "ledger"))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, store.Close()) }()
+	for _, s := range graph {
+		require.NoError(t, store.AddDep(s.id, s.dependsOn))
+	}
+}
+
+// TestE2E_ResumeReplaysGraphValidation verifies the crash-replay path:
+// when the ledger shows a completed planner task but the event log has no
+// graph_validated / graph_invalid anchor, Engine.Resume must re-fire the
+// validation hook and emit the missing anchor. This pins the BVV-TG-07..10
+// crash-resilience claim at the engine level — reconcile-layer tests only
+// verify the input data, not the engine's consumption of it.
+func TestE2E_ResumeReplaysGraphValidation(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat/replay-valid"
+	runID := "e2e-replay-v"
+
+	// Pre-crash state: planner completed, downstream graph wired, no
+	// graph_* anchor in the event log.
+	seedCompletedPlannerWithGraph(t, runDir, branch, wellFormedGraph())
+	writeEvents(t, filepath.Join(runDir, "events.jsonl"), []orch.Event{
+		{Kind: orch.EventLifecycleStarted, Summary: "prior run"},
+		{Kind: orch.EventTaskCompleted, TaskID: "plan-1"},
+		// No graph_validated / graph_invalid — the crash is here.
+	})
+
+	lifecycle := testutil.MockLifecycleConfig(branch, "planner", "builder", "verifier", "gate")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Millisecond // stale → recoverable
+	lifecycle.Lock.RetryCount = 0
+	lifecycle.ValidateGraph = true
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = runID
+	cfg.MaxWorkers = 2
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err = e.Resume(ctx)
+	assert.NoError(t, err, "resume with well-formed latent graph should complete")
+
+	logPath := filepath.Join(runDir, "events.jsonl")
+	// Replay must emit graph_validated for plan-1, and the rest of the
+	// lifecycle must proceed to completion.
+	assertEventKinds(t, logPath,
+		orch.EventGraphValidated,
+		orch.EventLifecycleCompleted,
+	)
+
+	// Invariant from Issue 1: the new (post-resume) lifecycle_started anchor
+	// must precede the replayed graph_validated. Prior to the reorder fix,
+	// graph_validated could land BEFORE the new lifecycle_started, producing
+	// an audit trail where mutation events fall outside any lifecycle.
+	validateEventSequence(t, logPath, []orch.EventKind{
+		orch.EventLifecycleStarted, // prior run's anchor
+		orch.EventTaskCompleted,    // prior plan-1 completion
+		orch.EventLifecycleStarted, // this run's anchor (the Resume)
+		orch.EventGraphValidated,   // replay fires AFTER the new lifecycle_started
+	})
+}
+
+// TestE2E_ResumeSkipsReplayWhenAnchorPresent verifies that when the event
+// log already contains graph_validated for the completed planner, the
+// replay path skips re-validation (no duplicate emission, no redundant
+// Store scan). Pins the GraphValidationSeen idempotency guard.
+func TestE2E_ResumeSkipsReplayWhenAnchorPresent(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat/replay-skip"
+	runID := "e2e-replay-s"
+
+	seedCompletedPlannerWithGraph(t, runDir, branch, wellFormedGraph())
+	writeEvents(t, filepath.Join(runDir, "events.jsonl"), []orch.Event{
+		{Kind: orch.EventLifecycleStarted, Summary: "prior run"},
+		{Kind: orch.EventTaskCompleted, TaskID: "plan-1"},
+		{Kind: orch.EventGraphValidated, TaskID: "plan-1"}, // already validated
+	})
+
+	lifecycle := testutil.MockLifecycleConfig(branch, "planner", "builder", "verifier", "gate")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Millisecond
+	lifecycle.Lock.RetryCount = 0
+	lifecycle.ValidateGraph = true
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = runID
+	cfg.MaxWorkers = 2
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err = e.Resume(ctx)
+	assert.NoError(t, err)
+
+	// Count graph_validated events — should be exactly ONE (the pre-existing
+	// one from the prior run). Replay must not re-emit.
+	events := readEvents(t, filepath.Join(runDir, "events.jsonl"))
+	validated := 0
+	for _, ev := range events {
+		if ev.Kind == orch.EventGraphValidated && ev.TaskID == "plan-1" {
+			validated++
+		}
+	}
+	assert.Equal(t, 1, validated, "replay must skip when graph_validated already present")
+}
+
+// TestE2E_ResumeReplayGraphInvalidAbortOrdering verifies both Issue 1
+// (event ordering: lifecycle_started before graph_invalid) and Issue 3
+// (abort reason plumbing: reason=graph_invalid:BVV-TG-09 lands on the
+// terminal anchor). The ledger simulates a planner that completed with a
+// malformed graph, crashed before the validator fired, then is Resumed.
+func TestE2E_ResumeReplayGraphInvalidAbortOrdering(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat/replay-invalid"
+	runID := "e2e-replay-i"
+
+	// Malformed graph in the ledger (no gate → BVV-TG-09 violation).
+	seedCompletedPlannerWithGraph(t, runDir, branch, malformedGraphNoGate())
+	writeEvents(t, filepath.Join(runDir, "events.jsonl"), []orch.Event{
+		{Kind: orch.EventLifecycleStarted, Summary: "prior run"},
+		{Kind: orch.EventTaskCompleted, TaskID: "plan-1"},
+	})
+
+	lifecycle := testutil.MockLifecycleConfig(branch, "planner", "builder", "verifier", "gate")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Millisecond
+	lifecycle.Lock.RetryCount = 0
+	lifecycle.ValidateGraph = true
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = runID
+	cfg.MaxWorkers = 2
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err = e.Resume(ctx)
+	assert.ErrorIs(t, err, orch.ErrLifecycleAborted,
+		"malformed-graph replay must abort the lifecycle")
+
+	logPath := filepath.Join(runDir, "events.jsonl")
+
+	// Issue 1 invariant: this run's lifecycle_started must precede the
+	// replayed graph_invalid. validateEventSequence does subsequence matching,
+	// so we walk the log and find the indices explicitly to pin ordering.
+	// Pin the ordering: the SECOND lifecycle_started (the one emitted by
+	// this Resume — the first came from the pre-staged prior-run log) must
+	// precede the graph_invalid event emitted by replayPlannerValidation.
+	// Counting occurrences instead of using index arithmetic keeps the test
+	// robust against changes to the pre-staged fixture's event count.
+	events := readEvents(t, logPath)
+	var startIdx, invalidIdx = -1, -1
+	lifecycleStartedCount := 0
+	for i, ev := range events {
+		if ev.Kind == orch.EventLifecycleStarted {
+			lifecycleStartedCount++
+			if lifecycleStartedCount == 2 {
+				startIdx = i
+			}
+		}
+		if ev.Kind == orch.EventGraphInvalid && ev.TaskID == "plan-1" {
+			invalidIdx = i
+			break
+		}
+	}
+	require.GreaterOrEqual(t, startIdx, 0, "post-resume lifecycle_started must exist")
+	require.GreaterOrEqual(t, invalidIdx, 0, "graph_invalid must be emitted by replay")
+	assert.Less(t, startIdx, invalidIdx,
+		"BVV-TG-07..10: post-resume lifecycle_started MUST precede replayed graph_invalid (audit trail integrity)")
+
+	// Issue 3 invariant: the terminal lifecycle_completed anchor must carry
+	// the machine-parseable abort reason identifying the graph-invalid
+	// requirement — NOT the default "gap_tolerance_exceeded".
+	var terminalDetail string
+	for _, ev := range events {
+		if ev.Kind == orch.EventLifecycleCompleted {
+			terminalDetail = ev.Detail
+		}
+	}
+	assert.Contains(t, terminalDetail, "graph_invalid:BVV-TG-09",
+		"terminal anchor must carry the specific abort reason, not 'gap_tolerance_exceeded'")
+	assert.NotContains(t, terminalDetail, "gap_tolerance_exceeded",
+		"abort reason must not fall through to the gap-tolerance default for graph-invalid aborts")
+
+	// Escalation task must exist (replay created it).
+	ledgerDir := filepath.Join(runDir, "ledger")
+	store, _, err := orch.NewStore("", ledgerDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	esc, err := store.GetTask("escalation-graph-plan-1")
+	require.NoError(t, err, "replay must create the graph-invalid escalation")
+	assert.Contains(t, esc.Title, "BVV-TG-09")
 }

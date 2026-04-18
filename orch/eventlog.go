@@ -30,17 +30,28 @@ const (
 	EventGateFailed          EventKind = "gate_failed"
 	EventEscalationResolved  EventKind = "escalation_resolved"
 	EventHandoffLimitReached EventKind = "handoff_limit_reached"
-	// EventGraphValidated is emitted when ValidateLifecycleGraph succeeds after
-	// a role:planner task completes. BVV-TG-07..10.
+	// EventGraphValidated is emitted when ValidateLifecycleGraph succeeds
+	// after a role:planner task completes (BVV-TG-07..10). Also serves as
+	// a replay-detection anchor: Engine.Resume scans the event log for
+	// this kind (see resume.go:recoverFromEventLog) to detect completed
+	// planner tasks whose validation hook never fired, then re-fires the
+	// hook on the next Resume. Absence of this anchor for a completed
+	// planner task is the signal, not a bug.
 	EventGraphValidated EventKind = "graph_validated"
 	// EventGraphInvalid is emitted when ValidateLifecycleGraph rejects the
 	// task graph after a role:planner task completes. Accompanied by an
-	// escalation task and lifecycle abort. BVV-TG-07..10.
+	// escalation task (escalation-graph-<plan-id>) and lifecycle abort.
+	// Like EventGraphValidated, also functions as a replay anchor so a
+	// crash-after-rejection doesn't silently re-validate on next Resume.
+	// BVV-TG-07..10.
 	EventGraphInvalid EventKind = "graph_invalid"
 )
 
-// AllEventKinds is the canonical set of BVV event kinds, used by tests
-// to verify completeness against spec §10.3.
+// AllEventKinds is the canonical set of BVV event kinds — spec §10.3's
+// 17 kinds plus the two BVV-TG-07..10 replay anchors (graph_validated,
+// graph_invalid). Tests iterate this slice to verify completeness and
+// distinctness; any new EventKind added to the const block above MUST
+// be appended here or TestEventKinds_Count catches the drift.
 var AllEventKinds = []EventKind{
 	EventTaskDispatched, EventTaskCompleted, EventTaskFailed, EventTaskRetried,
 	EventTaskBlocked, EventTaskHandoff, EventWorkerSpawned, EventWorkerReleased,

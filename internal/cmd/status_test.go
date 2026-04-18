@@ -171,7 +171,7 @@ func TestStatusCmd_JSONOutput(t *testing.T) {
 	require.Len(t, got, 2)
 
 	byID := map[string]*orch.Task{got[0].ID: got[0], got[1].ID: got[1]}
-	assert.Equal(t, "builder", byID["issue-1"].Role())
+	assert.Equal(t, orch.Role("builder"), byID["issue-1"].Role())
 	assert.Equal(t, orch.StatusInProgress, byID["issue-2"].Status)
 	assert.Equal(t, "worker-1", byID["issue-2"].Assignee)
 }

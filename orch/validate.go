@@ -6,14 +6,39 @@ import (
 	"strings"
 )
 
+// TGRequirement names a specific BVV-TG-* requirement reported by
+// ValidateLifecycleGraph. A typed value (rather than a free-form string)
+// gives us compile-time protection against typos in call sites and lets
+// downstream code switch exhaustively over the closed set.
+//
+// Constants are declared untyped below so they remain assignable to both
+// TGRequirement-typed fields and string contexts (e.g. fmt.Sprintf with
+// %s). The underlying type is string and %s formatting renders the
+// requirement ID verbatim in audit-trail events and error messages.
+type TGRequirement string
+
+// TG-07..10 requirement IDs from BVV spec §7.5.
+const (
+	ReqTG07 = "BVV-TG-07" // every non-escalation task carries a configured role
+	ReqTG08 = "BVV-TG-08" // task graph is acyclic
+	ReqTG09 = "BVV-TG-09" // exactly one role:gate task depends on every role:verifier task
+	ReqTG10 = "BVV-TG-10" // every non-escalation task is reachable from the plan task
+)
+
+// AllTGRequirements enumerates every recognised BVV-TG-* requirement ID.
+// Tests iterate this to pin the closed set; adding a new requirement
+// without updating this slice yields a test failure at the TGRequirement
+// boundary rather than a silent drift.
+var AllTGRequirements = []TGRequirement{ReqTG07, ReqTG08, ReqTG09, ReqTG10}
+
 // GraphValidationError reports a BVV-TG-07..10 violation discovered by
 // ValidateLifecycleGraph. Carries the requirement ID (e.g. "BVV-TG-09"),
 // a human-readable reason, and the offending task IDs so callers can
 // surface actionable diagnostics to operators.
 type GraphValidationError struct {
-	Requirement string   // BVV-TG-07 / BVV-TG-08 / BVV-TG-09 / BVV-TG-10
-	Reason      string   // one-line human explanation
-	TaskIDs     []string // offending task IDs (may be empty for structural errors)
+	Requirement TGRequirement // one of ReqTG07..ReqTG10
+	Reason      string        // one-line human explanation
+	TaskIDs     []string      // offending task IDs (may be empty for structural errors)
 }
 
 func (e *GraphValidationError) Error() string {
@@ -27,6 +52,9 @@ func (e *GraphValidationError) Error() string {
 // label "branch:<branch>" in the given store. Returns nil on a well-formed
 // graph. Returns *GraphValidationError identifying the first failed
 // requirement when malformed. Other errors wrap store failures.
+//
+// See docs/BVV_PHASE_9_PLAN.md §"Open Questions" for the rationale behind
+// abort-on-failure vs. retry, and the default-on-at-Level-2 policy.
 //
 // Early skip (returns nil, no error): the branch has zero role:planner tasks.
 // This is the legitimate Level 1 pre-populated-ledger path — validation is
@@ -77,7 +105,7 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 	// reachability-from-plan is ill-defined when there are multiple plans.
 	if len(planners) > 1 {
 		return &GraphValidationError{
-			Requirement: "BVV-TG-10",
+			Requirement: ReqTG10,
 			Reason:      fmt.Sprintf("exactly one role:planner task required, got %d", len(planners)),
 			TaskIDs:     planners,
 		}
@@ -95,13 +123,15 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 			badRoles = append(badRoles, t.ID)
 			continue
 		}
-		if _, ok := roles[role]; !ok {
+		// Role map is keyed by string (CLI-configured). Convert at the
+		// lookup boundary — Role and string share underlying type.
+		if _, ok := roles[string(role)]; !ok {
 			badRoles = append(badRoles, t.ID)
 		}
 	}
 	if len(badRoles) > 0 {
 		return &GraphValidationError{
-			Requirement: "BVV-TG-07",
+			Requirement: ReqTG07,
 			Reason:      "tasks carry role labels not configured in lifecycle.Roles",
 			TaskIDs:     badRoles,
 		}
@@ -134,7 +164,7 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 	// This catches that path and pins BVV-TG-08 as an independent spec test.
 	if cyc := firstCycle(taskByID, forward); cyc != nil {
 		return &GraphValidationError{
-			Requirement: "BVV-TG-08",
+			Requirement: ReqTG08,
 			Reason:      "dependency cycle detected",
 			TaskIDs:     cyc,
 		}
@@ -143,7 +173,7 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 	// --- BVV-TG-09: exactly one role:gate, reachable from gate must cover verifiers. ---
 	if len(gates) != 1 {
 		return &GraphValidationError{
-			Requirement: "BVV-TG-09",
+			Requirement: ReqTG09,
 			Reason:      fmt.Sprintf("exactly one role:gate task required, got %d", len(gates)),
 			TaskIDs:     gates,
 		}
@@ -158,7 +188,7 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 	}
 	if len(unreachedVerifiers) > 0 {
 		return &GraphValidationError{
-			Requirement: "BVV-TG-09",
+			Requirement: ReqTG09,
 			Reason:      "gate task does not depend (directly or transitively) on all role:verifier tasks",
 			TaskIDs:     unreachedVerifiers,
 		}
@@ -185,7 +215,7 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 	}
 	if len(orphans) > 0 {
 		return &GraphValidationError{
-			Requirement: "BVV-TG-10",
+			Requirement: ReqTG10,
 			Reason:      "tasks not reachable from plan task via dependency edges",
 			TaskIDs:     orphans,
 		}
@@ -219,8 +249,13 @@ func firstCycle(taskByID map[string]*Task, forward map[string][]string) []string
 				return true
 			case white:
 				if visit(dep) {
-					// Keep a minimal evidence slice: the offending edge is
-					// enough to point an operator at the right place.
+					// Cycle found deeper in the recursion — bubble up
+					// without extending `cycle`. The two back-edge
+					// endpoints set in the gray branch above are enough
+					// evidence for operator diagnostics; a full cycle
+					// reconstruction would require tracking the recursion
+					// stack, which is out of scope for this defensive
+					// check (AddDep catches the common case).
 					return true
 				}
 			}

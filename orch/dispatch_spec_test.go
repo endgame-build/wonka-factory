@@ -91,7 +91,7 @@ func TestBVV_DSP03_RoleBasedRouting(t *testing.T) {
 	var dispatched []string
 	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		mu.Lock()
-		dispatched = append(dispatched, task.ID+":"+task.Role())
+		dispatched = append(dispatched, task.ID+":"+string(task.Role()))
 		mu.Unlock()
 		outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeSuccess, 0, roleCfg)
 	})
@@ -1151,7 +1151,7 @@ func TestBVV_S05_RoutingUsesLabelsOnly(t *testing.T) {
 		},
 	}))
 
-	var routedRole string
+	var routedRole orch.Role
 	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		routedRole = task.Role()
 		outcomes <- orch.NewTaskOutcome(task, worker, orch.DetermineOutcome(0), 0, roleCfg)
@@ -1161,7 +1161,7 @@ func TestBVV_S05_RoutingUsesLabelsOnly(t *testing.T) {
 	d.Tick(ctx)
 	d.Wait()
 
-	assert.Equal(t, "builder", routedRole,
+	assert.Equal(t, orch.Role("builder"), routedRole,
 		"routing uses Role() label, not Title or Body content")
 }
 

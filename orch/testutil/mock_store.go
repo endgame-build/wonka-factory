@@ -29,6 +29,7 @@ type MockStore struct {
 	// matching operation returns the error instead of succeeding. Each
 	// independent hook lets tests pin the exact step under Reconcile that
 	// surfaces a store failure. Thread-safe: guarded by mu.
+	CreateTaskErr   error
 	UpdateTaskErr   error
 	UpdateWorkerErr error
 	ListTasksErr    error
@@ -46,6 +47,15 @@ func NewMockStore() *MockStore {
 		workers: make(map[string]*orch.Worker),
 		deps:    make(map[string][]string),
 	}
+}
+
+// SetCreateTaskErr sets (or clears) the error returned by CreateTask.
+// Thread-safe: acquires the store mutex. Used to simulate durable-store
+// failures in the escalation-creation path (silent-failure audit I-3).
+func (s *MockStore) SetCreateTaskErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CreateTaskErr = err
 }
 
 // SetUpdateTaskErr sets (or clears) the error returned by UpdateTask.
@@ -116,6 +126,9 @@ func (s *MockStore) CreateTask(t *orch.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.CreateTaskErr != nil {
+		return s.CreateTaskErr
+	}
 	if _, exists := s.tasks[t.ID]; exists {
 		return fmt.Errorf("task %q: %w", t.ID, orch.ErrTaskExists)
 	}

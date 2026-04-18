@@ -87,6 +87,48 @@ func TestTask_LabelAccessors(t *testing.T) {
 	})
 }
 
+// TestRole_ValidAndAllRoles pins the closed-set enforcement added alongside
+// the Role type promotion. A regression that adds a new Role constant
+// without updating AllRoles / Valid() would slip past compile-time checks
+// but fail this test.
+func TestRole_ValidAndAllRoles(t *testing.T) {
+	t.Run("every constant in AllRoles is Valid", func(t *testing.T) {
+		for _, r := range AllRoles {
+			if !r.Valid() {
+				t.Errorf("Role %q is in AllRoles but not Valid()", r)
+			}
+		}
+	})
+
+	t.Run("Valid rejects empty and arbitrary strings", func(t *testing.T) {
+		invalid := []Role{"", "unknown", "BUILDER", "builder ", " builder"}
+		for _, r := range invalid {
+			if r.Valid() {
+				t.Errorf("Role %q should not be Valid()", r)
+			}
+		}
+	})
+
+	t.Run("String returns underlying value", func(t *testing.T) {
+		if RolePlanner != "planner" || Role(RolePlanner).String() != "planner" {
+			t.Errorf("Role.String() did not round-trip: got %q", Role(RolePlanner).String())
+		}
+	})
+
+	t.Run("AllRoles matches the const declaration", func(t *testing.T) {
+		// Pin the canonical order + membership so a silent removal is caught.
+		want := []Role{RolePlanner, RoleBuilder, RoleVerifier, RoleGate, RoleEscalation}
+		if len(AllRoles) != len(want) {
+			t.Fatalf("AllRoles length = %d, want %d", len(AllRoles), len(want))
+		}
+		for i, r := range want {
+			if AllRoles[i] != r {
+				t.Errorf("AllRoles[%d] = %q, want %q", i, AllRoles[i], r)
+			}
+		}
+	})
+}
+
 // TestAgentOutcome_String verifies that all four BVV outcomes produce stable,
 // human-readable strings suitable for JSONL event serialization.
 //

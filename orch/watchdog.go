@@ -300,7 +300,9 @@ func (w *Watchdog) CheckOnce() error {
 		// Resolve role → RoleConfig. Unknown role is the dispatcher's problem
 		// (it creates escalation tasks per BVV-DSP-03a); the watchdog skips.
 		role := task.Role()
-		roleCfg, ok := w.roles[role]
+		// Role map is keyed by string (CLI-configured). Convert at the
+		// lookup boundary — see Role type in types.go.
+		roleCfg, ok := w.roles[string(role)]
 		if !ok {
 			continue
 		}

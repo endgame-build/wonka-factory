@@ -91,7 +91,7 @@ func AssertLifecycleReleaseDrained(store Store) {
 // (resolvedRole != "") catches callers that dispatch without a real role
 // decision (e.g. defaulting instead of escalating on unknown role per
 // BVV-DSP-03a).
-func AssertZeroContentInspection(task *Task, resolvedRole string) {
+func AssertZeroContentInspection(task *Task, resolvedRole Role) {
 	if task == nil {
 		panic("[BVV-S-05] zero content inspection: nil task")
 	}

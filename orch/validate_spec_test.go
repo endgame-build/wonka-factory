@@ -54,12 +54,14 @@ func standardRoles() map[string]orch.RoleConfig {
 // requireGraphError asserts that err is a *GraphValidationError pinned to
 // the expected BVV-TG-* requirement. Centralizes the assertion so each
 // test reads as "build graph, call validator, check requirement ID".
+// wantReq is a string for readability; converted to orch.TGRequirement
+// internally.
 func requireGraphError(t *testing.T, err error, wantReq string) *orch.GraphValidationError {
 	t.Helper()
 	require.Error(t, err, "expected validation error, got nil")
 	var ve *orch.GraphValidationError
 	require.True(t, errors.As(err, &ve), "expected *GraphValidationError, got %T: %v", err, err)
-	assert.Equal(t, wantReq, ve.Requirement, "wrong BVV-TG-* requirement: %s", err)
+	assert.Equal(t, orch.TGRequirement(wantReq), ve.Requirement, "wrong BVV-TG-* requirement: %s", err)
 	return ve
 }
 
@@ -280,19 +282,34 @@ func TestBVV_TG12_PlanOnlyFails(t *testing.T) {
 	_ = requireGraphError(t, err, "BVV-TG-09")
 }
 
+// TestAllTGRequirements pins the closed set of BVV-TG-* requirement IDs.
+// Adding a new requirement without updating AllTGRequirements would pass
+// compile but fail this test — surfacing the drift at its narrowest seam
+// (the enum) rather than deep in audit-trail tooling.
+func TestAllTGRequirements(t *testing.T) {
+	want := []orch.TGRequirement{orch.ReqTG07, orch.ReqTG08, orch.ReqTG09, orch.ReqTG10}
+	assert.ElementsMatch(t, want, orch.AllTGRequirements,
+		"AllTGRequirements must exactly match the declared ReqTG* constants")
+	// Pin the format — operator tooling greps the audit trail for this
+	// shape ("BVV-TG-<digits>"), so accidental reformatting must fail loud.
+	for _, r := range orch.AllTGRequirements {
+		assert.Regexp(t, `^BVV-TG-\d{2}$`, string(r), "requirement %q must match BVV-TG-NN format", r)
+	}
+}
+
 // TestValidate_GraphValidationErrorFormat verifies the Error() string carries
 // both the requirement ID and the offending task IDs — operators grep audit
 // trails for [BVV-TG-* patterns, so format stability matters.
 func TestValidate_GraphValidationErrorFormat(t *testing.T) {
 	ve := &orch.GraphValidationError{
-		Requirement: "BVV-TG-09",
+		Requirement: orch.ReqTG09,
 		Reason:      "exactly one role:gate task required, got 0",
 		TaskIDs:     nil,
 	}
 	assert.Equal(t, "[BVV-TG-09] exactly one role:gate task required, got 0", ve.Error())
 
 	ve2 := &orch.GraphValidationError{
-		Requirement: "BVV-TG-10",
+		Requirement: orch.ReqTG10,
 		Reason:      "tasks not reachable from plan task via dependency edges",
 		TaskIDs:     []string{"orphan-1", "orphan-2"},
 	}

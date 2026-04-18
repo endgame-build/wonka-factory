@@ -76,6 +76,7 @@ type Dispatcher struct {
 
 	branchLabel string // "branch:<name>" for ReadyTasks filter
 	aborted     bool   // lifecycle abort flag
+	abortReason string // machine-readable reason for the terminal anchor (e.g. "graph_invalid:BVV-TG-09")
 	testMode    bool   // skip SpawnSession (set by SetSpawnFunc)
 
 	spawnFunc SpawnFunc
@@ -172,9 +173,9 @@ func (d *Dispatcher) SetSpawnFunc(fn SpawnFunc) {
 // threaded (runs on the dispatch goroutine) so the hook body does not need
 // synchronization against other outcome processing.
 //
-// The hook may call d.AbortLifecycle() to stop further dispatch — useful
-// for post-completion validators (e.g. BVV-TG-07..10 graph well-formedness
-// check that runs after the planner completes).
+// The hook may call d.AbortLifecycle(reason) to stop further dispatch —
+// useful for post-completion validators (e.g. BVV-TG-07..10 graph
+// well-formedness check that runs after the planner completes).
 func (d *Dispatcher) SetPostSuccessHook(fn func(*Task)) {
 	d.postSuccessHook = fn
 }
@@ -185,9 +186,35 @@ func (d *Dispatcher) SetPostSuccessHook(fn func(*Task)) {
 // that don't come from a terminal failure path (BVV-ERR-03/04), the
 // caller is responsible for emitting the appropriate audit-trail event
 // before invoking this method.
-func (d *Dispatcher) AbortLifecycle() {
+//
+// The reason is stamped on the terminal lifecycle_completed anchor. Use a
+// short, machine-parseable token (e.g. "graph_invalid:BVV-TG-09") so
+// operator tooling can classify aborts without parsing free-form prose.
+//
+// First-wins: once a reason is set (by this method or by handleTerminalFailure),
+// subsequent calls do not overwrite it. This gives operators the earliest
+// and typically most-specific cause when multiple abort paths race within
+// a single dispatch Drain. An empty reason is always a no-op.
+func (d *Dispatcher) AbortLifecycle(reason string) {
+	d.setAbortReason(reason)
 	d.aborted = true
 	d.abortCleanup()
+}
+
+// setAbortReason applies first-wins semantics to d.abortReason. Centralises
+// the guard so AbortLifecycle and handleTerminalFailure cannot drift.
+func (d *Dispatcher) setAbortReason(reason string) {
+	if reason != "" && d.abortReason == "" {
+		d.abortReason = reason
+	}
+}
+
+// AbortReason returns the reason passed to AbortLifecycle, or empty if the
+// dispatcher aborted via the gap-tolerance path (BVV-ERR-04) which sets the
+// flag directly. Emitted on the terminal lifecycle_completed anchor so an
+// operator can distinguish abort causes without timestamp correlation.
+func (d *Dispatcher) AbortReason() string {
+	return d.abortReason
 }
 
 // Wait blocks until all runAgent goroutines have completed.
@@ -351,6 +378,7 @@ func (d *Dispatcher) handleHandoff(ctx context.Context, o TaskOutcome) {
 // BVV-ERR-04: non-critical task → gap counter → abort at tolerance.
 func (d *Dispatcher) handleTerminalFailure(task *Task) {
 	if task.IsCritical() {
+		d.setAbortReason("critical_task_failure:" + task.ID)
 		d.aborted = true
 		d.abortCleanup()
 		d.emit(Event{Kind: EventEscalationCreated, TaskID: task.ID,
@@ -366,6 +394,7 @@ func (d *Dispatcher) handleTerminalFailure(task *Task) {
 	d.emit(Event{Kind: EventGapRecorded, TaskID: task.ID,
 		Summary: fmt.Sprintf("gap %d/%d recorded for task %s", d.gaps.Count(), d.lifecycle.GapTolerance, task.ID)})
 	if abort {
+		d.setAbortReason("gap_tolerance_exceeded")
 		d.aborted = true
 		d.abortCleanup()
 		d.emit(Event{Kind: EventEscalationCreated, TaskID: task.ID,
@@ -505,7 +534,11 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 		if role == RoleEscalation {
 			continue
 		}
-		roleCfg, ok := d.lifecycle.Roles[role]
+		// Role map is keyed by string (CLI-configured) — convert the typed
+		// Role to string at the lookup boundary. The CLI builds this map
+		// with string keys derived from our untyped Role constants, so the
+		// round-trip is lossless.
+		roleCfg, ok := d.lifecycle.Roles[string(role)]
 		if !ok {
 			// BVV-DSP-03a: unknown role → create escalation, block original.
 			d.createEscalation(task, role)
@@ -597,7 +630,7 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 
 // createEscalation creates an escalation task for an unknown role and blocks
 // the original task (BVV-DSP-03a).
-func (d *Dispatcher) createEscalation(task *Task, role string) {
+func (d *Dispatcher) createEscalation(task *Task, role Role) {
 	escID := "escalation-" + task.ID
 	escTask := &Task{
 		ID:     escID,
