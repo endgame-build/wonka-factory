@@ -243,6 +243,11 @@ func (w *Watchdog) Run(ctx context.Context) {
 // errors.Join and returned at end-of-tick so Run can surface them; other
 // workers in the same tick are still checked.
 func (w *Watchdog) CheckOnce() error {
+	// BVV-S-10: snapshot task statuses at entry so the exit check can assert
+	// the watchdog never mutated them.
+	branchLabel := LabelBranch + ":" + w.branch
+	before := snapshotBranchTasks(w.store, branchLabel)
+
 	workers, err := w.store.ListWorkers()
 	if err != nil {
 		return fmt.Errorf("watchdog: list workers: %w", err)
@@ -344,6 +349,9 @@ func (w *Watchdog) CheckOnce() error {
 			tickErrs = append(tickErrs, fmt.Errorf("restart %s (task %s): %w", worker.Name, task.ID, err))
 		}
 	}
+
+	// BVV-S-10: verify the watchdog tick did not change any task status.
+	AssertWatchdogNoStatusChange(before, snapshotBranchTasks(w.store, branchLabel))
 
 	return errors.Join(tickErrs...)
 }

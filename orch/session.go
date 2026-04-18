@@ -58,6 +58,11 @@ func (wp *WorkerPool) Allocate() (*Worker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("allocate: list workers: %w", err)
 	}
+	// WC invariant: idle+active never exceeds maxWorkers. The check is at the
+	// pool-mutation boundary because the TLA+ model found double-decrement
+	// races (watchdog vs dispatch) that once-per-tick checks miss.
+	AssertWorkerConservation(workers, wp.maxWorkers)
+
 	for _, w := range workers {
 		if w.Status == WorkerIdle {
 			return w, nil
@@ -212,7 +217,12 @@ func (wp *WorkerPool) Release(workerName string) error {
 	worker.SessionPID = 0
 	worker.SessionStartedAt = time.Time{}
 
-	return wp.store.UpdateWorker(worker)
+	if err := wp.store.UpdateWorker(worker); err != nil {
+		return err
+	}
+	// WC invariant: re-check after transition to catch any double-release race.
+	guardWorkerConservation(wp.store, wp.maxWorkers)
+	return nil
 }
 
 // Deallocate removes a worker from the pool. Returns ErrWorkerBusy if the
