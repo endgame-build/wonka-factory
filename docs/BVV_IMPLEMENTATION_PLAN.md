@@ -107,15 +107,15 @@ Build order follows dependency graph: types → errors → eventlog → store in
   }
   ```
 
-- `AgentOutcome` — **semantic rewrite** (not extension). Fork's `AgentOutcome int` with `OutcomeCompleted/Retry/Gap/Failed` derived outcomes from output validation via `DetermineOutcome()`. BVV replaces this with `AgentOutcome string` mapping 1:1 to agent exit codes: `OutcomeSuccess` (0), `OutcomeFailure` (1), `OutcomeBlocked` (2), `OutcomeHandoff` (3). `DetermineOutcome()` is deleted entirely — agents signal their own outcome via exit codes, not output inspection (ZFC / BVV-DSN-04). Using typed strings instead of iota ensures human-readable JSONL event serialization.
+- `AgentOutcome` — **semantic rewrite** (not extension). Fork's `AgentOutcome int` with `OutcomeCompleted/Retry/Gap/Failed` derived outcomes from output validation via `DetermineOutcome()`. BVV replaces this with `AgentOutcome string` mapping 1:1 to agent exit codes: `OutcomeSuccess` (0), `OutcomeFailure` (1), `OutcomeBlocked` (2), `OutcomeHandoff` (3). `DetermineOutcome()` is **retained** but simplified to a pure exit-code switch — see §4.1 for the implementation. Agents signal their own outcome via exit codes, not output inspection (ZFC / BVV-DSN-04). Using typed strings instead of iota ensures human-readable JSONL event serialization.
 
 **Design decision — labels as `map[string]string`:** The orchestrator uses labels for all metadata routing (role, branch, critical flag). Beads labels are `"key:value"` strings; the Store implementations parse them into the map on read and serialize back on write. This keeps the Task struct clean and aligns with BVV-DSN-04 (phase-agnostic orchestration).
 
 ### 2.2 `orch/errors.go` — CONSOLIDATE from 3 fork files
 
-**Note:** The fork scattered sentinels across `_fork/ledger.go` (16 errors), `_fork/lock.go` (`ErrLockContention`), and `_fork/errors.go` (only `SubprocessError` type). The port consolidates all sentinels into a single `errors.go` — 12 total (9 kept + 1 renamed + 2 added).
+**Note:** The fork scattered sentinels across `_fork/ledger.go` (16 errors), `_fork/lock.go` (`ErrLockContention`), and `_fork/errors.go` (only `SubprocessError` type). The port consolidates all sentinels into a single `errors.go` — 13 total (10 kept + 1 renamed + 2 added).
 
-**Keep:** `ErrNotFound`, `ErrTaskExists`, `ErrCycle`, `ErrAlreadyAssigned`, `ErrTaskNotReady`, `ErrWorkerBusy`, `ErrPoolExhausted`, `ErrLockContention`, `ErrResumeNoLedger`.
+**Keep:** `ErrNotFound`, `ErrTaskExists`, `ErrWorkerExists` (used by `CreateWorker` for duplicate detection), `ErrCycle`, `ErrAlreadyAssigned`, `ErrTaskNotReady`, `ErrWorkerBusy`, `ErrPoolExhausted`, `ErrLockContention`, `ErrResumeNoLedger`.
 
 **Remove:** `ErrInputMissing`, `ErrOutputMissing`, `ErrOutputInvalid` (no output validation), `ErrEnvKeyInvalid`, `ErrGateHalt` (gates are regular tasks), `ErrRetriesExhausted`, `ErrLedgerUnavailable` (deferred to Phase 3), `SubprocessError` type.
 
@@ -284,15 +284,15 @@ Update `Cleanup` to match renamed types if needed.
 
 **Keep:** `BuildCommand`, `ReadAgentPrompt`, `LogPath`.
 
-**Simplify `DetermineOutcome`:** Pure exit-code switch (no output validation):
+**Simplify `DetermineOutcome`:** Pure exit-code switch (no output validation). Constant names align with §2.1 (`OutcomeSuccess`/`OutcomeFailure`, not `OutcomeCompleted`/`OutcomeFailed`):
 ```go
 func DetermineOutcome(exitCode int) AgentOutcome {
     switch exitCode {
-    case 0:  return OutcomeCompleted
-    case 1:  return OutcomeFailed
+    case 0:  return OutcomeSuccess
+    case 1:  return OutcomeFailure
     case 2:  return OutcomeBlocked
     case 3:  return OutcomeHandoff
-    default: return OutcomeFailed
+    default: return OutcomeFailure
     }
 }
 ```
@@ -338,7 +338,7 @@ type DispatchResult struct {
 }
 ```
 
-**DAG Tick algorithm (3 steps per tick):**
+**DAG Tick algorithm (6 steps per tick):**
 
 ```
 Tick(ctx):
@@ -346,22 +346,32 @@ Tick(ctx):
      For each outcome: process exit code, update task status, handle retry/gap/handoff/abort.
      (This runs on the dispatch goroutine, keeping GapTracker/RetryState/HandoffState single-threaded.)
 
-  2. DISPATCH — ReadyTasks(branchLabel):
+  2. HANDLE ORPHANS — recover CB-tripped tasks + fail stuck tasks (BVV-ERR-11a):
+     a. orphanCk() — re-dispatch tasks orphaned when the circuit breaker tripped.
+     b. failStuckTasks() — fail tasks the watchdog flagged stuck (dead session +
+        exhausted handoff budget). The watchdog emits EventHandoffLimitReached
+        and records the task; the dispatcher owns the status transition (BVV-S-10).
+
+  3. CHECK ABORT — if lifecycle aborted (critical failure or gap overrun),
+     return DispatchResult{GapAbort: true} and exit.
+
+  4. DISPATCH — ReadyTasks(branchLabel):
      For each ready task (up to idle workers):
        a. role = task.Role()
        b. roleCfg = lifecycle.Roles[role]
        c. If role unknown → create escalation task (BVV-DSP-03a), set task to blocked, continue
        d. worker = pool.Allocate()
        e. store.Assign(taskID, workerName) — atomic
-       f. pool.SpawnSession(workerName, task, roleCfg, task.ID, lifecycle.Branch)
-       g. emit(EventTaskDispatched)
-       h. go runAgent(ctx, task, worker, roleCfg) — sends outcome to channel when done
+       f. AssertZeroContentInspection(task, role) — BVV-S-05 runtime guard
+       g. pool.SpawnSession(workerName, task, roleCfg, lifecycle.Branch)
+       h. emit(EventTaskDispatched)
+       i. go runAgent(ctx, task, worker, roleCfg) — sends outcome to channel when done
 
-  3. CHECK TERMINATION:
+  5. CHECK TERMINATION:
      allTasks = store.ListTasks(branchLabel)
      If ALL terminal AND no active workers → LifecycleDone = true
 
-  4. LOCK REFRESH — lock.Refresh(lifecycle.Branch)
+  6. LOCK REFRESH — lock.Refresh(lifecycle.Branch)
 ```
 
 **`runAgent` goroutine:**
@@ -439,16 +449,24 @@ for each: set status = blocked; store.UpdateTask
 The gate handler is a deterministic script (BVV-AI-02), not an AI agent. Built-in implementation:
 
 ```go
-func ExecuteGate(ctx context.Context, store Store, taskID, repoPath, targetBranch string) int {
+func ExecuteGate(
+    ctx context.Context,
+    store Store,
+    log *EventLog,                 // audit trail for gate events
+    taskID, repoPath string,
+    targetBranch, sourceBranch string, // sourceBranch supports multi-branch PRs
+    cfg GateConfig,
+) int {
     // 1. Check predecessor statuses (BVV-GT-03)
     deps = store.GetDeps(taskID)
     for each dep:
         task = store.GetTask(dep)
         if task.Status == StatusFailed || task.Status == StatusBlocked:
             return 1 // don't create PR if predecessors failed
-    // 2. Create PR: gh pr create --base targetBranch --head featureBranch
-    // 3. Poll CI: gh pr checks featureBranch --watch (with timeout)
+    // 2. Create PR: gh pr create --base targetBranch --head sourceBranch
+    // 3. Poll CI: gh pr checks sourceBranch --watch (with cfg.Timeout)
     // 4. All pass → return 0; any fail → return 1
+    // Events emitted via log: EventGateCreated / EventGatePassed / EventGateFailed.
 }
 ```
 
@@ -534,18 +552,23 @@ Reconcile(store, tmux, lifecycle, logPath) → *ResumeResult:
 
 ### 5.3 `orch/invariant.go` — REWRITE for BVV safety properties
 
-Runtime assertions (build tag `verify`) that panic with requirement IDs:
+Runtime assertions (build tag `verify`) that panic with requirement IDs. All 9 listed assertions are implemented in `invariant.go`; `invariant_noverify.go` supplies matching no-op stubs for non-verify builds. Two assertions (marked "test-only") are exercised solely by the test suite today — the production call sites are tracked as follow-up work, not regressions.
 
-| Assertion | Requirement | Checks |
-|-----------|-------------|--------|
-| `AssertTerminalIrreversibility` | BVV-S-02 | Orchestrator never reverses a terminal status |
-| `AssertSingleAssignment` | BVV-S-03 | At most one worker per task |
-| `AssertDependencyOrdering` | BVV-S-04 | No task dispatched before all deps terminal |
-| `AssertLifecycleExclusion` | BVV-S-01 | At most one orchestrator per branch |
-| `AssertZeroContentInspection` | BVV-S-05 | Routing uses only task metadata |
-| `AssertBoundedDegradation` | BVV-S-07 | No PR if gaps >= tolerance |
-| `AssertWorkerConservation` | WC | idle + active <= maxWorkers |
-| `AssertWatchdogNoStatusChange` | BVV-S-10 | Watchdog never changes task status |
+| Assertion | Requirement | Call site | Checks |
+|-----------|-------------|-----------|--------|
+| `AssertTerminalIrreversibility` | BVV-S-02 | `dispatch.terminateAndRelease` | Orchestrator never reverses a terminal status |
+| `AssertSingleAssignment` | BVV-S-03 | dispatch (post-`Assign`) | At most one worker per task |
+| `AssertDependencyOrdering` | BVV-S-04 | dispatch (post-`Assign`) | No task dispatched before all deps terminal |
+| `AssertLifecycleExclusion` | BVV-S-01 | **(test-only)** | At most one orchestrator per branch |
+| `AssertZeroContentInspection` | BVV-S-05 | dispatch (before test-mode/SpawnSession split) | Routing uses only task metadata |
+| `AssertBoundedDegradation` | BVV-S-07 | **(test-only)** | Gap count never exceeds tolerance |
+| `AssertWorkerConservation` | WC | `WorkerPool.Allocate` + `Release` (via `guardWorkerConservation`) + once per Tick | idle + active <= maxWorkers |
+| `AssertWatchdogNoStatusChange` | BVV-S-10 | `Watchdog.CheckOnce` entry/exit snapshots | Watchdog never changes task status |
+| `AssertLifecycleReleaseDrained` | BVV-ERR-10a | `Engine.runLoop` lock release | No active workers at voluntary lock release |
+
+Internal helpers (unexported):
+- `guardWorkerConservation(store, max)` — loads workers and calls `AssertWorkerConservation`; used where the caller doesn't already have a workers slice. No-op in non-verify builds (zero I/O).
+- `snapshotBranchTasks(store, branchLabel)` — snapshot helper for the BVV-S-10 before/after comparison. No-op in non-verify builds.
 
 ---
 
@@ -645,13 +668,18 @@ wonka status  --branch <name>           # Show lifecycle status (read-only)
 
 ### 7.4 Preset registry
 
+The Claude preset matches the real CLI contract. Two deviations from an earlier draft:
+
+- `Args` includes `--dangerously-skip-permissions` (required: the orchestrator already gates tool use via role/branch labels) and `--output-format stream-json` (required so sidecar exit-code capture works with line-buffered stdout).
+- `SystemPromptFlag` is `--append-system-prompt` — a **body-valued** flag, not a path. `orch.BuildCommand` passes the instruction file contents literally. This preserves the Store → agent contract (agents receive text, not a path that could be tampered with by a cohabiting process).
+
 ```go
 var Presets = map[string]*orch.Preset{
     "claude": {
         Name:             "claude",
         Command:          "claude",
-        Args:             []string{"-p", "--verbose"},
-        SystemPromptFlag: "--system-prompt-file",
+        Args:             []string{"--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"},
+        SystemPromptFlag: "--append-system-prompt",   // body-valued (not path)
         ModelFlag:        "--model",
         Env:              map[string]string{},
     },
