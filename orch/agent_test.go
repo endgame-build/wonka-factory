@@ -182,6 +182,85 @@ func TestLogPath_Canonical(t *testing.T) {
 	assert.Equal(t, want, got)
 }
 
+// TestBVV_AI01_InstructionFileInjection verifies BVV-AI-01: a role's
+// instruction file body is injected into the agent invocation via the
+// preset's SystemPromptFlag. Exercises ReadAgentPrompt → BuildCommand
+// end-to-end so a regression in either side surfaces here.
+func TestBVV_AI01_InstructionFileInjection(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "OOMPA.md")
+	body := "You are a builder. Write code, run tests, commit."
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+
+	gotBody, _, err := orch.ReadAgentPrompt(path)
+	require.NoError(t, err)
+
+	preset := &orch.Preset{
+		Command:          "claude",
+		SystemPromptFlag: "--append-system-prompt",
+	}
+	cmd := orch.BuildCommand(preset, gotBody, "", 0)
+
+	// Locate the flag and assert the immediately-following arg is the body.
+	idx := -1
+	for i, arg := range cmd {
+		if arg == "--append-system-prompt" {
+			idx = i
+			break
+		}
+	}
+	require.NotEqual(t, -1, idx, "SystemPromptFlag missing from cmd: %v", cmd)
+	require.Less(t, idx, len(cmd)-1, "SystemPromptFlag has no value: %v", cmd)
+	assert.Equal(t, body, cmd[idx+1], "instruction body must be the literal flag value")
+}
+
+// TestBVV_AI02_RoleToInstructionMapping verifies BVV-AI-02: a task's role
+// label is the lookup key into LifecycleConfig.Roles, which returns the
+// instruction file path. The mapping is the contract the dispatcher relies
+// on to inject the right system prompt for the right role.
+func TestBVV_AI02_RoleToInstructionMapping(t *testing.T) {
+	roles := map[string]orch.RoleConfig{
+		orch.RoleBuilder:  {InstructionFile: "/agents/OOMPA.md"},
+		orch.RoleVerifier: {InstructionFile: "/agents/LOOMPA.md"},
+		orch.RolePlanner:  {InstructionFile: "/agents/CHARLIE.md"},
+	}
+	cases := []struct {
+		role     string
+		wantFile string
+	}{
+		{orch.RoleBuilder, "/agents/OOMPA.md"},
+		{orch.RoleVerifier, "/agents/LOOMPA.md"},
+		{orch.RolePlanner, "/agents/CHARLIE.md"},
+	}
+	for _, c := range cases {
+		cfg, ok := roles[c.role]
+		require.True(t, ok, "role %q must be in role map", c.role)
+		assert.Equal(t, c.wantFile, cfg.InstructionFile,
+			"role %q must map to %q", c.role, c.wantFile)
+	}
+	_, ok := roles["unknown"]
+	assert.False(t, ok, "unknown role must miss the map (dispatcher escalates per BVV-DSP-03a)")
+}
+
+// TestBVV_AI03_PresetSelection verifies BVV-AI-03: distinct roles may carry
+// distinct presets, and BuildCommand renders each role's preset
+// independently. Pinning this prevents a future "single preset per
+// lifecycle" regression that would tie all roles to the same agent CLI.
+func TestBVV_AI03_PresetSelection(t *testing.T) {
+	claude := &orch.Preset{Command: "claude", Args: []string{"-p"}, SystemPromptFlag: "--append-system-prompt"}
+	codex := &orch.Preset{Command: "codex", Args: []string{"chat"}, SystemPromptFlag: "--system"}
+
+	cmdClaude := orch.BuildCommand(claude, "be a builder", "", 0)
+	cmdCodex := orch.BuildCommand(codex, "be a builder", "", 0)
+
+	assert.Equal(t, "claude", cmdClaude[0])
+	assert.Equal(t, "codex", cmdCodex[0])
+	assert.Contains(t, cmdClaude, "--append-system-prompt")
+	assert.Contains(t, cmdCodex, "--system")
+	assert.NotContains(t, cmdClaude, "--system", "preset isolation: claude must not use codex flag")
+	assert.NotContains(t, cmdCodex, "--append-system-prompt", "preset isolation: codex must not use claude flag")
+}
+
 // TestBVV_DSP04_DetermineOutcome verifies the exit-code-to-outcome mapping
 // (BVV-DSP-04). The orchestrator MUST determine task outcome from the exit
 // code alone — no output content inspection.

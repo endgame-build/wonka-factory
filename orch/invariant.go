@@ -2,6 +2,28 @@
 
 package orch
 
+// TLA+ Traceability Matrix
+//
+// Each runtime assertion below corresponds to a TLA+ operator (or set of
+// operators) in the formal model under docs/specs/tla/. Line numbers
+// reference BVV.tla unless otherwise noted. Update this matrix whenever an
+// assertion is added, renamed, or removed. The matrix is intentionally
+// grep-parseable: scripts/trace-requirement.sh keys off the requirement IDs
+// in the rightmost column to surface the spec → model → assertion chain.
+//
+//   Go Assertion                       TLA+ Operator             BVV.tla  Req ID
+//   ----------------------------       ----------------------    -------  -----------------
+//   AssertLifecycleExclusion           LifecycleExclusion        :295     BVV-S-01
+//   AssertTerminalIrreversibility      TerminalIrreversibility   :307     BVV-S-02
+//   AssertSingleAssignment             SingleAssignment          :321     BVV-S-03
+//   AssertDependencyOrdering           DependencyOrdering        :327     BVV-S-04
+//   AssertZeroContentInspection        (by construction)         —        BVV-S-05
+//   AssertBoundedDegradation           BoundedDegradation        :344     BVV-S-07
+//   AssertWatchdogNoStatusChange       (by construction)         —        BVV-S-10
+//   AssertLifecycleReleaseDrained      (by construction)         —        BVV-ERR-10a
+//   AssertWorkerConservation           TypeOK (worker/session)   :268     WC
+//   AssertPostPlannerWellFormed        (no TLA+ counterpart)     —        BVV-TG-07..10
+
 import "fmt"
 
 // AssertTerminalIrreversibility panics if a terminal status is being changed
@@ -156,5 +178,26 @@ func AssertWatchdogNoStatusChange(before, after []*Task) {
 func guardWorkerConservation(store Store, maxWorkers int) {
 	if workers, err := store.ListWorkers(); err == nil {
 		AssertWorkerConservation(workers, maxWorkers)
+	}
+}
+
+// AssertPostPlannerWellFormed panics if the post-planner task graph for the
+// given branch fails any of BVV-TG-07..10. Called from Engine.onPlannerCompleted
+// immediately after ValidateLifecycleGraph returns nil.
+//
+// This is a re-execution of the same validator the engine just ran — so a
+// buggy validator breaks both call sites together. The assertion's value is
+// not catching validator regressions; it is:
+//
+//  1. surfacing graph violations as a grep-traceable panic ([BVV-TG-07..10])
+//     for any future code path that calls it without first checking the err;
+//  2. providing a named, independently-testable contract that tests can pin
+//     the post-planner invariant against without reaching into engine state;
+//  3. offering a stable assertion API for future call sites (admin tools,
+//     watchdog extensions) that need to re-verify the invariant without
+//     re-implementing the validator's traversal.
+func AssertPostPlannerWellFormed(store Store, branch string, roles map[string]RoleConfig) {
+	if err := ValidateLifecycleGraph(store, branch, roles); err != nil {
+		panic(fmt.Sprintf("[BVV-TG-07..10] post-planner well-formedness violated: %v", err))
 	}
 }

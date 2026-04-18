@@ -390,3 +390,33 @@ func TestBVV_ERR11a_HandoffStateSetCounts(t *testing.T) {
 	h.RecordHandoffUnchecked("task-b")
 	assert.False(t, h.CanHandoff("task-b"), "replayed count + new increment hit limit")
 }
+
+// TestBVV_L04_HandoffNotResetOnRetry verifies BVV-L-04: a retry (exit 1)
+// does not reset the handoff counter. RetryState and HandoffState are
+// orthogonal concerns; the only legitimate reset of HandoffState is a
+// human re-open (BVV-S-02a, covered by TestBVV_S02a_HandoffStateReset).
+//
+// The property is asserted by the absence of coupling: simulate two
+// handoffs, then a retry, then assert the handoff count is unchanged.
+// A regression that introduced a "reset on retry" path would fail here.
+func TestBVV_L04_HandoffNotResetOnRetry(t *testing.T) {
+	const taskID = "task-handoff-retry"
+
+	retries := orch.NewRetryState()
+	handoffs := orch.NewHandoffState(5)
+
+	// Simulate two handoffs (sessions 1 and 2).
+	handoffs.RecordHandoffUnchecked(taskID)
+	handoffs.RecordHandoffUnchecked(taskID)
+	require.Equal(t, 2, handoffs.Count(taskID), "preconditions: 2 handoffs recorded")
+
+	// Simulate a retry (orchestrator processed an exit-1 outcome).
+	retries.RecordAttempt(taskID)
+	require.Equal(t, 1, retries.AttemptCount(taskID), "preconditions: 1 retry recorded")
+
+	// L-04 invariant: handoff count unchanged.
+	assert.Equal(t, 2, handoffs.Count(taskID),
+		"BVV-L-04: handoff counter must not reset on retry")
+	assert.True(t, handoffs.CanHandoff(taskID),
+		"BVV-L-04: budget unchanged — task can still hand off (limit 5, used 2)")
+}

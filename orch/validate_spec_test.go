@@ -4,6 +4,7 @@ package orch_test
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/endgame/wonka-factory/orch"
@@ -332,4 +333,50 @@ func TestValidate_BranchIsolation(t *testing.T) {
 
 	assert.NoError(t, orch.ValidateLifecycleGraph(store, "feat/a", standardRoles()),
 		"other-branch tasks must not contaminate feat/a validation")
+}
+
+// TestBVV_TG07to10_AssertPostPlannerWellFormed_NoOpOnValid pins that the
+// runtime invariant is silent on a well-formed graph. Mirror of
+// TestValidate_WellFormed but exercising the assertion path directly so
+// regressions in the assertion (e.g. accidentally panicking on nil err)
+// surface here rather than only in integration tests.
+func TestBVV_TG07to10_AssertPostPlannerWellFormed_NoOpOnValid(t *testing.T) {
+	store := testutil.NewMockStore()
+	buildWellFormedGraph(t, store, "feat/x")
+	assert.NotPanics(t, func() {
+		orch.AssertPostPlannerWellFormed(store, "feat/x", standardRoles())
+	})
+}
+
+// TestBVV_TG07to10_AssertPostPlannerWellFormed_PanicsOnInvalid pins the
+// hard-failure contract: any TG-07..10 violation must surface as a panic
+// carrying the [BVV-TG-07..10] tag so log scrapers and crash reporters
+// classify it as a spec-invariant breach rather than a generic runtime
+// fault. The two-gate failure mode is the cheapest mutation of the
+// canonical graph — any other TG-* mutation works equally well since the
+// assertion delegates uniformly to ValidateLifecycleGraph.
+func TestBVV_TG07to10_AssertPostPlannerWellFormed_PanicsOnInvalid(t *testing.T) {
+	store := testutil.NewMockStore()
+	buildWellFormedGraph(t, store, "feat/x")
+	// Inject a second gate to force a TG-09 violation ("exactly one gate").
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID: "gate-2", Status: orch.StatusOpen,
+		Labels: map[string]string{
+			orch.LabelBranch: "feat/x",
+			orch.LabelRole:   orch.RoleGate,
+		},
+	}))
+	require.NoError(t, store.AddDep("gate-2", "verify-1"))
+
+	defer func() {
+		r := recover()
+		require.NotNil(t, r, "AssertPostPlannerWellFormed must panic on invalid graph")
+		msg := fmt.Sprintf("%v", r)
+		assert.Contains(t, msg, "[BVV-TG-07..10]",
+			"panic message must carry the requirement-class tag for log scrapers")
+		assert.Contains(t, msg, "BVV-TG-09",
+			"panic message must include the specific requirement that failed")
+	}()
+	orch.AssertPostPlannerWellFormed(store, "feat/x", standardRoles())
+	t.Fatal("unreachable — assertion should have panicked")
 }

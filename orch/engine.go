@@ -451,6 +451,10 @@ func (e *Engine) onPlannerCompleted(task *Task) {
 		}); emitErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: emit graph_validated for %s: %v\n", task.ID, emitErr)
 		}
+		// Defense-in-depth invariant under -tags verify (no-op otherwise).
+		// See AssertPostPlannerWellFormed doc for the rationale on why we
+		// re-execute the validator instead of trusting the prior nil check.
+		AssertPostPlannerWellFormed(e.store, branch, e.cfg.Lifecycle.Roles)
 		return
 	}
 
