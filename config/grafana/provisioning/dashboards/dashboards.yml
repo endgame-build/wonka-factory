@@ -1,0 +1,17 @@
+apiVersion: 1
+
+# One provider scans /etc/grafana/dashboards and lands everything under the
+# Telemetry folder. Houses both claude-code.json (agent-side cost/tokens)
+# and wonka-orchestrator.json (orch-side dispatch/watchdog/gate metrics).
+providers:
+  - name: 'telemetry'
+    orgId: 1
+    folder: 'Telemetry'
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

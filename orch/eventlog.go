@@ -1,6 +1,7 @@
 package orch
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -68,6 +69,7 @@ type Event struct {
 	Timestamp time.Time    `json:"timestamp"`
 	Kind      EventKind    `json:"kind"`
 	TaskID    string       `json:"task_id,omitempty"`
+	Role      string       `json:"role,omitempty"`
 	Worker    string       `json:"worker,omitempty"`
 	Summary   string       `json:"summary"`
 	Detail    string       `json:"detail,omitempty"`
@@ -81,10 +83,15 @@ type ProgressReporter interface {
 	OnEvent(Event)
 }
 
-// emitAndNotify writes an event to the log and forwards it to the progress reporter.
-// Either log or progress may be nil. Returns the Emit error (if any) so callers
-// can decide whether to propagate or log — audit trail gaps corrupt GapTracker
-// recovery (BVV-ERR-03..05).
+// emitAndNotify writes an event to the log and forwards it to the progress
+// reporter. Either log or progress may be nil. Returns the Emit error (if any)
+// so callers can decide whether to propagate or log — audit trail gaps
+// corrupt GapTracker recovery (BVV-ERR-03..05).
+//
+// Telemetry side-effects piggyback on log.Emit when the log has been
+// attached to a Telemetry via EventLog.WithTelemetry; this keeps the
+// orchestrator's emission surface small (one call) without threading
+// observability through every dispatcher/watchdog constructor.
 func emitAndNotify(log *EventLog, progress ProgressReporter, ev Event) error {
 	if progress != nil {
 		progress.OnEvent(ev)
@@ -101,6 +108,25 @@ type EventLog struct {
 	mu   sync.Mutex
 	file *os.File
 	path string
+
+	// Optional telemetry side-channel. Set via WithTelemetry; unset = no-op.
+	// Held here rather than threaded through every emission call site so
+	// that dispatcher/watchdog/engine signatures stay unchanged.
+	telem  *Telemetry
+	branch string
+}
+
+// WithTelemetry binds the event log to a Telemetry instrument so Emit
+// also records metrics and opens/closes spans. branch is the lifecycle
+// branch label used as an attribute on branch-scoped metrics. Passing a
+// nil telem or an empty branch is safe and disables the side-channel.
+// Returns the receiver for chainable configuration.
+func (el *EventLog) WithTelemetry(telem *Telemetry, branch string) *EventLog {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	el.telem = telem
+	el.branch = branch
+	return el
 }
 
 // NewEventLog creates or opens an event log at the given path.
@@ -115,6 +141,13 @@ func NewEventLog(path string) (*EventLog, error) {
 
 // Emit appends a single event to the log. Thread-safe.
 // Sets Timestamp to now if zero.
+//
+// When a Telemetry has been attached via WithTelemetry, Emit also records
+// metrics and opens/closes spans for the event. Telemetry is best-effort —
+// a panic in the OTel layer would corrupt the audit trail, so recovery is
+// delegated to OTel's own no-op-on-panic provider semantics. The metric
+// record happens after the JSONL write succeeds: audit trail is primary,
+// observability is secondary.
 func (el *EventLog) Emit(e Event) error {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = time.Now()
@@ -127,10 +160,18 @@ func (el *EventLog) Emit(e Event) error {
 	data = append(data, '\n')
 
 	el.mu.Lock()
-	defer el.mu.Unlock()
-
+	telem, branch := el.telem, el.branch
 	if _, err := el.file.Write(data); err != nil {
+		el.mu.Unlock()
 		return fmt.Errorf("eventlog: write: %w", err)
+	}
+	el.mu.Unlock()
+
+	// Record telemetry outside the lock: OTel instruments are
+	// independently thread-safe and we don't want exporter latency on the
+	// event-log critical section.
+	if telem != nil {
+		telem.Record(context.Background(), e, branch)
 	}
 	return nil
 }
