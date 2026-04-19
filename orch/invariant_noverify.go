@@ -15,3 +15,5 @@ func AssertZeroContentInspection(_ *Task, _ Role)         {}
 func AssertWorkerConservation(_ []*Worker, _ int)         {}
 func AssertWatchdogNoStatusChange(_, _ []*Task)           {}
 func guardWorkerConservation(_ Store, _ int)              {}
+
+func AssertPostPlannerWellFormed(_ Store, _ string, _ map[string]RoleConfig) {}

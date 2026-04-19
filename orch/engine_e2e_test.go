@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -503,7 +504,8 @@ func TestE2E_PlannerIdempotent(t *testing.T) {
 
 	// plannerAttempts is captured so the planner fails on attempt 1, succeeds on attempt 2.
 	// seedLifecycleGraph runs on BOTH attempts — verifies idempotency.
-	var plannerAttempts int
+	// atomic.Int32: spawn func runs on dispatch goroutine; test reads on test goroutine.
+	var plannerAttempts atomic.Int32
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
 	e.SetTestSpawnFunc(plannerE2ESpawnFunc(t, e, branch, wellFormedGraph(), &plannerAttempts))
@@ -513,7 +515,7 @@ func TestE2E_PlannerIdempotent(t *testing.T) {
 
 	err = e.Run(ctx)
 	assert.NoError(t, err, "idempotent planner should complete despite first-attempt failure")
-	assert.GreaterOrEqual(t, plannerAttempts, 2, "planner should have been invoked at least twice")
+	assert.GreaterOrEqual(t, int(plannerAttempts.Load()), 2, "planner should have been invoked at least twice")
 
 	// Post-run: only one build-1 / verify-1 / gate-1 should exist (no dupes).
 	ledgerDir := filepath.Join(runDir, "ledger")
@@ -619,19 +621,16 @@ func TestE2E_PlannerGraphInvalid(t *testing.T) {
 // store via seedGraphForTest. If attempts is non-nil, the first planner
 // invocation fails (exit 1) and subsequent attempts succeed — exercises
 // BVV-TG-02 idempotency through the retry path. Non-planner roles
-// succeed immediately (exit 0).
-//
-// The engine reference is captured by closure; e.Store() resolves lazily
-// at invocation time, after init() has populated it.
-func plannerE2ESpawnFunc(t *testing.T, e *orch.Engine, branch string, tasks []seededTask, attempts *int) orch.SpawnFunc {
+// succeed immediately (exit 0). e.Store() resolves lazily at invocation
+// time, after init() has populated it.
+func plannerE2ESpawnFunc(t *testing.T, e *orch.Engine, branch string, tasks []seededTask, attempts *atomic.Int32) orch.SpawnFunc {
 	return func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		if task.Role() == orch.RolePlanner {
 			if store := e.Store(); store != nil {
 				seedGraphForTest(t, store, branch, tasks)
 			}
 			if attempts != nil {
-				*attempts++
-				if *attempts == 1 {
+				if attempts.Add(1) == 1 {
 					outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeFailure, 1, roleCfg)
 					return
 				}
@@ -971,4 +970,366 @@ func TestE2E_ResumeReplayGraphInvalidAbortOrdering(t *testing.T) {
 	esc, err := store.GetTask("escalation-graph-plan-1")
 	require.NoError(t, err, "replay must create the graph-invalid escalation")
 	assert.Contains(t, esc.Title, "BVV-TG-09")
+}
+
+// --- V&V matrix Sections 9.2–9.5 scenario coverage ---
+
+// TestE2E_PlannerPartialFailure verifies BVV_VV_STRATEGY.md §Phase 8
+// scenario 9.2: a planner task that fails on its first attempt and
+// succeeds on retry must (a) emit task_retried then task_completed for the
+// plan task, and (b) dispatch the downstream build/verify/gate tasks
+// after the retry succeeds. Distinct from TestE2E_PlannerIdempotent —
+// that test pins "no duplicate tasks created"; this one pins "lifecycle
+// progress past the planner is not blocked by the partial failure".
+func TestE2E_PlannerPartialFailure(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat/planner-partial"
+	lifecycle := testutil.MockLifecycleConfig(branch,
+		orch.RolePlanner, orch.RoleBuilder, orch.RoleVerifier, orch.RoleGate)
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+	lifecycle.ValidateGraph = true
+	lifecycle.MaxRetries = 2
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "e2e-planner-partial"
+	cfg.MaxWorkers = 2
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	prepopulateLedger(t, runDir, &orch.Task{
+		ID: "plan-1", Title: "plan", Status: orch.StatusOpen,
+		Labels: map[string]string{
+			orch.LabelBranch:      branch,
+			orch.LabelRole:        orch.RolePlanner,
+			orch.LabelCriticality: string(orch.NonCritical),
+		},
+	})
+
+	// atomic.Int32: spawn func runs on dispatch goroutine; test reads on test goroutine.
+	var plannerAttempts atomic.Int32
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(plannerE2ESpawnFunc(t, e, branch, wellFormedGraph(), &plannerAttempts))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err = e.Run(ctx)
+	assert.NoError(t, err, "lifecycle must complete after planner retry succeeds")
+	// Exact == not >= so a watchdog-driven over-retry regression fails here.
+	assert.Equal(t, int32(2), plannerAttempts.Load(), "planner must retry exactly once (1 fail + 1 success)")
+
+	logPath := filepath.Join(runDir, "events.jsonl")
+	// Mandatory event sequence per V&V matrix §9.2.
+	validateEventSequence(t, logPath, []orch.EventKind{
+		orch.EventTaskDispatched,
+		orch.EventTaskRetried,
+		orch.EventTaskDispatched,
+		orch.EventTaskCompleted,
+		orch.EventGraphValidated,
+	})
+
+	// Lifecycle progress assertion: every downstream task must have dispatched.
+	dispatched := map[string]bool{}
+	for _, ev := range readEvents(t, logPath) {
+		if ev.Kind == orch.EventTaskDispatched {
+			dispatched[ev.TaskID] = true
+		}
+	}
+	for _, id := range []string{"plan-1", "build-1", "verify-1"} {
+		assert.True(t, dispatched[id],
+			"task %s must dispatch — partial planner failure must not stall progress", id)
+	}
+}
+
+// TestE2E_ConcurrentVVConflict verifies V&V matrix §9.3: two parallel
+// verifier tasks where one fails on its first attempt and succeeds on
+// retry must both reach `completed`. Models the canonical "git conflict
+// during parallel V&V" scenario where one verifier transiently fails and
+// the orchestrator's retry path resolves it without blocking the sibling.
+func TestE2E_ConcurrentVVConflict(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat/vv-conflict"
+	lifecycle := testutil.MockLifecycleConfig(branch,
+		orch.RoleBuilder, orch.RoleVerifier, orch.RoleGate)
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+	lifecycle.ValidateGraph = false // no planner — skip graph validation
+	lifecycle.MaxRetries = 2
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "e2e-vv-conflict"
+	cfg.MaxWorkers = 3
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	// Seed graph: build-1 → [vv-1, vv-2] → gate-1.
+	ledgerDir := filepath.Join(runDir, "ledger")
+	require.NoError(t, os.MkdirAll(ledgerDir, 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "logs"), 0o755))
+	store, _, err := orch.NewStore("", ledgerDir)
+	require.NoError(t, err)
+	mk := func(id, role string, crit orch.Criticality) {
+		require.NoError(t, store.CreateTask(&orch.Task{
+			ID: id, Title: id, Status: orch.StatusOpen,
+			Labels: map[string]string{
+				orch.LabelBranch:      branch,
+				orch.LabelRole:        role,
+				orch.LabelCriticality: string(crit),
+			},
+		}))
+	}
+	mk("build-1", orch.RoleBuilder, orch.NonCritical)
+	mk("vv-1", orch.RoleVerifier, orch.NonCritical)
+	mk("vv-2", orch.RoleVerifier, orch.NonCritical)
+	mk("gate-1", orch.RoleGate, orch.Critical)
+	require.NoError(t, store.AddDep("vv-1", "build-1"))
+	require.NoError(t, store.AddDep("vv-2", "build-1"))
+	require.NoError(t, store.AddDep("gate-1", "vv-1"))
+	require.NoError(t, store.AddDep("gate-1", "vv-2"))
+	require.NoError(t, store.Close())
+
+	// vv-1 fails on its first invocation only; everything else exits 0.
+	// Atomic counter keeps the spawn func race-free under concurrent dispatch.
+	var vv1Attempts atomic.Int32
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		if task.ID == "vv-1" && vv1Attempts.Add(1) == 1 {
+			outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeFailure, 1, roleCfg)
+			return
+		}
+		// gate-1 will fail on `gh pr create` (no gh CLI in tests). Skip its
+		// real execution and short-circuit to success — the test scope is
+		// V&V conflict resolution, not gate behavior (covered separately).
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeSuccess, 0, roleCfg)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err = e.Run(ctx)
+	assert.NoError(t, err, "concurrent V&V with retry must complete")
+
+	logPath := filepath.Join(runDir, "events.jsonl")
+	assertEventKinds(t, logPath, orch.EventTaskRetried)
+
+	// Final state: both verifiers and the gate must be completed.
+	store2, _, err := orch.NewStore("", ledgerDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store2.Close()) })
+	for _, id := range []string{"vv-1", "vv-2", "gate-1"} {
+		task, err := store2.GetTask(id)
+		require.NoError(t, err)
+		assert.Equal(t, orch.StatusCompleted, task.Status,
+			"task %s must complete despite vv-1 conflict", id)
+	}
+	assert.GreaterOrEqual(t, int(vv1Attempts.Load()), 2,
+		"vv-1 must have been retried after first failure")
+}
+
+// TestE2E_CrashDuringReconciliation verifies V&V matrix §9.4: an
+// orchestrator killed while a task is still `in_progress` must, on
+// resume, reconcile the stale assignment (status reset, assignment
+// cleared) before re-dispatching. Pins the reconcile-then-dispatch
+// ordering in the resumed run's event log.
+//
+// Mechanism: Phase 1 uses ChannelSpawnFunc to leave t-0 stuck in
+// `in_progress` (no completion signal sent), then cancels. Phase 2's
+// Resume must observe the in-progress-without-tmux state, reset t-0
+// to `open`, and re-dispatch it cleanly to completion.
+func TestE2E_CrashDuringReconciliation(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat/crash-reconcile"
+	lifecycle := testutil.MockLifecycleConfig(branch, orch.RoleBuilder)
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	// Seed two linear tasks; t-0 will be left in_progress at Phase-1 crash time.
+	ledgerDir := filepath.Join(runDir, "ledger")
+	require.NoError(t, os.MkdirAll(ledgerDir, 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "logs"), 0o755))
+	store, _, err := orch.NewStore("", ledgerDir)
+	require.NoError(t, err)
+	testutil.LinearGraph(t, store, branch, orch.RoleBuilder, 2)
+	require.NoError(t, store.Close())
+
+	logPath := filepath.Join(runDir, "events.jsonl")
+
+	// --- Phase 1: dispatch t-0, leave it in_progress, cancel ---
+	cfg1 := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg1.RunID = "e2e-crash-reconcile-1"
+	cfg1.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e1, err := orch.NewEngine(cfg1)
+	require.NoError(t, err)
+	// ChannelSpawnFunc blocks forever (no signal sent) — t-0 stays in_progress.
+	spawnFn, _ := testutil.ChannelSpawnFunc()
+	e1.SetTestSpawnFunc(spawnFn)
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 15*time.Second)
+	done1 := make(chan error, 1)
+	go func() { done1 <- e1.Run(ctx1) }()
+
+	// Wait for t-0 to be dispatched (and therefore in_progress).
+	waitForTaskEvent(t, logPath, orch.EventTaskDispatched, "t-0", 10*time.Second)
+	cancel1()
+	// ChannelSpawnFunc blocks forever — t-0 can't terminate before the
+	// cancel, so Phase 1 MUST surface context.Canceled, not nil.
+	runErr := <-done1
+	require.Error(t, runErr, "Phase 1 must surface context.Canceled, not nil")
+	assert.ErrorIs(t, runErr, context.Canceled, "Phase 1 should exit via cancel, got: %v", runErr)
+
+	// Confirm Phase-1 crash left t-0 in a non-terminal state with a stale
+	// assignment — otherwise the reconcile path is vacuous. The paired
+	// (non-terminal status, non-empty assignee) precondition is what makes
+	// the later "t0Dispatches >= 2" check load-bearing: a regression that
+	// redispatches without first clearing Assignee would violate BVV-S-03
+	// (single assignment) under the new dispatch.
+	storeMid, _, err := orch.NewStore("", ledgerDir)
+	require.NoError(t, err)
+	t0Mid, err := storeMid.GetTask("t-0")
+	require.NoError(t, err)
+	require.False(t, t0Mid.Status.Terminal(),
+		"reconcile precondition: t-0 must be non-terminal at crash time, got %s", t0Mid.Status)
+	require.NotEmpty(t, t0Mid.Assignee,
+		"reconcile precondition: t-0 must carry a stale assignment at crash time")
+	require.NoError(t, storeMid.Close())
+
+	// --- Phase 2: Resume with immediate-success spawns ---
+	cfg2 := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg2.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e2, err := orch.NewEngine(cfg2)
+	require.NoError(t, err)
+	e2.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+
+	err = e2.Resume(ctx2)
+	assert.NoError(t, err, "resume after mid-flight crash must complete")
+
+	// Final state: both tasks terminal.
+	store3, _, err := orch.NewStore("", ledgerDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store3.Close()) })
+	for _, id := range []string{"t-0", "t-1"} {
+		task, err := store3.GetTask(id)
+		require.NoError(t, err)
+		assert.True(t, task.Status.Terminal(),
+			"task %s must be terminal after resume, got %s", id, task.Status)
+	}
+
+	// Event-log assertion: the resumed run must dispatch t-0 a SECOND time
+	// after reconcile reset its stale assignment. Count dispatches for t-0
+	// across the full log — Phase 1 contributed one; Phase 2's reconcile
+	// must contribute another.
+	t0Dispatches := 0
+	for _, ev := range readEvents(t, logPath) {
+		if ev.Kind == orch.EventTaskDispatched && ev.TaskID == "t-0" {
+			t0Dispatches++
+		}
+	}
+	assert.GreaterOrEqual(t, t0Dispatches, 2,
+		"reconcile must redispatch t-0 after Phase-1 crash (got %d dispatches)", t0Dispatches)
+}
+
+// TestE2E_ParallelGapExhaustion verifies V&V matrix §9.5: 5 parallel
+// non-critical builders all fail; gap-tolerance=3 trips abort after the
+// 3rd failure; remaining open tasks are blocked per BVV-ERR-04a abort
+// cleanup. The lifecycle returns ErrLifecycleAborted with the audit trail
+// pinning the gap_recorded × 3 → escalation_created sequence.
+func TestE2E_ParallelGapExhaustion(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	branch := "feat/gap-exhaust"
+	lifecycle := testutil.MockLifecycleConfig(branch, orch.RoleBuilder)
+	lifecycle.GapTolerance = 3
+	lifecycle.MaxRetries = 0 // immediate failure → gap counter increment
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "e2e-gap-exhaust"
+	cfg.MaxWorkers = 3
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(1)) // every dispatch fails
+
+	// 5 parallel tasks: 3 will dispatch (fill the worker pool), all fail,
+	// gap trips at the 3rd, abort cleanup blocks the 2 still-open tasks.
+	ledgerDir := filepath.Join(runDir, "ledger")
+	require.NoError(t, os.MkdirAll(ledgerDir, 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "logs"), 0o755))
+	store, _, err := orch.NewStore("", ledgerDir)
+	require.NoError(t, err)
+	testutil.ParallelGraph(t, store, branch, orch.RoleBuilder, 5)
+	require.NoError(t, store.Close())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	err = e.Run(ctx)
+	assert.ErrorIs(t, err, orch.ErrLifecycleAborted,
+		"gap exhaustion at threshold 3 must surface ErrLifecycleAborted")
+
+	// Single log scan: count gap_recorded events and verify the escalation
+	// landed. Gap may overshoot tolerance by up to MaxWorkers-1 (see
+	// handleTerminalFailure; property covered by TestProp_GapBoundedOvershoot).
+	logPath := filepath.Join(runDir, "events.jsonl")
+	gapCount, sawEscalation := 0, false
+	for _, ev := range readEvents(t, logPath) {
+		switch ev.Kind {
+		case orch.EventGapRecorded:
+			gapCount++
+		case orch.EventEscalationCreated:
+			sawEscalation = true
+		}
+	}
+	assert.True(t, sawEscalation, "abort must emit escalation_created")
+	assert.GreaterOrEqual(t, gapCount, lifecycle.GapTolerance,
+		"gap counter must reach the tolerance threshold (got %d)", gapCount)
+	assert.LessOrEqual(t, gapCount, lifecycle.GapTolerance+cfg.MaxWorkers-1,
+		"gap counter must not overshoot by more than MaxWorkers-1 (got %d)", gapCount)
+
+	// BVV-ERR-04a: post-abort, no task should remain `open`. Every task
+	// must be either failed (dispatched + exit 1) or blocked (abort
+	// cleanup swept it before dispatch). The total must account for every
+	// seeded task — a leak would surface as other > 0 or as
+	// failed+blocked < seeded.
+	store2, _, err := orch.NewStore("", ledgerDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store2.Close()) })
+	tasks, err := store2.ListTasks("branch:" + branch)
+	require.NoError(t, err)
+	const seeded = 5
+	require.Len(t, tasks, seeded, "all seeded tasks must still exist in the ledger")
+	failed, blocked, other := 0, 0, 0
+	for _, task := range tasks {
+		switch task.Status {
+		case orch.StatusFailed:
+			failed++
+		case orch.StatusBlocked:
+			blocked++
+		default:
+			other++
+			t.Logf("post-abort task %s has unexpected status %s", task.ID, task.Status)
+		}
+	}
+	assert.Zero(t, other, "BVV-ERR-04a: no tasks may remain non-terminal after abort cleanup")
+	assert.Equal(t, seeded, failed+blocked,
+		"every task must reach a terminal state (failed=%d blocked=%d)", failed, blocked)
+	assert.GreaterOrEqual(t, failed, lifecycle.GapTolerance,
+		"failed count must reach tolerance before abort (got %d)", failed)
+	assert.GreaterOrEqual(t, blocked, 1,
+		"at least one task must be blocked by BVV-ERR-04a cleanup (got %d)", blocked)
 }

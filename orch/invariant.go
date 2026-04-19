@@ -2,6 +2,34 @@
 
 package orch
 
+// TLA+ Traceability Matrix (Go assertion → TLA+ operator → BVV req).
+// Operator names, not line numbers — line numbers rot on refactor.
+// Canonical spec-level mapping: docs/BVV_VV_STRATEGY.md.
+// scripts/trace-requirement.sh greps the rightmost column.
+//
+//   Go Assertion                       TLA+ Operator              Req ID
+//   ----------------------------       ----------------------     -----------------
+//   AssertLifecycleExclusion           LifecycleExclusion         BVV-S-01
+//   AssertTerminalIrreversibility      TerminalIrreversibility    BVV-S-02
+//   AssertSingleAssignment             SingleAssignment           BVV-S-03
+//   AssertDependencyOrdering           DependencyOrdering         BVV-S-04
+//   AssertZeroContentInspection        (by construction)          BVV-S-05
+//   AssertBoundedDegradation           BoundedDegradation         BVV-S-07
+//   AssertWatchdogNoStatusChange       (by construction)          BVV-S-10
+//   AssertLifecycleReleaseDrained      (by construction)          BVV-ERR-10a
+//   AssertWorkerConservation           TypeOK (worker/session)    WC
+//   AssertPostPlannerWellFormed        ValidRoles, AcyclicGraph,  BVV-TG-07, BVV-TG-08,
+//                                      SingleGatePerBranch        BVV-TG-09, BVV-TG-10
+//                                      (all three operators are
+//                                      in BVV.tla §7.5. TG-10
+//                                      has no TLA+ operator —
+//                                      the Go validator
+//                                      (ValidateLifecycleGraph)
+//                                      enforces it via BFS
+//                                      reachability; TLA+ defers
+//                                      full reachability per the
+//                                      BVV.tla §7.5 NOTE.)
+
 import "fmt"
 
 // AssertTerminalIrreversibility panics if a terminal status is being changed
@@ -156,5 +184,28 @@ func AssertWatchdogNoStatusChange(before, after []*Task) {
 func guardWorkerConservation(store Store, maxWorkers int) {
 	if workers, err := store.ListWorkers(); err == nil {
 		AssertWorkerConservation(workers, maxWorkers)
+	}
+}
+
+// AssertPostPlannerWellFormed panics if the post-planner task graph for the
+// given branch fails any of BVV-TG-07..10. Spec-primitive: not called from the
+// engine's success path — the canonical enforcement is ValidateLifecycleGraph
+// at Engine.onPlannerCompleted (engine.go), whose non-nil error triggers
+// escalation + AbortLifecycle in all builds.
+//
+// Kept as a named assertion so:
+//
+//  1. the runtime panic carries a grep-traceable [BVV-TG-07..10] tag for any
+//     future caller (admin tools, watchdog extensions) that wants fail-fast
+//     semantics rather than error-returning graceful abort;
+//  2. validate_spec_test.go can pin the panic contract per-requirement
+//     without reaching into engine state.
+//
+// Callers in the engine's primary dispatch path MUST use ValidateLifecycleGraph
+// directly — panicking from onPlannerCompleted would unwind past Engine.Run and
+// skip Cleanup, leaking the per-branch lockfile and tmux sessions.
+func AssertPostPlannerWellFormed(store Store, branch string, roles map[string]RoleConfig) {
+	if err := ValidateLifecycleGraph(store, branch, roles); err != nil {
+		panic(fmt.Sprintf("[BVV-TG-07..10] post-planner well-formedness violated: %v", err))
 	}
 }

@@ -3,11 +3,15 @@
 package orch_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/endgame/wonka-factory/orch"
+	"github.com/endgame/wonka-factory/orch/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -180,6 +184,125 @@ func TestLogPath_Canonical(t *testing.T) {
 	got := orch.LogPath("/run/abc", "task-001")
 	want := filepath.Join("/run/abc", "logs", "task-001.stdout")
 	assert.Equal(t, want, got)
+}
+
+// TestBVV_AI01_InstructionFileInjection verifies BVV-AI-01: a role's
+// instruction file body is injected into the agent invocation via the
+// preset's SystemPromptFlag. Exercises ReadAgentPrompt → BuildCommand
+// end-to-end so a regression in either side surfaces here.
+func TestBVV_AI01_InstructionFileInjection(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "OOMPA.md")
+	body := "You are a builder. Write code, run tests, commit."
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+
+	gotBody, _, err := orch.ReadAgentPrompt(path)
+	require.NoError(t, err)
+
+	preset := &orch.Preset{
+		Command:          "claude",
+		SystemPromptFlag: "--append-system-prompt",
+	}
+	cmd := orch.BuildCommand(preset, gotBody, "", 0)
+
+	// Locate the flag and assert the immediately-following arg is the body.
+	idx := -1
+	for i, arg := range cmd {
+		if arg == "--append-system-prompt" {
+			idx = i
+			break
+		}
+	}
+	require.NotEqual(t, -1, idx, "SystemPromptFlag missing from cmd: %v", cmd)
+	require.Less(t, idx, len(cmd)-1, "SystemPromptFlag has no value: %v", cmd)
+	assert.Equal(t, body, cmd[idx+1], "instruction body must be the literal flag value")
+}
+
+// TestBVV_AI02_RoleToInstructionMapping verifies BVV-AI-02 end-to-end:
+// the dispatcher resolves a task's role label to the configured
+// RoleConfig and passes that config to the spawn path. Exercises the
+// production lookup instead of a test-local map — a regression that
+// routes by content (BVV-S-05 violation) or drops InstructionFile from
+// roleCfg would fail here.
+func TestBVV_AI02_RoleToInstructionMapping(t *testing.T) {
+	branch := "feat/ai02"
+	rolePaths := map[string]string{
+		orch.RoleBuilder:  "/agents/OOMPA.md",
+		orch.RoleVerifier: "/agents/LOOMPA.md",
+		orch.RolePlanner:  "/agents/CHARLIE.md",
+	}
+
+	roles := make([]string, 0, len(rolePaths))
+	for r := range rolePaths {
+		roles = append(roles, r)
+	}
+	lifecycle := testutil.MockLifecycleConfig(branch, roles...)
+	for r, path := range rolePaths {
+		lifecycle.Roles[r] = orch.RoleConfig{InstructionFile: path}
+	}
+
+	store := testutil.NewMockStore()
+	for r := range rolePaths {
+		require.NoError(t, store.CreateTask(&orch.Task{
+			ID: "t-" + r, Status: orch.StatusOpen,
+			Labels: map[string]string{
+				orch.LabelBranch:      branch,
+				orch.LabelRole:        r,
+				orch.LabelCriticality: string(orch.NonCritical),
+			},
+		}))
+	}
+
+	pool := orch.NewWorkerPool(store, nil, len(rolePaths), "test-run", "/repo", t.TempDir())
+	d, err := orch.NewDispatcher(
+		store, pool, nil, nil, nil,
+		orch.NewGapTracker(lifecycle.GapTolerance),
+		orch.NewRetryState(),
+		orch.NewHandoffState(lifecycle.MaxHandoffs),
+		orch.RetryConfig{MaxRetries: 0, BaseTimeout: 30 * time.Minute},
+		lifecycle,
+		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
+		nil,
+	)
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	observed := map[string]string{}
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		mu.Lock()
+		observed[task.ID] = roleCfg.InstructionFile
+		mu.Unlock()
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeSuccess, 0, roleCfg)
+	})
+
+	d.Tick(context.Background())
+	d.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for r, want := range rolePaths {
+		assert.Equal(t, want, observed["t-"+r],
+			"role %q must dispatch with %q (label-derived lookup)", r, want)
+	}
+}
+
+// TestBVV_AI03_PresetSelection verifies BVV-AI-03: distinct roles may carry
+// distinct presets, and BuildCommand renders each role's preset
+// independently. Pinning this prevents a future "single preset per
+// lifecycle" regression that would tie all roles to the same agent CLI.
+func TestBVV_AI03_PresetSelection(t *testing.T) {
+	claude := &orch.Preset{Command: "claude", Args: []string{"-p"}, SystemPromptFlag: "--append-system-prompt"}
+	codex := &orch.Preset{Command: "codex", Args: []string{"chat"}, SystemPromptFlag: "--system"}
+
+	cmdClaude := orch.BuildCommand(claude, "be a builder", "", 0)
+	cmdCodex := orch.BuildCommand(codex, "be a builder", "", 0)
+
+	assert.Equal(t, "claude", cmdClaude[0])
+	assert.Equal(t, "codex", cmdCodex[0])
+	assert.Contains(t, cmdClaude, "--append-system-prompt")
+	assert.Contains(t, cmdCodex, "--system")
+	assert.NotContains(t, cmdClaude, "--system", "preset isolation: claude must not use codex flag")
+	assert.NotContains(t, cmdCodex, "--append-system-prompt", "preset isolation: codex must not use claude flag")
 }
 
 // TestBVV_DSP04_DetermineOutcome verifies the exit-code-to-outcome mapping
