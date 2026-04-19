@@ -1185,14 +1185,20 @@ func TestE2E_CrashDuringReconciliation(t *testing.T) {
 	require.Error(t, runErr, "Phase 1 must surface context.Canceled, not nil")
 	assert.ErrorIs(t, runErr, context.Canceled, "Phase 1 should exit via cancel, got: %v", runErr)
 
-	// Confirm Phase-1 crash left t-0 in a non-terminal state — otherwise the
-	// reconcile path is vacuous.
+	// Confirm Phase-1 crash left t-0 in a non-terminal state with a stale
+	// assignment — otherwise the reconcile path is vacuous. The paired
+	// (non-terminal status, non-empty assignee) precondition is what makes
+	// the later "t0Dispatches >= 2" check load-bearing: a regression that
+	// redispatches without first clearing Assignee would violate BVV-S-03
+	// (single assignment) under the new dispatch.
 	storeMid, _, err := orch.NewStore("", ledgerDir)
 	require.NoError(t, err)
 	t0Mid, err := storeMid.GetTask("t-0")
 	require.NoError(t, err)
 	require.False(t, t0Mid.Status.Terminal(),
 		"reconcile precondition: t-0 must be non-terminal at crash time, got %s", t0Mid.Status)
+	require.NotEmpty(t, t0Mid.Assignee,
+		"reconcile precondition: t-0 must carry a stale assignment at crash time")
 	require.NoError(t, storeMid.Close())
 
 	// --- Phase 2: Resume with immediate-success spawns ---

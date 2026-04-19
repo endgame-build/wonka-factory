@@ -20,11 +20,15 @@ package orch
 //   AssertWorkerConservation           TypeOK (worker/session)    WC
 //   AssertPostPlannerWellFormed        ValidRoles, AcyclicGraph,  BVV-TG-07, BVV-TG-08,
 //                                      SingleGatePerBranch        BVV-TG-09, BVV-TG-10
-//                                      (partial: TG-07..09 in
-//                                      BVVLifecycle; TG-10
-//                                      weakened — not a search
-//                                      target, see rightmost
-//                                      column for grep)
+//                                      (all three operators are
+//                                      in BVV.tla §7.5. TG-10
+//                                      has no TLA+ operator —
+//                                      the Go validator
+//                                      (ValidateLifecycleGraph)
+//                                      enforces it via BFS
+//                                      reachability; TLA+ defers
+//                                      full reachability per the
+//                                      BVV.tla §7.5 NOTE.)
 
 import "fmt"
 
@@ -184,20 +188,22 @@ func guardWorkerConservation(store Store, maxWorkers int) {
 }
 
 // AssertPostPlannerWellFormed panics if the post-planner task graph for the
-// given branch fails any of BVV-TG-07..10. Called from Engine.onPlannerCompleted
-// immediately after ValidateLifecycleGraph returns nil.
+// given branch fails any of BVV-TG-07..10. Spec-primitive: not called from the
+// engine's success path — the canonical enforcement is ValidateLifecycleGraph
+// at Engine.onPlannerCompleted (engine.go), whose non-nil error triggers
+// escalation + AbortLifecycle in all builds.
 //
-// This is a re-execution of the same validator the engine just ran — so a
-// buggy validator breaks both call sites together. The assertion's value is
-// not catching validator regressions; it is:
+// Kept as a named assertion so:
 //
-//  1. surfacing graph violations as a grep-traceable panic ([BVV-TG-07..10])
-//     for any future code path that calls it without first checking the err;
-//  2. providing a named, independently-testable contract that tests can pin
-//     the post-planner invariant against without reaching into engine state;
-//  3. offering a stable assertion API for future call sites (admin tools,
-//     watchdog extensions) that need to re-verify the invariant without
-//     re-implementing the validator's traversal.
+//  1. the runtime panic carries a grep-traceable [BVV-TG-07..10] tag for any
+//     future caller (admin tools, watchdog extensions) that wants fail-fast
+//     semantics rather than error-returning graceful abort;
+//  2. validate_spec_test.go can pin the panic contract per-requirement
+//     without reaching into engine state.
+//
+// Callers in the engine's primary dispatch path MUST use ValidateLifecycleGraph
+// directly — panicking from onPlannerCompleted would unwind past Engine.Run and
+// skip Cleanup, leaking the per-branch lockfile and tmux sessions.
 func AssertPostPlannerWellFormed(store Store, branch string, roles map[string]RoleConfig) {
 	if err := ValidateLifecycleGraph(store, branch, roles); err != nil {
 		panic(fmt.Sprintf("[BVV-TG-07..10] post-planner well-formedness violated: %v", err))
