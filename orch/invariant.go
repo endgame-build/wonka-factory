@@ -2,27 +2,27 @@
 
 package orch
 
-// TLA+ Traceability Matrix
+// TLA+ Traceability Matrix (Go assertion → TLA+ operator → BVV req).
+// Operator names, not line numbers — line numbers rot on refactor.
+// Canonical spec-level mapping: docs/BVV_VV_STRATEGY.md.
+// scripts/trace-requirement.sh greps the rightmost column.
 //
-// Each runtime assertion below corresponds to a TLA+ operator (or set of
-// operators) in the formal model under docs/specs/tla/. Line numbers
-// reference BVV.tla unless otherwise noted. Update this matrix whenever an
-// assertion is added, renamed, or removed. The matrix is intentionally
-// grep-parseable: scripts/trace-requirement.sh keys off the requirement IDs
-// in the rightmost column to surface the spec → model → assertion chain.
-//
-//   Go Assertion                       TLA+ Operator             BVV.tla  Req ID
-//   ----------------------------       ----------------------    -------  -----------------
-//   AssertLifecycleExclusion           LifecycleExclusion        :295     BVV-S-01
-//   AssertTerminalIrreversibility      TerminalIrreversibility   :307     BVV-S-02
-//   AssertSingleAssignment             SingleAssignment          :321     BVV-S-03
-//   AssertDependencyOrdering           DependencyOrdering        :327     BVV-S-04
-//   AssertZeroContentInspection        (by construction)         —        BVV-S-05
-//   AssertBoundedDegradation           BoundedDegradation        :344     BVV-S-07
-//   AssertWatchdogNoStatusChange       (by construction)         —        BVV-S-10
-//   AssertLifecycleReleaseDrained      (by construction)         —        BVV-ERR-10a
-//   AssertWorkerConservation           TypeOK (worker/session)   :268     WC
-//   AssertPostPlannerWellFormed        (no TLA+ counterpart)     —        BVV-TG-07..10
+//   Go Assertion                       TLA+ Operator              Req ID
+//   ----------------------------       ----------------------     -----------------
+//   AssertLifecycleExclusion           LifecycleExclusion         BVV-S-01
+//   AssertTerminalIrreversibility      TerminalIrreversibility    BVV-S-02
+//   AssertSingleAssignment             SingleAssignment           BVV-S-03
+//   AssertDependencyOrdering           DependencyOrdering         BVV-S-04
+//   AssertZeroContentInspection        (by construction)          BVV-S-05
+//   AssertBoundedDegradation           BoundedDegradation         BVV-S-07
+//   AssertWatchdogNoStatusChange       (by construction)          BVV-S-10
+//   AssertLifecycleReleaseDrained      (by construction)          BVV-ERR-10a
+//   AssertWorkerConservation           TypeOK (worker/session)    WC
+//   AssertPostPlannerWellFormed        ValidRoles, AcyclicGraph,  BVV-TG-07..10
+//                                      SingleGatePerBranch
+//                                      (partial: TG-07..09 in
+//                                      BVVLifecycle; TG-10
+//                                      weakened)
 
 import "fmt"
 

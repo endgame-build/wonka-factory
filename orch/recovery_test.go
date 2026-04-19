@@ -3,12 +3,14 @@
 package orch_test
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/endgame/wonka-factory/orch"
+	"github.com/endgame/wonka-factory/orch/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -391,32 +393,66 @@ func TestBVV_ERR11a_HandoffStateSetCounts(t *testing.T) {
 	assert.False(t, h.CanHandoff("task-b"), "replayed count + new increment hit limit")
 }
 
-// TestBVV_L04_HandoffNotResetOnRetry verifies BVV-L-04: a retry (exit 1)
-// does not reset the handoff counter. RetryState and HandoffState are
-// orthogonal concerns; the only legitimate reset of HandoffState is a
-// human re-open (BVV-S-02a, covered by TestBVV_S02a_HandoffStateReset).
-//
-// The property is asserted by the absence of coupling: simulate two
-// handoffs, then a retry, then assert the handoff count is unchanged.
-// A regression that introduced a "reset on retry" path would fail here.
+// TestBVV_L04_HandoffNotResetOnRetry verifies BVV-L-04: driving the full
+// dispatcher retry path (exit 1 → handleFailure → RecordAttempt) must NOT
+// reset the handoff counter. The only legitimate call to HandoffState.Reset
+// is the human re-open path in engine.go. A regression adding
+// handoffs.Reset() inside handleFailure would fail here.
 func TestBVV_L04_HandoffNotResetOnRetry(t *testing.T) {
 	const taskID = "task-handoff-retry"
+	branch := "feat/l04"
+
+	store := testutil.NewMockStore()
+	lifecycle := testutil.MockLifecycleConfig(branch, orch.RoleBuilder)
+	lifecycle.MaxRetries = 2
+	pool := orch.NewWorkerPool(store, nil, 1, "test-run", "/repo", t.TempDir())
+
+	// Seed prior handoff state: 2 handoffs already recorded on the task.
+	// A regression that zeroed this inside the retry path would drop the
+	// observed count back to 0, bypass BVV-L-04's budget check, and allow
+	// unbounded handoff cycles.
+	handoffs := orch.NewHandoffState(5)
+	handoffs.RecordHandoffUnchecked(taskID)
+	handoffs.RecordHandoffUnchecked(taskID)
+	require.Equal(t, 2, handoffs.Count(taskID), "preconditions: 2 handoffs staged")
 
 	retries := orch.NewRetryState()
-	handoffs := orch.NewHandoffState(5)
+	d, err := orch.NewDispatcher(
+		store, pool, nil, nil, nil,
+		orch.NewGapTracker(10), retries, handoffs,
+		orch.RetryConfig{MaxRetries: lifecycle.MaxRetries, BaseTimeout: 30 * time.Minute},
+		lifecycle,
+		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
+		nil,
+	)
+	require.NoError(t, err)
 
-	// Simulate two handoffs (sessions 1 and 2).
-	handoffs.RecordHandoffUnchecked(taskID)
-	handoffs.RecordHandoffUnchecked(taskID)
-	require.Equal(t, 2, handoffs.Count(taskID), "preconditions: 2 handoffs recorded")
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID: taskID, Status: orch.StatusOpen,
+		Labels: map[string]string{
+			orch.LabelBranch:      branch,
+			orch.LabelRole:        orch.RoleBuilder,
+			orch.LabelCriticality: string(orch.NonCritical),
+		},
+	}))
 
-	// Simulate a retry (orchestrator processed an exit-1 outcome).
-	retries.RecordAttempt(taskID)
-	require.Equal(t, 1, retries.AttemptCount(taskID), "preconditions: 1 retry recorded")
+	// Exit 1 drives the retry path in Dispatcher.handleFailure.
+	d.SetSpawnFunc(testutil.ImmediateSpawnFunc(1))
 
-	// L-04 invariant: handoff count unchanged.
+	ctx := context.Background()
+	d.Tick(ctx) // dispatch → spawn → outcome(exit 1)
+	d.Wait()
+	d.Tick(ctx) // process retry outcome
+
+	// Retry must have been recorded on RetryState.
+	assert.Equal(t, 1, retries.AttemptCount(taskID),
+		"retry path must increment RetryState (sanity: we actually ran the retry)")
+
+	// L-04 invariant: handoff count survived the retry unchanged. The only
+	// legitimate mutation path for HandoffState during a retry is zero
+	// calls to Reset / RecordHandoff* — the handler must leave it alone.
 	assert.Equal(t, 2, handoffs.Count(taskID),
-		"BVV-L-04: handoff counter must not reset on retry")
+		"BVV-L-04: handoff counter must not reset on retry (dispatcher retry path)")
 	assert.True(t, handoffs.CanHandoff(taskID),
-		"BVV-L-04: budget unchanged — task can still hand off (limit 5, used 2)")
+		"BVV-L-04: remaining budget preserved (limit 5, used 2) — task may still hand off")
 }

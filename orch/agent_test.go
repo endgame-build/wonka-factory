@@ -3,11 +3,15 @@
 package orch_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/endgame/wonka-factory/orch"
+	"github.com/endgame/wonka-factory/orch/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -214,32 +218,72 @@ func TestBVV_AI01_InstructionFileInjection(t *testing.T) {
 	assert.Equal(t, body, cmd[idx+1], "instruction body must be the literal flag value")
 }
 
-// TestBVV_AI02_RoleToInstructionMapping verifies BVV-AI-02: a task's role
-// label is the lookup key into LifecycleConfig.Roles, which returns the
-// instruction file path. The mapping is the contract the dispatcher relies
-// on to inject the right system prompt for the right role.
+// TestBVV_AI02_RoleToInstructionMapping verifies BVV-AI-02 end-to-end:
+// the dispatcher resolves a task's role label to the configured
+// RoleConfig and passes that config to the spawn path. Exercises the
+// production lookup instead of a test-local map — a regression that
+// routes by content (BVV-S-05 violation) or drops InstructionFile from
+// roleCfg would fail here.
 func TestBVV_AI02_RoleToInstructionMapping(t *testing.T) {
-	roles := map[string]orch.RoleConfig{
-		orch.RoleBuilder:  {InstructionFile: "/agents/OOMPA.md"},
-		orch.RoleVerifier: {InstructionFile: "/agents/LOOMPA.md"},
-		orch.RolePlanner:  {InstructionFile: "/agents/CHARLIE.md"},
+	branch := "feat/ai02"
+	rolePaths := map[string]string{
+		orch.RoleBuilder:  "/agents/OOMPA.md",
+		orch.RoleVerifier: "/agents/LOOMPA.md",
+		orch.RolePlanner:  "/agents/CHARLIE.md",
 	}
-	cases := []struct {
-		role     string
-		wantFile string
-	}{
-		{orch.RoleBuilder, "/agents/OOMPA.md"},
-		{orch.RoleVerifier, "/agents/LOOMPA.md"},
-		{orch.RolePlanner, "/agents/CHARLIE.md"},
+
+	roles := make([]string, 0, len(rolePaths))
+	for r := range rolePaths {
+		roles = append(roles, r)
 	}
-	for _, c := range cases {
-		cfg, ok := roles[c.role]
-		require.True(t, ok, "role %q must be in role map", c.role)
-		assert.Equal(t, c.wantFile, cfg.InstructionFile,
-			"role %q must map to %q", c.role, c.wantFile)
+	lifecycle := testutil.MockLifecycleConfig(branch, roles...)
+	for r, path := range rolePaths {
+		lifecycle.Roles[r] = orch.RoleConfig{InstructionFile: path}
 	}
-	_, ok := roles["unknown"]
-	assert.False(t, ok, "unknown role must miss the map (dispatcher escalates per BVV-DSP-03a)")
+
+	store := testutil.NewMockStore()
+	for r := range rolePaths {
+		require.NoError(t, store.CreateTask(&orch.Task{
+			ID: "t-" + r, Status: orch.StatusOpen,
+			Labels: map[string]string{
+				orch.LabelBranch:      branch,
+				orch.LabelRole:        r,
+				orch.LabelCriticality: string(orch.NonCritical),
+			},
+		}))
+	}
+
+	pool := orch.NewWorkerPool(store, nil, len(rolePaths), "test-run", "/repo", t.TempDir())
+	d, err := orch.NewDispatcher(
+		store, pool, nil, nil, nil,
+		orch.NewGapTracker(lifecycle.GapTolerance),
+		orch.NewRetryState(),
+		orch.NewHandoffState(lifecycle.MaxHandoffs),
+		orch.RetryConfig{MaxRetries: 0, BaseTimeout: 30 * time.Minute},
+		lifecycle,
+		orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 5 * time.Millisecond},
+		nil,
+	)
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	observed := map[string]string{}
+	d.SetSpawnFunc(func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
+		mu.Lock()
+		observed[task.ID] = roleCfg.InstructionFile
+		mu.Unlock()
+		outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeSuccess, 0, roleCfg)
+	})
+
+	d.Tick(context.Background())
+	d.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for r, want := range rolePaths {
+		assert.Equal(t, want, observed["t-"+r],
+			"role %q must dispatch with %q (label-derived lookup)", r, want)
+	}
 }
 
 // TestBVV_AI03_PresetSelection verifies BVV-AI-03: distinct roles may carry

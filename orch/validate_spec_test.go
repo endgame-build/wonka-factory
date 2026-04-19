@@ -349,34 +349,77 @@ func TestBVV_TG07to10_AssertPostPlannerWellFormed_NoOpOnValid(t *testing.T) {
 }
 
 // TestBVV_TG07to10_AssertPostPlannerWellFormed_PanicsOnInvalid pins the
-// hard-failure contract: any TG-07..10 violation must surface as a panic
-// carrying the [BVV-TG-07..10] tag so log scrapers and crash reporters
-// classify it as a spec-invariant breach rather than a generic runtime
-// fault. The two-gate failure mode is the cheapest mutation of the
-// canonical graph — any other TG-* mutation works equally well since the
-// assertion delegates uniformly to ValidateLifecycleGraph.
+// hard-failure contract: EACH of BVV-TG-07..10 must surface as a panic
+// carrying both the class tag [BVV-TG-07..10] and the specific requirement
+// ID. Table-driven so a future change that silently stops propagating any
+// one of the four requirements (e.g. a logging wrapper that collapses
+// errors into a single "graph invalid" message) fails here instead of
+// passing a single-case test.
 func TestBVV_TG07to10_AssertPostPlannerWellFormed_PanicsOnInvalid(t *testing.T) {
-	store := testutil.NewMockStore()
-	buildWellFormedGraph(t, store, "feat/x")
-	// Inject a second gate to force a TG-09 violation ("exactly one gate").
-	require.NoError(t, store.CreateTask(&orch.Task{
-		ID: "gate-2", Status: orch.StatusOpen,
-		Labels: map[string]string{
-			orch.LabelBranch: "feat/x",
-			orch.LabelRole:   orch.RoleGate,
+	cases := []struct {
+		name   string
+		mutate func(t *testing.T, store *testutil.MockStore)
+		reqID  string
+	}{
+		{
+			name: "TG-07_UnknownRole",
+			mutate: func(t *testing.T, store *testutil.MockStore) {
+				require.NoError(t, store.CreateTask(&orch.Task{
+					ID: "mystery-1", Status: orch.StatusOpen,
+					Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: "mystery"},
+				}))
+				require.NoError(t, store.AddDep("mystery-1", "plan-1"))
+			},
+			reqID: "BVV-TG-07",
 		},
-	}))
-	require.NoError(t, store.AddDep("gate-2", "verify-1"))
+		{
+			name: "TG-08_Cycle",
+			mutate: func(t *testing.T, store *testutil.MockStore) {
+				// Force verify-1 ↔ gate-1 cycle via the MockStore-only InjectDep.
+				store.InjectDep("verify-1", "gate-1")
+			},
+			reqID: "BVV-TG-08",
+		},
+		{
+			name: "TG-09_MultipleGates",
+			mutate: func(t *testing.T, store *testutil.MockStore) {
+				require.NoError(t, store.CreateTask(&orch.Task{
+					ID: "gate-2", Status: orch.StatusOpen,
+					Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: orch.RoleGate},
+				}))
+				require.NoError(t, store.AddDep("gate-2", "verify-1"))
+			},
+			reqID: "BVV-TG-09",
+		},
+		{
+			name: "TG-10_OrphanTask",
+			mutate: func(t *testing.T, store *testutil.MockStore) {
+				require.NoError(t, store.CreateTask(&orch.Task{
+					ID: "orphan-1", Status: orch.StatusOpen,
+					Labels: map[string]string{orch.LabelBranch: "feat/x", orch.LabelRole: orch.RoleBuilder},
+				}))
+				// No AddDep — orphan-1 is unreachable from plan-1.
+			},
+			reqID: "BVV-TG-10",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store := testutil.NewMockStore()
+			buildWellFormedGraph(t, store, "feat/x")
+			c.mutate(t, store)
 
-	defer func() {
-		r := recover()
-		require.NotNil(t, r, "AssertPostPlannerWellFormed must panic on invalid graph")
-		msg := fmt.Sprintf("%v", r)
-		assert.Contains(t, msg, "[BVV-TG-07..10]",
-			"panic message must carry the requirement-class tag for log scrapers")
-		assert.Contains(t, msg, "BVV-TG-09",
-			"panic message must include the specific requirement that failed")
-	}()
-	orch.AssertPostPlannerWellFormed(store, "feat/x", standardRoles())
-	t.Fatal("unreachable — assertion should have panicked")
+			defer func() {
+				r := recover()
+				require.NotNil(t, r, "AssertPostPlannerWellFormed must panic on %s violation", c.reqID)
+				msg := fmt.Sprintf("%v", r)
+				assert.Contains(t, msg, "[BVV-TG-07..10]",
+					"panic message must carry the requirement-class tag for log scrapers")
+				assert.Contains(t, msg, c.reqID,
+					"panic message must name the specific failed requirement (%s)", c.reqID)
+			}()
+			orch.AssertPostPlannerWellFormed(store, "feat/x", standardRoles())
+			t.Fatalf("unreachable — %s violation should have panicked", c.reqID)
+		})
+	}
 }

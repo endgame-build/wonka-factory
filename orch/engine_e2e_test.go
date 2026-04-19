@@ -504,7 +504,8 @@ func TestE2E_PlannerIdempotent(t *testing.T) {
 
 	// plannerAttempts is captured so the planner fails on attempt 1, succeeds on attempt 2.
 	// seedLifecycleGraph runs on BOTH attempts — verifies idempotency.
-	var plannerAttempts int
+	// atomic.Int32: spawn func runs on dispatch goroutine; test reads on test goroutine.
+	var plannerAttempts atomic.Int32
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
 	e.SetTestSpawnFunc(plannerE2ESpawnFunc(t, e, branch, wellFormedGraph(), &plannerAttempts))
@@ -514,7 +515,7 @@ func TestE2E_PlannerIdempotent(t *testing.T) {
 
 	err = e.Run(ctx)
 	assert.NoError(t, err, "idempotent planner should complete despite first-attempt failure")
-	assert.GreaterOrEqual(t, plannerAttempts, 2, "planner should have been invoked at least twice")
+	assert.GreaterOrEqual(t, int(plannerAttempts.Load()), 2, "planner should have been invoked at least twice")
 
 	// Post-run: only one build-1 / verify-1 / gate-1 should exist (no dupes).
 	ledgerDir := filepath.Join(runDir, "ledger")
@@ -620,19 +621,16 @@ func TestE2E_PlannerGraphInvalid(t *testing.T) {
 // store via seedGraphForTest. If attempts is non-nil, the first planner
 // invocation fails (exit 1) and subsequent attempts succeed — exercises
 // BVV-TG-02 idempotency through the retry path. Non-planner roles
-// succeed immediately (exit 0).
-//
-// The engine reference is captured by closure; e.Store() resolves lazily
-// at invocation time, after init() has populated it.
-func plannerE2ESpawnFunc(t *testing.T, e *orch.Engine, branch string, tasks []seededTask, attempts *int) orch.SpawnFunc {
+// succeed immediately (exit 0). e.Store() resolves lazily at invocation
+// time, after init() has populated it.
+func plannerE2ESpawnFunc(t *testing.T, e *orch.Engine, branch string, tasks []seededTask, attempts *atomic.Int32) orch.SpawnFunc {
 	return func(_ context.Context, task *orch.Task, worker *orch.Worker, roleCfg orch.RoleConfig, _ int, outcomes chan<- orch.TaskOutcome) {
 		if task.Role() == orch.RolePlanner {
 			if store := e.Store(); store != nil {
 				seedGraphForTest(t, store, branch, tasks)
 			}
 			if attempts != nil {
-				*attempts++
-				if *attempts == 1 {
+				if attempts.Add(1) == 1 {
 					outcomes <- orch.NewTaskOutcome(task, worker, orch.OutcomeFailure, 1, roleCfg)
 					return
 				}
@@ -1009,7 +1007,8 @@ func TestE2E_PlannerPartialFailure(t *testing.T) {
 		},
 	})
 
-	var plannerAttempts int
+	// atomic.Int32: spawn func runs on dispatch goroutine; test reads on test goroutine.
+	var plannerAttempts atomic.Int32
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
 	e.SetTestSpawnFunc(plannerE2ESpawnFunc(t, e, branch, wellFormedGraph(), &plannerAttempts))
@@ -1019,7 +1018,8 @@ func TestE2E_PlannerPartialFailure(t *testing.T) {
 
 	err = e.Run(ctx)
 	assert.NoError(t, err, "lifecycle must complete after planner retry succeeds")
-	assert.GreaterOrEqual(t, plannerAttempts, 2, "planner must have been retried at least once")
+	// Exact == not >= so a watchdog-driven over-retry regression fails here.
+	assert.Equal(t, int32(2), plannerAttempts.Load(), "planner must retry exactly once (1 fail + 1 success)")
 
 	logPath := filepath.Join(runDir, "events.jsonl")
 	// Mandatory event sequence per V&V matrix §9.2.
@@ -1179,9 +1179,11 @@ func TestE2E_CrashDuringReconciliation(t *testing.T) {
 	// Wait for t-0 to be dispatched (and therefore in_progress).
 	waitForTaskEvent(t, logPath, orch.EventTaskDispatched, "t-0", 10*time.Second)
 	cancel1()
-	if runErr := <-done1; runErr != nil {
-		assert.ErrorIs(t, runErr, context.Canceled, "Phase 1 should exit via cancel")
-	}
+	// ChannelSpawnFunc blocks forever — t-0 can't terminate before the
+	// cancel, so Phase 1 MUST surface context.Canceled, not nil.
+	runErr := <-done1
+	require.Error(t, runErr, "Phase 1 must surface context.Canceled, not nil")
+	assert.ErrorIs(t, runErr, context.Canceled, "Phase 1 should exit via cancel, got: %v", runErr)
 
 	// Confirm Phase-1 crash left t-0 in a non-terminal state — otherwise the
 	// reconcile path is vacuous.
@@ -1274,29 +1276,37 @@ func TestE2E_ParallelGapExhaustion(t *testing.T) {
 	assert.ErrorIs(t, err, orch.ErrLifecycleAborted,
 		"gap exhaustion at threshold 3 must surface ErrLifecycleAborted")
 
+	// Single log scan: count gap_recorded events and verify the escalation
+	// landed. Gap may overshoot tolerance by up to MaxWorkers-1 (see
+	// handleTerminalFailure; property covered by TestProp_GapBoundedOvershoot).
 	logPath := filepath.Join(runDir, "events.jsonl")
-	assertEventKinds(t, logPath, orch.EventGapRecorded, orch.EventEscalationCreated)
-
-	// Count gap_recorded events — must reach the tolerance threshold.
-	gapCount := 0
+	gapCount, sawEscalation := 0, false
 	for _, ev := range readEvents(t, logPath) {
-		if ev.Kind == orch.EventGapRecorded {
+		switch ev.Kind {
+		case orch.EventGapRecorded:
 			gapCount++
+		case orch.EventEscalationCreated:
+			sawEscalation = true
 		}
 	}
+	assert.True(t, sawEscalation, "abort must emit escalation_created")
 	assert.GreaterOrEqual(t, gapCount, lifecycle.GapTolerance,
-		"gap counter must hit tolerance before abort, got %d", gapCount)
+		"gap counter must reach the tolerance threshold (got %d)", gapCount)
+	assert.LessOrEqual(t, gapCount, lifecycle.GapTolerance+cfg.MaxWorkers-1,
+		"gap counter must not overshoot by more than MaxWorkers-1 (got %d)", gapCount)
 
-	// BVV-ERR-04a: post-abort, no task should remain `open`. Failed tasks
-	// stay failed; remaining open-at-abort tasks become blocked. The exact
-	// failed/blocked split depends on how many were dispatched before the
-	// abort triggered — we assert the spec invariant (no open tasks left)
-	// rather than a brittle exact split.
+	// BVV-ERR-04a: post-abort, no task should remain `open`. Every task
+	// must be either failed (dispatched + exit 1) or blocked (abort
+	// cleanup swept it before dispatch). The total must account for every
+	// seeded task — a leak would surface as other > 0 or as
+	// failed+blocked < seeded.
 	store2, _, err := orch.NewStore("", ledgerDir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store2.Close()) })
 	tasks, err := store2.ListTasks("branch:" + branch)
 	require.NoError(t, err)
+	const seeded = 5
+	require.Len(t, tasks, seeded, "all seeded tasks must still exist in the ledger")
 	failed, blocked, other := 0, 0, 0
 	for _, task := range tasks {
 		switch task.Status {
@@ -1310,8 +1320,10 @@ func TestE2E_ParallelGapExhaustion(t *testing.T) {
 		}
 	}
 	assert.Zero(t, other, "BVV-ERR-04a: no tasks may remain non-terminal after abort cleanup")
+	assert.Equal(t, seeded, failed+blocked,
+		"every task must reach a terminal state (failed=%d blocked=%d)", failed, blocked)
 	assert.GreaterOrEqual(t, failed, lifecycle.GapTolerance,
-		"expected at least GapTolerance failed tasks (one per gap), got %d", failed)
+		"failed count must reach tolerance before abort (got %d)", failed)
 	assert.GreaterOrEqual(t, blocked, 1,
-		"expected at least 1 blocked task from BVV-ERR-04a cleanup, got %d", blocked)
+		"at least one task must be blocked by BVV-ERR-04a cleanup (got %d)", blocked)
 }

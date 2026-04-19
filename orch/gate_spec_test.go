@@ -5,6 +5,8 @@ package orch_test
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/endgame/wonka-factory/orch"
@@ -12,6 +14,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// goCommentRegex matches //-line and /* */-block comments. Relies on gate.go
+// containing no `//` or `/*` inside string literals (verified; keep that way).
+var goCommentRegex = regexp.MustCompile(`//[^\n]*|/\*[\s\S]*?\*/`)
 
 // TestBVV_GT03_PredecessorCheck verifies that ExecuteGate returns 1 (fail)
 // without creating a PR when any predecessor has status failed or blocked
@@ -105,22 +111,24 @@ func TestBVV_S06_GateAuthority(t *testing.T) {
 	assert.Equal(t, orch.OutcomeFailure, orch.DetermineOutcome(1))
 }
 
-// TestBVV_GT01_NoAutoMerge verifies BVV-GT-01: the gate MUST NOT merge the
-// PR. The spec is enforced by structural absence — gate.go invokes only
-// the gh subcommands needed for PR creation and CI polling. A future PR
-// that adds `gh pr merge` (or any other "merge" string literal that could
-// reach an args slice) breaks this test.
-//
-// String-literal scan rather than exec-arg scan: the latter is strictly
-// weaker (it only catches direct exec.Command("gh", "pr", "merge", ...)
-// patterns) and a literal-anywhere check subsumes it. If a future commit
-// builds the args slice indirectly (e.g. via a const or a helper), the
-// literal-scan still catches it.
+// TestBVV_GT01_NoAutoMerge verifies BVV-GT-01: gate.go must never invoke
+// `gh pr merge`. Comments are stripped before scanning so a docstring that
+// legitimately mentions "merge" doesn't false-positive. Three substring
+// patterns cover the realistic regression modes — exec args, shell form,
+// and format-string embedding.
 func TestBVV_GT01_NoAutoMerge(t *testing.T) {
 	src, err := os.ReadFile("gate.go")
 	require.NoError(t, err, "gate.go must be readable from package dir")
-	assert.NotContains(t, string(src), `"merge"`,
-		"gate.go must contain no \"merge\" string literal — BVV-GT-01")
+	stripped := goCommentRegex.ReplaceAllString(string(src), "")
+
+	for _, pat := range []string{
+		`"pr", "merge"`, // exec.Command("gh", "pr", "merge", ...)
+		`"pr merge"`,    // shell form or single-arg invocation
+		`pr merge`,      // embedded in a format string / shell command
+	} {
+		assert.NotContains(t, stripped, pat,
+			"gate.go must not contain %q (BVV-GT-01)", pat)
+	}
 }
 
 // TestBVV_GT02_GateFailureIsolation verifies BVV-GT-02: a failing gate on
@@ -129,17 +137,18 @@ func TestBVV_GT01_NoAutoMerge(t *testing.T) {
 // branch-scoped — each ExecuteGate call reads only its own branch's
 // dependency state.
 //
-// The test runs both gates and asserts:
+// The test runs both gates, shares an EventLog between them, and asserts:
 //
 //  1. Gate A returns exit 1 because its predecessor is failed (BVV-GT-03).
 //  2. Branch B's predecessor (build-b) remains completed after gate-a's
 //     failure — i.e., gate-a did not mutate cross-branch state.
 //  3. Gate B passes the predecessor check (its own predecessor is
 //     completed) and proceeds to the gh invocation. The gh CLI is absent
-//     in tests, so gate-b also returns 1 — but for a different reason
-//     than gate-a. We verify the divergent reasons via the gate event
-//     log: gate-a emits gate_failed with a "predecessor" detail; gate-b
-//     emits gate_failed with a gh-related detail.
+//     in tests, so gate-b also returns 1 — but via a different path.
+//  4. The two gate_failed event Summaries carry divergent reasons:
+//     gate-a's contains "predecessor"; gate-b's contains "gh pr".
+//     Proves the "different failure mode" claim instead of treating the
+//     exit codes as interchangeable.
 func TestBVV_GT02_GateFailureIsolation(t *testing.T) {
 	store := testutil.NewMockStore()
 
@@ -158,7 +167,14 @@ func TestBVV_GT02_GateFailureIsolation(t *testing.T) {
 		Labels: map[string]string{orch.LabelBranch: "feat/b"}}))
 	require.NoError(t, store.AddDep("gate-b", "build-b"))
 
-	exitA := orch.ExecuteGate(context.Background(), store, nil,
+	// Shared event log — both gate invocations write here, so we can
+	// distinguish their failure paths from a single artifact.
+	logPath := filepath.Join(t.TempDir(), "events.jsonl")
+	log, err := orch.NewEventLog(logPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, log.Close()) })
+
+	exitA := orch.ExecuteGate(context.Background(), store, log,
 		"gate-a", "/tmp/repo", "main", "feat/a", orch.DefaultGateConfig())
 	assert.Equal(t, 1, exitA, "branch A gate must fail on failed predecessor")
 
@@ -168,13 +184,7 @@ func TestBVV_GT02_GateFailureIsolation(t *testing.T) {
 	assert.Equal(t, orch.StatusCompleted, depB.Status,
 		"branch B predecessor must remain completed after branch A gate failed")
 
-	// Behavioral isolation: gate-b proceeds past its own (passing) predecessor
-	// check and reaches the gh invocation. gh is absent in tests, so the
-	// final exit is also 1 — but the path through the function differs.
-	// Asserting only the exit code can't distinguish the two failure modes;
-	// the value here is that ExecuteGate does not panic, returns cleanly,
-	// and does not mutate gate-a's state.
-	exitB := orch.ExecuteGate(context.Background(), store, nil,
+	exitB := orch.ExecuteGate(context.Background(), store, log,
 		"gate-b", "/tmp/repo", "main", "feat/b", orch.DefaultGateConfig())
 	assert.Equal(t, 1, exitB, "branch B gate must return cleanly even when gh is unavailable")
 
@@ -184,4 +194,27 @@ func TestBVV_GT02_GateFailureIsolation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, orch.StatusFailed, depA.Status,
 		"branch A predecessor state must survive branch B gate execution")
+
+	// Event-log discrimination: scan gate_failed emissions and pin the
+	// divergent Summary text — the load-bearing evidence that the two
+	// gates failed via different paths, not the exit code alone.
+	summaries := gateFailedSummaries(t, logPath)
+	assert.Contains(t, summaries["gate-a"], "predecessor",
+		"gate-a must fail via the predecessor check (BVV-GT-03); summary was %q", summaries["gate-a"])
+	assert.Contains(t, summaries["gate-b"], "gh pr",
+		"gate-b must fail via the gh invocation (predecessor passed); summary was %q", summaries["gate-b"])
+	assert.NotContains(t, summaries["gate-b"], "predecessor",
+		"gate-b must NOT fail on predecessor check — its predecessor is completed")
+}
+
+// gateFailedSummaries returns the last gate_failed Summary per taskID.
+func gateFailedSummaries(t *testing.T, logPath string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, ev := range readEvents(t, logPath) {
+		if ev.Kind == orch.EventGateFailed {
+			out[ev.TaskID] = ev.Summary
+		}
+	}
+	return out
 }
