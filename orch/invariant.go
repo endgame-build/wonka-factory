@@ -18,11 +18,13 @@ package orch
 //   AssertWatchdogNoStatusChange       (by construction)          BVV-S-10
 //   AssertLifecycleReleaseDrained      (by construction)          BVV-ERR-10a
 //   AssertWorkerConservation           TypeOK (worker/session)    WC
-//   AssertPostPlannerWellFormed        ValidRoles, AcyclicGraph,  BVV-TG-07..10
-//                                      SingleGatePerBranch
+//   AssertPostPlannerWellFormed        ValidRoles, AcyclicGraph,  BVV-TG-07, BVV-TG-08,
+//                                      SingleGatePerBranch        BVV-TG-09, BVV-TG-10
 //                                      (partial: TG-07..09 in
 //                                      BVVLifecycle; TG-10
-//                                      weakened)
+//                                      weakened — not a search
+//                                      target, see rightmost
+//                                      column for grep)
 
 import "fmt"
 

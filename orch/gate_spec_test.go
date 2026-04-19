@@ -4,9 +4,13 @@ package orch_test
 
 import (
 	"context"
-	"os"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
-	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/endgame/wonka-factory/orch"
@@ -14,10 +18,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// goCommentRegex matches //-line and /* */-block comments. Relies on gate.go
-// containing no `//` or `/*` inside string literals (verified; keep that way).
-var goCommentRegex = regexp.MustCompile(`//[^\n]*|/\*[\s\S]*?\*/`)
 
 // TestBVV_GT03_PredecessorCheck verifies that ExecuteGate returns 1 (fail)
 // without creating a PR when any predecessor has status failed or blocked
@@ -112,23 +112,81 @@ func TestBVV_S06_GateAuthority(t *testing.T) {
 }
 
 // TestBVV_GT01_NoAutoMerge verifies BVV-GT-01: gate.go must never invoke
-// `gh pr merge`. Comments are stripped before scanning so a docstring that
-// legitimately mentions "merge" doesn't false-positive. Three substring
-// patterns cover the realistic regression modes — exec args, shell form,
-// and format-string embedding.
+// `gh pr merge`. Parses gate.go with go/parser (comments are naturally elided
+// from the AST, so docstrings mentioning "merge" cannot false-positive) and
+// walks every *ast.CallExpr / *ast.CompositeLit. A violation is recorded when
+// two adjacent sibling expressions are string literals "pr" followed by
+// "merge", or when a single string literal contains the substring "pr merge".
+//
+// This covers the regression modes that matter in practice:
+//   - runGH(ctx, dir, "pr", "merge", ...)             → CallExpr.Args
+//   - exec.CommandContext(ctx, "gh", "pr", "merge")   → CallExpr.Args
+//   - args := []string{"pr", "merge"}; runGH(…, args…)→ CompositeLit.Elts
+//   - fmt.Sprintf("gh pr merge %s", x)                → literal-embedding "pr merge"
+//
+// It does not defeat adversarial rune-by-rune construction. That is
+// acceptable: this is a guardrail against accidental regressions, not a proof.
 func TestBVV_GT01_NoAutoMerge(t *testing.T) {
-	src, err := os.ReadFile("gate.go")
-	require.NoError(t, err, "gate.go must be readable from package dir")
-	stripped := goCommentRegex.ReplaceAllString(string(src), "")
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "gate.go", nil, parser.SkipObjectResolution)
+	require.NoError(t, err, "gate.go must parse as valid Go")
 
-	for _, pat := range []string{
-		`"pr", "merge"`, // exec.Command("gh", "pr", "merge", ...)
-		`"pr merge"`,    // shell form or single-arg invocation
-		`pr merge`,      // embedded in a format string / shell command
-	} {
-		assert.NotContains(t, stripped, pat,
-			"gate.go must not contain %q (BVV-GT-01)", pat)
+	var violations []string
+	report := func(pos token.Pos, msg string) {
+		violations = append(violations, fmt.Sprintf("%s: %s", fset.Position(pos), msg))
 	}
+
+	// literalAt returns (value, true) iff exprs[i] is a string *ast.BasicLit.
+	literalAt := func(exprs []ast.Expr, i int) (string, bool) {
+		if i < 0 || i >= len(exprs) {
+			return "", false
+		}
+		lit, ok := exprs[i].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return "", false
+		}
+		v, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return "", false
+		}
+		return v, true
+	}
+
+	scanSiblings := func(exprs []ast.Expr) {
+		for i := 0; i < len(exprs); i++ {
+			a, aok := literalAt(exprs, i)
+			if !aok {
+				continue
+			}
+			if strings.Contains(a, "pr merge") {
+				report(exprs[i].Pos(), fmt.Sprintf(
+					"string literal %q embeds %q — BVV-GT-01 forbids `gh pr merge`",
+					a, "pr merge"))
+			}
+			b, bok := literalAt(exprs, i+1)
+			if !bok {
+				continue
+			}
+			if a == "pr" && b == "merge" {
+				report(exprs[i].Pos(),
+					`adjacent "pr", "merge" string literals — BVV-GT-01 forbids `+"`gh pr merge`")
+			}
+		}
+	}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.CallExpr:
+			scanSiblings(x.Args)
+		case *ast.CompositeLit:
+			scanSiblings(x.Elts)
+		}
+		return true
+	})
+
+	assert.Empty(t, violations,
+		"gate.go must not invoke `gh pr merge` (BVV-GT-01); violations:\n  %s",
+		strings.Join(violations, "\n  "))
 }
 
 // TestBVV_GT02_GateFailureIsolation verifies BVV-GT-02: a failing gate on
