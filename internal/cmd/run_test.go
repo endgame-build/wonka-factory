@@ -145,3 +145,50 @@ func TestRunCmd_NoValidateGraphFlag(t *testing.T) {
 	require.Error(t, err)
 	assert.NotContains(t, stderr, "unknown flag", "--no-validate-graph must parse")
 }
+
+// TestBuildTelemetry_EmptyEndpointReturnsNil verifies the no-op path: with
+// no --otel-endpoint, BuildTelemetry returns (nil, noop-shutdown, nil) so
+// the engine attaches a nil *Telemetry and the whole observability surface
+// stays dormant. This is the default posture — running wonka without an
+// OTel collector MUST NOT fail or block.
+func TestBuildTelemetry_EmptyEndpointReturnsNil(t *testing.T) {
+	telem, shutdown, err := BuildTelemetry(CLIFlags{})
+	require.NoError(t, err)
+	assert.Nil(t, telem, "no endpoint => nil telemetry")
+	require.NotNil(t, shutdown, "shutdown func must always be callable")
+	// noop shutdown must not panic or error even when telemetry is disabled.
+	assert.NoError(t, shutdown(nil))
+}
+
+// TestBuildTelemetry_UnknownProtocol rejects a bad --otel-protocol before
+// any network I/O, so operators see a clear error rather than a misleading
+// "connection refused" from an OTLP exporter attempting to dial with the
+// wrong wire format.
+func TestBuildTelemetry_UnknownProtocol(t *testing.T) {
+	_, _, err := BuildTelemetry(CLIFlags{
+		OTelEndpoint: "localhost:14317",
+		OTelProtocol: "thrift", // not supported
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "thrift")
+}
+
+// TestRunCmd_OTelFlagsParse confirms --otel-endpoint, --otel-protocol, and
+// --otel-insecure all parse through cobra. Short-circuits before engine
+// init via an invalid ledger so the test stays hermetic (no collector
+// needed).
+func TestRunCmd_OTelFlagsParse(t *testing.T) {
+	repo := seedRepoWithAgents(t)
+	err, stderr := runCobra(t,
+		"run",
+		"--branch", "test",
+		"--repo", repo,
+		"--agent-dir", filepath.Join(repo, "agents"),
+		"--otel-endpoint", "localhost:14317",
+		"--otel-protocol", "grpc",
+		"--otel-insecure=true",
+		"--ledger", "dolt",
+	)
+	require.Error(t, err)
+	assert.NotContains(t, stderr, "unknown flag", "OTel flags must parse")
+}

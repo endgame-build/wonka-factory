@@ -33,6 +33,12 @@ type CLIFlags struct {
 	MaxHandoffs     int
 	BaseTimeout     time.Duration
 	NoValidateGraph bool // when true, disables BVV-TG-07..10 post-planner validation
+
+	// Observability — OBS-04. Empty OTelEndpoint means no-op telemetry; no
+	// network connection is attempted and no data leaves the process.
+	OTelEndpoint string // host:port of OTLP receiver (e.g. "localhost:14317")
+	OTelProtocol string // "grpc" (default) or "http"
+	OTelInsecure bool   // when true, skip TLS for OTLP transport (default: true for local dev)
 }
 
 // Default values for CLI flags — chosen to match the BVV spec's reference
@@ -284,4 +290,7 @@ func addLifecycleFlags(cmd *cobra.Command, flags *CLIFlags) {
 	cmd.Flags().IntVar(&flags.MaxHandoffs, "handoff-limit", defaultMaxHandoffs, "session restarts per task on exit-code-3 handoff (BVV-L-04)")
 	cmd.Flags().DurationVar(&flags.BaseTimeout, "timeout", defaultBaseTimeout, "base session timeout, scales with retry attempt (BVV-ERR-02a)")
 	cmd.Flags().BoolVar(&flags.NoValidateGraph, "no-validate-graph", false, "disable post-planner task-graph validation (BVV-TG-07..10); required for Level 1 operation against pre-populated ledgers")
+	cmd.Flags().StringVar(&flags.OTelEndpoint, "otel-endpoint", "", "OTLP receiver endpoint (host:port). Empty = no telemetry emitted. Example: localhost:14317")
+	cmd.Flags().StringVar(&flags.OTelProtocol, "otel-protocol", "grpc", "OTLP transport: grpc or http. Only consulted when --otel-endpoint is set")
+	cmd.Flags().BoolVar(&flags.OTelInsecure, "otel-insecure", true, "skip TLS on the OTLP connection (default true for local docker-compose stack)")
 }
