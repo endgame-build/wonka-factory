@@ -76,7 +76,7 @@ The `-tags verify` build tag enables runtime invariant assertions that panic wit
 
 ```bash
 docker compose up -d                                      # stack on localhost
-bin/wonka run --branch feat/x --otel-endpoint localhost:14317
+bin/wonka run --branch feat/x --otel-endpoint localhost:14317 --otel-insecure
 ```
 
 - Grafana: http://localhost:3000 (admin/changeme) — "Telemetry" folder has `Wonka Orchestrator` and `Claude Code Telemetry` dashboards.
@@ -84,6 +84,8 @@ bin/wonka run --branch feat/x --otel-endpoint localhost:14317
 - OTel collector: OTLP gRPC on `localhost:14317`, HTTP on `localhost:14318` (remapped from 4317/4318 to avoid conflicts with a host jaeger).
 
 The default for `--otel-endpoint` is empty — no network I/O occurs unless the flag is set. Telemetry is never on by default.
+
+**Transport security.** `--otel-insecure` defaults to `false` (TLS required). The local docker-compose stack ships without TLS, so the command above passes `--otel-insecure` explicitly. `BuildTelemetry` refuses `--otel-insecure` combined with a non-loopback endpoint — pointing `--otel-endpoint` at a remote collector without TLS would transmit branch names, task IDs, and error text in cleartext.
 
 ## Continuous Integration
 

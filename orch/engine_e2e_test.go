@@ -1348,7 +1348,7 @@ func TestE2E_ParallelGapExhaustion(t *testing.T) {
 // Hermetic: uses in-memory ManualReader and SpanRecorder, not a real OTLP
 // collector. Runs a 3-task linear graph (builder → verifier → gate) with
 // mock-agents that exit 0.
-func TestE2E_TelemetryEmission(t *testing.T) {
+func TestOBS04_E2EEmission(t *testing.T) {
 	skipWithoutTmux(t)
 
 	reader := sdkmetric.NewManualReader()
@@ -1398,8 +1398,8 @@ func TestE2E_TelemetryEmission(t *testing.T) {
 	metrics := flattenMetrics(&rm)
 
 	// All 3 tasks dispatched → completed.
-	assert.Equal(t, int64(3), sumInt64(metrics["wonka_task_dispatch_total"]),
-		"every completion should increment the dispatch counter once")
+	assert.Equal(t, int64(3), sumInt64(metrics["wonka_task_terminal_total"]),
+		"every completion should increment the terminal counter once")
 
 	// Task duration histogram observed 3 samples (one per completion).
 	assert.Equal(t, uint64(3), histCount(metrics["wonka_task_duration_seconds"]),

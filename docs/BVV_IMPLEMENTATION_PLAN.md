@@ -808,7 +808,7 @@ Fifteen instruments, all under the `github.com/endgame/wonka-factory/orch` scope
 
 | Metric | Type | Attributes | Requirement |
 |---|---|---|---|
-| `wonka_task_dispatch_total` | counter | branch, outcome | throughput |
+| `wonka_task_terminal_total` | counter | branch, outcome | throughput |
 | `wonka_task_duration_seconds` | histogram | role, outcome | duration p50/p95 |
 | `wonka_workers_active` | gauge | — | OBS-04 |
 | `wonka_tasks_in_progress` | gauge | branch | OBS-04 |

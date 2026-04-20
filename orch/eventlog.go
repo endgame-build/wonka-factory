@@ -143,11 +143,11 @@ func NewEventLog(path string) (*EventLog, error) {
 // Sets Timestamp to now if zero.
 //
 // When a Telemetry has been attached via WithTelemetry, Emit also records
-// metrics and opens/closes spans for the event. Telemetry is best-effort —
-// a panic in the OTel layer would corrupt the audit trail, so recovery is
-// delegated to OTel's own no-op-on-panic provider semantics. The metric
-// record happens after the JSONL write succeeds: audit trail is primary,
-// observability is secondary.
+// metrics and opens/closes spans for the event. The JSONL write is primary
+// and happens under the file lock; the telemetry record runs afterwards
+// outside the lock. A panic in the OTel layer is recovered here so it
+// cannot propagate past Emit and corrupt callers that only care about the
+// audit trail — audit trail is primary, observability is secondary.
 func (el *EventLog) Emit(e Event) error {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = time.Now()
@@ -169,11 +169,27 @@ func (el *EventLog) Emit(e Event) error {
 
 	// Record telemetry outside the lock: OTel instruments are
 	// independently thread-safe and we don't want exporter latency on the
-	// event-log critical section.
+	// event-log critical section. Recover panics so a buggy exporter
+	// cannot skip deferred Cleanup in the caller (lock release, tmux kill,
+	// store close) — the JSONL write already landed, the audit trail is
+	// intact, and the metric gap will surface via the scrape on next tick.
 	if telem != nil {
-		telem.Record(context.Background(), e, branch)
+		recordTelemetry(telem, e, branch)
 	}
 	return nil
+}
+
+// recordTelemetry invokes telem.Record and swallows panics. Exported as a
+// separate function so the deferred recover is visible at the call site
+// and so tests can exercise the recovery path without racing Emit's mutex.
+func recordTelemetry(telem *Telemetry, e Event, branch string) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[OBS-04] telemetry record panicked for event %s (task=%s): %v\n",
+				e.Kind, e.TaskID, r)
+		}
+	}()
+	telem.Record(context.Background(), e, branch)
 }
 
 // Close closes the underlying file.

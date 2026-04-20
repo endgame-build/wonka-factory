@@ -26,7 +26,7 @@
           "type": "prometheus",
           "uid": "prometheus"
         },
-        "query": "label_values(wonka_task_dispatch_total, branch)",
+        "query": "label_values(wonka_task_terminal_total, branch)",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -178,7 +178,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (outcome)(rate(wonka_task_dispatch_total{branch=~\"$branch\"}[5m]))",
+          "expr": "sum by (outcome)(rate(wonka_task_terminal_total{branch=~\"$branch\"}[5m]))",
           "legendFormat": "{{outcome}}"
         }
       ],

@@ -21,7 +21,7 @@ const instrumentationName = "github.com/endgame/wonka-factory/orch"
 type Telemetry struct {
 	tracer trace.Tracer
 
-	taskDispatch    metric.Int64Counter
+	taskTerminal    metric.Int64Counter
 	retries         metric.Int64Counter
 	handoffs        metric.Int64Counter
 	handoffLimit    metric.Int64Counter
@@ -41,6 +41,15 @@ type Telemetry struct {
 
 	taskSpans sync.Map // taskID → *taskSpanRecord
 
+	// lifecycleMu guards lifecycleSpan and lifecycleStarted. StartLifecycle
+	// and EndLifecycle mutate them; Record reads lifecycleSpan in
+	// onTaskDispatched to parent the task span. Current call sites
+	// serialize access (dispatch goroutine writes, Drain reads post-Wait),
+	// but the race detector flagged a narrow window during test-mode
+	// shutdown where a trailing outcome goroutine could Emit after the
+	// main goroutine entered EndLifecycle. Mutex-guarded access removes
+	// the hazard at negligible cost.
+	lifecycleMu      sync.Mutex
 	lifecycleSpan    trace.Span
 	lifecycleStarted time.Time
 }
@@ -59,10 +68,10 @@ func NewTelemetry(meterProvider metric.MeterProvider, tracerProvider trace.Trace
 	t := &Telemetry{tracer: tracerProvider.Tracer(instrumentationName)}
 
 	var err error
-	if t.taskDispatch, err = m.Int64Counter("wonka_task_dispatch_total",
-		metric.WithDescription("Tasks dispatched by outcome"),
+	if t.taskTerminal, err = m.Int64Counter("wonka_task_terminal_total",
+		metric.WithDescription("Tasks that reached a terminal state, counted by outcome (completed/failed/blocked)"),
 	); err != nil {
-		return nil, fmt.Errorf("telemetry: task_dispatch counter: %w", err)
+		return nil, fmt.Errorf("telemetry: task_terminal counter: %w", err)
 	}
 	if t.retries, err = m.Int64Counter("wonka_retry_total",
 		metric.WithDescription("Exit-1 retries (BVV-ERR-01)"),
@@ -148,11 +157,13 @@ func NoopTelemetry() *Telemetry {
 }
 
 // StartLifecycle opens the lifecycle-scope span. Called once per engine run
-// from emitLifecycleStarted. Safe on a nil receiver.
+// from emitLifecycleStarted. Safe on a nil receiver. Concurrent-safe.
 func (t *Telemetry) StartLifecycle(ctx context.Context, branch string) context.Context {
 	if t == nil {
 		return ctx
 	}
+	t.lifecycleMu.Lock()
+	defer t.lifecycleMu.Unlock()
 	t.lifecycleStarted = time.Now()
 	ctx, t.lifecycleSpan = t.tracer.Start(ctx, "wonka.lifecycle",
 		trace.WithAttributes(attribute.String("branch", branch)),
@@ -162,21 +173,28 @@ func (t *Telemetry) StartLifecycle(ctx context.Context, branch string) context.C
 
 // EndLifecycle closes the lifecycle span and records duration. Idempotent —
 // nils lifecycleSpan after End so a second call is a no-op. Safe on a nil
-// receiver or if StartLifecycle was never called.
+// receiver or if StartLifecycle was never called. Concurrent-safe.
 func (t *Telemetry) EndLifecycle(ctx context.Context, branch, outcome string) {
-	if t == nil || t.lifecycleSpan == nil {
+	if t == nil {
 		return
 	}
-	duration := time.Since(t.lifecycleStarted).Seconds()
+	t.lifecycleMu.Lock()
+	span := t.lifecycleSpan
+	started := t.lifecycleStarted
+	t.lifecycleSpan = nil
+	t.lifecycleMu.Unlock()
+	if span == nil {
+		return
+	}
+	duration := time.Since(started).Seconds()
 	t.lifecycleDuration.Record(ctx, duration,
 		metric.WithAttributes(
 			attribute.String("branch", branch),
 			attribute.String("outcome", outcome),
 		),
 	)
-	t.lifecycleSpan.SetAttributes(attribute.String("outcome", outcome))
-	t.lifecycleSpan.End()
-	t.lifecycleSpan = nil
+	span.SetAttributes(attribute.String("outcome", outcome))
+	span.End()
 }
 
 // Record dispatches an event to the right instruments. Attributes stay low-
@@ -195,21 +213,21 @@ func (t *Telemetry) Record(ctx context.Context, ev Event, branch string) {
 
 	case EventTaskCompleted:
 		t.onTaskTerminal(ctx, ev, "completed")
-		t.taskDispatch.Add(ctx, 1, metric.WithAttributes(
+		t.taskTerminal.Add(ctx, 1, metric.WithAttributes(
 			branchAttr, attribute.String("outcome", "completed"),
 		))
 		t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
 	case EventTaskFailed:
 		t.onTaskTerminal(ctx, ev, "failed")
-		t.taskDispatch.Add(ctx, 1, metric.WithAttributes(
+		t.taskTerminal.Add(ctx, 1, metric.WithAttributes(
 			branchAttr, attribute.String("outcome", "failed"),
 		))
 		t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
 	case EventTaskBlocked:
 		t.onTaskTerminal(ctx, ev, "blocked")
-		t.taskDispatch.Add(ctx, 1, metric.WithAttributes(
+		t.taskTerminal.Add(ctx, 1, metric.WithAttributes(
 			branchAttr, attribute.String("outcome", "blocked"),
 		))
 		t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
@@ -220,9 +238,19 @@ func (t *Telemetry) Record(ctx context.Context, ev Event, branch string) {
 		t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
 	case EventTaskHandoff:
-		t.onTaskTerminal(ctx, ev, "handoff")
+		// BVV-DSP-14: the task remains in_progress across a handoff;
+		// only the tmux session restarts. We keep the dispatch span
+		// open, annotate it with a handoff marker, and leave
+		// tasksInProgress alone. Decrementing here (and ending the
+		// span) would drift the gauge permanently low per handoff and
+		// drop the post-handoff segment from wonka_task_duration_seconds.
+		if raw, ok := t.taskSpans.Load(ev.TaskID); ok {
+			rec := raw.(*taskSpanRecord)
+			rec.span.AddEvent("handoff", trace.WithAttributes(
+				attribute.String("worker", ev.Worker),
+			))
+		}
 		t.handoffs.Add(ctx, 1, metric.WithAttributes(branchAttr))
-		t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
 	case EventWorkerSpawned:
 		t.workersActive.Add(ctx, 1)
@@ -281,8 +309,11 @@ func (t *Telemetry) Record(ctx context.Context, ev Event, branch string) {
 
 func (t *Telemetry) onTaskDispatched(ctx context.Context, ev Event, branchAttr attribute.KeyValue) {
 	var parent context.Context = ctx
-	if t.lifecycleSpan != nil {
-		parent = trace.ContextWithSpan(ctx, t.lifecycleSpan)
+	t.lifecycleMu.Lock()
+	lifecycleSpan := t.lifecycleSpan
+	t.lifecycleMu.Unlock()
+	if lifecycleSpan != nil {
+		parent = trace.ContextWithSpan(ctx, lifecycleSpan)
 	}
 	_, span := t.tracer.Start(parent, "wonka.task",
 		trace.WithAttributes(
@@ -292,11 +323,22 @@ func (t *Telemetry) onTaskDispatched(ctx context.Context, ev Event, branchAttr a
 			attribute.String("worker", ev.Worker),
 		),
 	)
-	t.taskSpans.Store(ev.TaskID, &taskSpanRecord{
+	newRec := &taskSpanRecord{
 		span:    span,
 		started: time.Now(),
 		role:    ev.Role,
-	})
+	}
+	// LoadOrStore protects against duplicate dispatch events (crash
+	// recovery / resume replay can re-emit task_dispatched for a task
+	// whose first span is still in taskSpans). A plain Store would
+	// orphan the prior span — never End()-ed, never exported. Instead
+	// we end the prior span with outcome="superseded" and take over.
+	if prior, loaded := t.taskSpans.LoadOrStore(ev.TaskID, newRec); loaded {
+		priorRec := prior.(*taskSpanRecord)
+		priorRec.span.SetAttributes(attribute.String("outcome", "superseded"))
+		priorRec.span.End()
+		t.taskSpans.Store(ev.TaskID, newRec)
+	}
 	t.tasksInProgress.Add(ctx, 1, metric.WithAttributes(branchAttr))
 }
 

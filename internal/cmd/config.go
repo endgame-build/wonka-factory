@@ -38,7 +38,7 @@ type CLIFlags struct {
 	// network connection is attempted and no data leaves the process.
 	OTelEndpoint string // host:port of OTLP receiver (e.g. "localhost:14317")
 	OTelProtocol string // "grpc" (default) or "http"
-	OTelInsecure bool   // when true, skip TLS for OTLP transport (default: true for local dev)
+	OTelInsecure bool   // when true, skip TLS for OTLP transport (default: false; must be explicit for loopback dev)
 }
 
 // Default values for CLI flags — chosen to match the BVV spec's reference
@@ -292,5 +292,5 @@ func addLifecycleFlags(cmd *cobra.Command, flags *CLIFlags) {
 	cmd.Flags().BoolVar(&flags.NoValidateGraph, "no-validate-graph", false, "disable post-planner task-graph validation (BVV-TG-07..10); required for Level 1 operation against pre-populated ledgers")
 	cmd.Flags().StringVar(&flags.OTelEndpoint, "otel-endpoint", "", "OTLP receiver endpoint (host:port). Empty = no telemetry emitted. Example: localhost:14317")
 	cmd.Flags().StringVar(&flags.OTelProtocol, "otel-protocol", "grpc", "OTLP transport: grpc or http. Only consulted when --otel-endpoint is set")
-	cmd.Flags().BoolVar(&flags.OTelInsecure, "otel-insecure", true, "skip TLS on the OTLP connection (default true for local docker-compose stack)")
+	cmd.Flags().BoolVar(&flags.OTelInsecure, "otel-insecure", false, "skip TLS on the OTLP connection. Required for the local docker-compose stack (localhost:14317). Refused for non-loopback endpoints unless combined with an explicit loopback host")
 }
