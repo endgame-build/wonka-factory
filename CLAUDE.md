@@ -64,11 +64,28 @@ go test -race -tags verify -run TestBVV_DSP01 ./orch/...
 # Property-based tests
 task test-prop         # or: RAPID_CHECKS=10000 go test -race -tags verify -run Prop ./orch/...
 
+# Tier 3 integration tests (real tmux, fault injection; build tag `integration`)
+task test-integration  # or: go test -race -tags "verify integration" -count=1 ./orch/...
+
 # Lint
 task lint              # or: golangci-lint run --build-tags=verify --timeout=5m
 ```
 
 The `-tags verify` build tag enables runtime invariant assertions that panic with requirement IDs (e.g., `[BVV-DSP-01]`, `[BVV-S-03]`). CI always runs with this tag.
+
+## CLI Surface
+
+`cmd/wonka/` is a thin `main`; all subcommands live in `internal/cmd/` (Cobra):
+
+| Subcommand     | Purpose                                                         |
+|----------------|-----------------------------------------------------------------|
+| `wonka run`    | Start a fresh lifecycle on a branch (acquires per-branch lock). |
+| `wonka resume` | Re-enter an interrupted lifecycle (reconciles stale state).     |
+| `wonka status` | Print ledger + gap + lock state for a branch.                   |
+
+CLI-level exit codes (distinct from the agent exit-code protocol described below):
+`1` runtime error, `2` config error, `3` lock corrupt, `4` lock busy, `130` SIGINT.
+Wrapper scripts should branch on 3/4 (wait-and-retry vs human intervention).
 
 ## Local observability stack
 
@@ -193,6 +210,7 @@ Four test categories in `orch/`:
 - **Atomic writes**: All JSON writes via tmp+rename pattern.
 - **Cycle detection**: `AddDep` runs DFS reachability check before adding any edge.
 - **Per-branch lifecycle lock**: `O_CREATE|O_EXCL` semantics, staleness-based recovery, lock path scoped by branch name.
+- **Runtime state at `.wonka/`**: Event log (`events-<branch>.jsonl`), per-branch lifecycle locks, and gap counters. Created on first `wonka run`. Safe to delete only when no lifecycle is active.
 - **Worker lifecycle**: validate → side-effect (tmux) → persist. `SpawnSession` uses defer-flag pattern for rollback.
 - **Idempotent cleanup**: Cleanup operations suppress "not found" errors. Use `KillSessionIfExists`.
 - **Tmux socket isolation**: Socket `"wonka-{runID}"`, session names `{runID}-{workerName}`.
@@ -205,6 +223,7 @@ Four test categories in `orch/`:
 ## Conventions
 
 - Comments and test names reference BVV requirement IDs as canonical spec references
+- `scripts/trace-requirement.sh <BVV-ID>` greps code, tests, and spec for a requirement ID — run it before deciding whether a clause has coverage
 - `errors.go` defines sentinel errors in 3 groups — match with `errors.Is()`
 - Error wrapping: `%w` for sentinel, `%v` for diagnostic context. Prefix with operation name.
 - `testify/require` for preconditions, `testify/assert` for assertions
