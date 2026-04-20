@@ -4,14 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-wonka-factory is a DAG-driven task dispatch system for autonomous software delivery agents. It coordinates builder agents (Oompa), verifier agents (Loompa), and a planning agent (Charlie) through a Wonka orchestrator that manages worker sessions, a durable assignment ledger, and process supervision.
+DAG-driven task dispatch for builder (Oompa), verifier (Loompa), and planner (Charlie) agents. Lifecycle ordering emerges from dependency edges in the task graph — the orchestrator has no phase logic.
 
-Two deliverables share one repo:
-
-- **`orch/`** — Reusable, domain-agnostic orchestrator library (forked from `github.com/endgame/facet-scan/orch`, simplified for DAG dispatch)
-- **`cmd/wonka/`** — CLI binary that wires `orch/` to BVV lifecycle dispatch
-
-The orchestrator replaces phase-driven pipeline execution with DAG-driven dispatch: lifecycle ordering emerges from dependency edges in the task graph, not from orchestrator logic.
+Two deliverables in one repo:
+- `orch/` — domain-agnostic orchestrator library
+- `cmd/wonka/` — CLI wiring `orch/` to BVV lifecycle dispatch
 
 ## Specifications
 
@@ -20,6 +17,8 @@ The orchestrator replaces phase-driven pipeline execution with DAG-driven dispat
 | `docs/specs/BUILD_VERIFY_VALIDATE_SPEC.md` | Primary spec — 70 normative requirements (BVV-*) |
 | `docs/specs/BVV_VALIDATION_REPORT.md` | Prose validation: state matrix, deadlock analysis, termination proof |
 | `docs/specs/MULTI_AGENT_PIPELINE_ORCHESTRATION_SPEC.md` | Infrastructure layer — BVV reuses Sections 4-11a (LDG-*, WKR-*, SUP-*, RCV-*, CTY-*) |
+| `docs/BVV_IMPLEMENTATION_PLAN.md` | Phase-by-phase rollout plan; source of truth for metric/span definitions |
+| `docs/BVV_VV_STRATEGY.md` | Verification & validation strategy — maps BVV requirements to test tiers |
 
 ## Formal Verification (TLA+)
 
@@ -69,6 +68,9 @@ task test-integration  # or: go test -race -tags "verify integration" -count=1 .
 
 # Lint
 task lint              # or: golangci-lint run --build-tags=verify --timeout=5m
+
+# Coverage (profile + per-function report)
+task coverage          # or: go test -race -tags verify -coverprofile=coverage.out ./orch/... ./internal/... && go tool cover -func=coverage.out
 ```
 
 The `-tags verify` build tag enables runtime invariant assertions that panic with requirement IDs (e.g., `[BVV-DSP-01]`, `[BVV-S-03]`). CI always runs with this tag.
@@ -100,11 +102,11 @@ bin/wonka run --branch feat/x --otel-endpoint localhost:14317 --otel-insecure
 - Prometheus: http://localhost:9090 — 90-day retention.
 - OTel collector: OTLP gRPC on `localhost:14317`, HTTP on `localhost:14318` (remapped from 4317/4318 to avoid conflicts with a host jaeger).
 
-**Traces.** Per-task and per-lifecycle spans are produced but the local stack currently exports them only to the collector's `debug` stdout exporter — there is no Tempo/Jaeger backend wired into `docker-compose.yaml` yet, and Grafana has no trace datasource. `docker compose logs otel-collector` shows the span JSON. Wiring Tempo (or equivalent) and a Grafana datasource is a follow-up.
+**Traces.** Per-task and per-lifecycle spans export only to the collector's `debug` stdout exporter — no Tempo/Jaeger backend, no Grafana trace datasource. View spans via `docker compose logs otel-collector`.
 
-The default for `--otel-endpoint` is empty — no network I/O occurs unless the flag is set. Telemetry is never on by default.
+**Default off.** `--otel-endpoint` defaults to empty; no network I/O unless set.
 
-**Transport security.** `--otel-insecure` defaults to `false` (TLS required). The local docker-compose stack ships without TLS, so the command above passes `--otel-insecure` explicitly. `BuildTelemetry` refuses `--otel-insecure` combined with a non-loopback endpoint — pointing `--otel-endpoint` at a remote collector without TLS would transmit branch names, task IDs, and error text in cleartext.
+**Transport security.** `--otel-insecure` defaults to `false` (TLS required). The local docker-compose stack ships without TLS, so pass `--otel-insecure` explicitly. `BuildTelemetry` rejects `--otel-insecure` paired with a non-loopback endpoint — otherwise it would leak branch names, task IDs, and error text in cleartext.
 
 ## Continuous Integration
 
@@ -150,16 +152,6 @@ Forked from `facet-scan/orch` and simplified per BVV Appendix B:
 | `signal.go` | Graceful shutdown (SIGINT/SIGTERM), no status modification | BVV-ERR-09..10a |
 | `telemetry.go` | OTel metrics + spans (nil-safe). Attached via `EventLog.WithTelemetry`; counters/histograms/gauges listed in `docs/BVV_IMPLEMENTATION_PLAN.md` §Phase 10 | OBS-04 |
 
-### What was removed from facet-scan/orch
-
-BVV replaces phase-driven execution with DAG dispatch. These types and functions are not needed:
-
-- `Pipeline`, `Phase`, `ConsensusConfig`, `QualityGate` types
-- `Expand()` function — task graphs come from the planning agent via Beads, not from Go structs
-- Phase advancement logic in the dispatch loop
-- Consensus protocol (instances → merge → verify)
-- File-based output validation in `DetermineOutcome` — replaced by exit codes
-
 ### Key concepts
 
 | Concept | Implementation |
@@ -180,7 +172,7 @@ BVV replaces phase-driven execution with DAG dispatch. These types and functions
 | `agents/LOOMPA.md` | Verifier | Traces code against specs, fixes defects, commits |
 | `agents/CHARLIE.md` | Planner | Decomposes work packages into task graphs in beads |
 
-Instruction files define agent identity: phases, decision rules, operating rules, completion protocol, memory format. The orchestrator injects them as system prompts and never modifies their content.
+The orchestrator injects these files as system prompts. Never modify their content.
 
 ### Task status enum
 
