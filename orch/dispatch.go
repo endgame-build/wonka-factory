@@ -286,7 +286,7 @@ func (d *Dispatcher) terminateAndRelease(task *Task, workerName string, newStatu
 
 func (d *Dispatcher) handleSuccess(o TaskOutcome) {
 	persisted := d.terminateAndRelease(o.Task, o.Worker.Name, StatusCompleted, Event{
-		Kind: EventTaskCompleted, TaskID: o.Task.ID, Worker: o.Worker.Name,
+		Kind: EventTaskCompleted, TaskID: o.Task.ID, Role: o.Task.Role(), Worker: o.Worker.Name,
 		Outcome: OutcomeSuccess, Summary: fmt.Sprintf("task %s completed", o.Task.ID),
 	})
 	// Fire the post-success hook only after the completion is durably
@@ -319,14 +319,14 @@ func (d *Dispatcher) handleFailure(o TaskOutcome) {
 			if err := d.pool.Release(o.Worker.Name); err != nil {
 				d.warnf("release worker %s: %v", o.Worker.Name, err)
 			}
-			d.emit(Event{Kind: EventTaskRetried, TaskID: o.Task.ID, Worker: o.Worker.Name,
+			d.emit(Event{Kind: EventTaskRetried, TaskID: o.Task.ID, Role: o.Task.Role(), Worker: o.Worker.Name,
 				Summary: fmt.Sprintf("task %s retried (attempt %d)", o.Task.ID, d.retries.AttemptCount(o.Task.ID))})
 			return
 		}
 	}
 
 	persisted := d.terminateAndRelease(o.Task, o.Worker.Name, StatusFailed, Event{
-		Kind: EventTaskFailed, TaskID: o.Task.ID, Worker: o.Worker.Name,
+		Kind: EventTaskFailed, TaskID: o.Task.ID, Role: o.Task.Role(), Worker: o.Worker.Name,
 		Outcome: OutcomeFailure, Summary: fmt.Sprintf("task %s failed (exit %d)", o.Task.ID, o.ExitCode),
 	})
 	if persisted {
@@ -336,7 +336,7 @@ func (d *Dispatcher) handleFailure(o TaskOutcome) {
 
 func (d *Dispatcher) handleBlocked(o TaskOutcome) {
 	persisted := d.terminateAndRelease(o.Task, o.Worker.Name, StatusBlocked, Event{
-		Kind: EventTaskBlocked, TaskID: o.Task.ID, Worker: o.Worker.Name,
+		Kind: EventTaskBlocked, TaskID: o.Task.ID, Role: o.Task.Role(), Worker: o.Worker.Name,
 		Outcome: OutcomeBlocked, Summary: fmt.Sprintf("task %s blocked (exit 2)", o.Task.ID),
 	})
 	if persisted {
@@ -355,7 +355,7 @@ func (d *Dispatcher) handleHandoff(ctx context.Context, o TaskOutcome) {
 				return
 			}
 		}
-		d.emit(Event{Kind: EventTaskHandoff, TaskID: o.Task.ID, Worker: o.Worker.Name,
+		d.emit(Event{Kind: EventTaskHandoff, TaskID: o.Task.ID, Role: o.Task.Role(), Worker: o.Worker.Name,
 			Summary: fmt.Sprintf("task %s handoff %d", o.Task.ID, count)})
 
 		// In test mode, re-launch the SpawnFunc goroutine for the restarted session.
@@ -371,7 +371,7 @@ func (d *Dispatcher) handleHandoff(ctx context.Context, o TaskOutcome) {
 	}
 
 	// Handoff budget exhausted — treat as failure (BVV-L-04).
-	d.emit(Event{Kind: EventHandoffLimitReached, TaskID: o.Task.ID, Worker: o.Worker.Name,
+	d.emit(Event{Kind: EventHandoffLimitReached, TaskID: o.Task.ID, Role: o.Task.Role(), Worker: o.Worker.Name,
 		Summary: fmt.Sprintf("task %s handoff limit reached (%d)", o.Task.ID, count)})
 	d.handleFailure(TaskOutcome{Task: o.Task, Worker: o.Worker, Outcome: OutcomeFailure, ExitCode: 1, RoleCfg: o.RoleCfg})
 }
@@ -458,7 +458,7 @@ func (d *Dispatcher) failOrphanedTask(taskID, workerName, summary string) bool {
 		return false
 	}
 	persisted := d.terminateAndRelease(task, workerName, StatusFailed, Event{
-		Kind: EventTaskFailed, TaskID: taskID, Worker: workerName,
+		Kind: EventTaskFailed, TaskID: taskID, Role: task.Role(), Worker: workerName,
 		Summary: summary,
 	})
 	if persisted {
@@ -572,8 +572,12 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 		taskID := task.ID
 		task, err = d.store.GetTask(taskID)
 		if err != nil {
-			// task may be nil — use a synthetic task with the known ID for cleanup.
-			d.failTaskAndRelease(&Task{ID: taskID}, worker.Name, fmt.Errorf("re-read after assign: %w", err))
+			// Carry role+branch so EventTaskFailed doesn't emit role="unknown".
+			synth := &Task{ID: taskID, Labels: map[string]string{
+				LabelRole:   string(role),
+				LabelBranch: d.lifecycle.Branch,
+			}}
+			d.failTaskAndRelease(synth, worker.Name, fmt.Errorf("re-read after assign: %w", err))
 			continue
 		}
 
@@ -614,8 +618,8 @@ func (d *Dispatcher) dispatch(ctx context.Context) (int, error) {
 			}
 		}
 
-		d.emit(Event{Kind: EventTaskDispatched, TaskID: task.ID, Worker: worker.Name,
-			Summary: fmt.Sprintf("task %s dispatched to %s (role: %s)", task.ID, worker.Name, role)})
+		d.emit(Event{Kind: EventTaskDispatched, TaskID: task.ID, Role: role, Worker: worker.Name,
+			Summary: fmt.Sprintf("task %s dispatched to %s", task.ID, worker.Name)})
 
 		// Launch agent monitoring goroutine. Capture attemptCount here on the
 		// dispatch goroutine to avoid a data race on RetryState.
@@ -672,7 +676,7 @@ func (d *Dispatcher) failTaskAndRelease(task *Task, workerName string, reason er
 	if err := d.pool.Release(workerName); err != nil {
 		d.warnf("failTaskAndRelease release worker %s: %v", workerName, err)
 	}
-	d.emit(Event{Kind: EventTaskFailed, TaskID: task.ID, Worker: workerName,
+	d.emit(Event{Kind: EventTaskFailed, TaskID: task.ID, Role: task.Role(), Worker: workerName,
 		Summary: fmt.Sprintf("spawn failed: %v", reason)})
 }
 

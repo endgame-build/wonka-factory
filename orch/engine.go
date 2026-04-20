@@ -24,6 +24,7 @@ type EngineConfig struct {
 	Dispatch   DispatchConfig
 	Watchdog   WatchdogConfig
 	Progress   ProgressReporter // nil = no-op
+	Telemetry  *Telemetry       // nil = no-op; construct via NewTelemetry
 }
 
 // DefaultEngineConfig returns sensible defaults with the given required parameters.
@@ -157,6 +158,12 @@ func (e *Engine) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Backstop: closes the lifecycle span and decrements wonka_lock_held on
+	// signal-cancel (BVV-ERR-09 is audit-silent, so emitLifecycle{Completed,
+	// Failed} don't run) and on panic. Idempotent, so happy-path emits with
+	// their own outcome still win.
+	defer e.cfg.Telemetry.EndLifecycle(context.Background(), e.cfg.Lifecycle.Branch, outcomeInterrupted)
+
 	// 6. Run dispatch loop.
 	return e.runLoop(ctx)
 }
@@ -241,6 +248,11 @@ func (e *Engine) Resume(ctx context.Context) error {
 	if err := e.emitLifecycleStarted(summary, result); err != nil {
 		return err
 	}
+
+	// Backstop — also covers the step-7 replayPlannerValidation failure
+	// window (a failure there returns before runLoop, leaking the span and
+	// wonka_lock_held gauge).
+	defer e.cfg.Telemetry.EndLifecycle(context.Background(), e.cfg.Lifecycle.Branch, outcomeInterrupted)
 
 	// 7. Re-fire post-planner validation for completed planner tasks
 	// whose hook never emitted graph_validated / graph_invalid (BVV-TG-07..10
@@ -346,6 +358,16 @@ func (e *Engine) initCommon(ledgerDir string) error {
 	if err != nil {
 		e.store.Close()
 		return fmt.Errorf("engine: open event log: %w", err)
+	}
+	// Attach optional OTel side-channel. Nil telemetry is a no-op; the
+	// audit trail remains the primary observability surface regardless.
+	// WithTelemetry errors only when telemetry is configured but branch is
+	// empty — the CLI validates branch upstream, so this returns a loud
+	// wiring error rather than silently producing un-filterable metrics.
+	if _, err := log.WithTelemetry(e.cfg.Telemetry, e.cfg.Lifecycle.Branch); err != nil {
+		_ = log.Close()
+		e.store.Close()
+		return fmt.Errorf("engine: %w", err)
 	}
 	e.log = log
 
@@ -571,6 +593,11 @@ func (e *Engine) runLoop(ctx context.Context) error {
 	sigCtx, sigCancel := SetupSignalHandler()
 	defer sigCancel()
 
+	// (Signal-cancel + panic coverage is provided by the EndLifecycle backstop
+	// registered in Run/Resume right after emitLifecycleStarted succeeds. Placing
+	// it there rather than here also covers any step-7 (Resume replay) failure
+	// that returns before runLoop.)
+
 	// 2. Merge parent context with signal context.
 	mergedCtx, mergedCancel := context.WithCancel(ctx)
 	defer mergedCancel()
@@ -644,7 +671,7 @@ func (e *Engine) runLoop(ctx context.Context) error {
 // Legacy callers that never set a reason fall through to the historical
 // gap-tolerance default.
 func (e *Engine) emitLifecycleCompleted(err error) {
-	var summary, detail string
+	var summary, detail, outcome string
 	if errors.Is(err, ErrLifecycleAborted) {
 		reason := "gap_tolerance_exceeded"
 		if e.disp != nil && e.disp.AbortReason() != "" {
@@ -653,13 +680,20 @@ func (e *Engine) emitLifecycleCompleted(err error) {
 		summary = fmt.Sprintf("lifecycle aborted: %s (run %s, branch %s)",
 			reason, e.cfg.RunID, e.cfg.Lifecycle.Branch)
 		detail = "outcome=aborted reason=" + reason
+		outcome = "aborted"
 	} else {
 		summary = fmt.Sprintf("lifecycle completed (run %s, branch %s)",
 			e.cfg.RunID, e.cfg.Lifecycle.Branch)
+		outcome = "completed"
 	}
+	// Closure-defer so the drain-violation override below reaches telemetry.
+	defer func() {
+		e.cfg.Telemetry.EndLifecycle(context.Background(), e.cfg.Lifecycle.Branch, outcome)
+	}()
 	if busy := CheckReleaseDrained(e.store); len(busy) > 0 {
 		summary = fmt.Sprintf("[BVV-ERR-10a] lifecycle release with active workers: %v", busy)
 		detail = fmt.Sprintf("run=%s branch=%s busy=%v", e.cfg.RunID, e.cfg.Lifecycle.Branch, busy)
+		outcome = "drain_violation"
 	}
 	AssertLifecycleReleaseDrained(e.store)
 	if emitErr := emitAndNotify(e.log, e.cfg.Progress, Event{
@@ -683,9 +717,14 @@ func (e *Engine) emitLifecycleCompleted(err error) {
 // crashed. Also runs CheckReleaseDrained + AssertLifecycleReleaseDrained
 // (BVV-ERR-10a) — operational errors do not legitimise leaked sessions.
 func (e *Engine) emitLifecycleFailed(runErr error) {
+	outcome := "failed"
+	defer func() {
+		e.cfg.Telemetry.EndLifecycle(context.Background(), e.cfg.Lifecycle.Branch, outcome)
+	}()
 	detail := fmt.Sprintf("outcome=failed reason=%s", runErr)
 	if busy := CheckReleaseDrained(e.store); len(busy) > 0 {
 		detail += fmt.Sprintf(" busy=%v", busy)
+		outcome = "drain_violation"
 	}
 	AssertLifecycleReleaseDrained(e.store)
 	summary := fmt.Sprintf("lifecycle failed (run %s, branch %s): %v",
@@ -709,9 +748,13 @@ func (e *Engine) markStarted() bool {
 }
 
 // emitLifecycleStarted writes the canonical §10.3 anchor event. Its absence
-// from the audit trail leaves a future Resume blind to the lifecycle
-// boundary (recoverFromEventLog keys off it), so a failed emit is fatal and
-// must cascade-close the resources the caller otherwise expects to own.
+// leaves a future Resume blind to the lifecycle boundary
+// (recoverFromEventLog keys off it), so a failed emit is fatal and must
+// cascade-close the resources the caller otherwise expects to own.
+//
+// Opens the lifecycle span ONLY after the audit write lands, so a crash in
+// the gap can't leak a span + lock_held=1 for a lifecycle with no JSONL
+// anchor.
 func (e *Engine) emitLifecycleStarted(summary string, result *ResumeResult) error {
 	err := emitAndNotify(e.log, e.cfg.Progress, Event{
 		Kind:    EventLifecycleStarted,
@@ -722,6 +765,7 @@ func (e *Engine) emitLifecycleStarted(summary string, result *ResumeResult) erro
 		Cleanup(e.tmux, e.lock, e.log, e.store)
 		return fmt.Errorf("engine: emit lifecycle_started: %w", err)
 	}
+	e.cfg.Telemetry.StartLifecycle(context.Background(), e.cfg.Lifecycle.Branch)
 	return nil
 }
 

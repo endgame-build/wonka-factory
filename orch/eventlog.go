@@ -1,7 +1,9 @@
 package orch
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -64,10 +66,15 @@ var AllEventKinds = []EventKind{
 // Event is a single JSONL audit record (BVV spec §10.3).
 // BVV-DSN-04: phase-agnostic — no Phase field; agents are identified by
 // role labels carried on the referenced Task, not by an Agent field.
+//
+// Empty Role means an infrastructure-level event (lifecycle, gap,
+// escalation, gate). Telemetry uses Role as the low-cardinality role
+// attribute on wonka_task_duration_seconds.
 type Event struct {
 	Timestamp time.Time    `json:"timestamp"`
 	Kind      EventKind    `json:"kind"`
 	TaskID    string       `json:"task_id,omitempty"`
+	Role      Role         `json:"role,omitempty"`
 	Worker    string       `json:"worker,omitempty"`
 	Summary   string       `json:"summary"`
 	Detail    string       `json:"detail,omitempty"`
@@ -81,10 +88,15 @@ type ProgressReporter interface {
 	OnEvent(Event)
 }
 
-// emitAndNotify writes an event to the log and forwards it to the progress reporter.
-// Either log or progress may be nil. Returns the Emit error (if any) so callers
-// can decide whether to propagate or log — audit trail gaps corrupt GapTracker
-// recovery (BVV-ERR-03..05).
+// emitAndNotify writes an event to the log and forwards it to the progress
+// reporter. Either log or progress may be nil. Returns the Emit error (if any)
+// so callers can decide whether to propagate or log — audit trail gaps
+// corrupt GapTracker recovery (BVV-ERR-03..05).
+//
+// Telemetry side-effects piggyback on log.Emit when the log has been
+// attached to a Telemetry via EventLog.WithTelemetry; this keeps the
+// orchestrator's emission surface small (one call) without threading
+// observability through every dispatcher/watchdog constructor.
 func emitAndNotify(log *EventLog, progress ProgressReporter, ev Event) error {
 	if progress != nil {
 		progress.OnEvent(ev)
@@ -101,6 +113,36 @@ type EventLog struct {
 	mu   sync.Mutex
 	file *os.File
 	path string
+
+	// Optional telemetry side-channel. Set via WithTelemetry; unset = no-op.
+	// Held here rather than threaded through every emission call site so
+	// that dispatcher/watchdog/engine signatures stay unchanged.
+	telem  *Telemetry
+	branch string
+}
+
+// ErrWithTelemetryEmptyBranch is returned by WithTelemetry when a non-nil
+// Telemetry is supplied with an empty branch. An empty branch would emit
+// un-filterable metric points (branch=""), so fail loud at wiring time.
+var ErrWithTelemetryEmptyBranch = errors.New("eventlog: WithTelemetry requires non-empty branch when telemetry is configured")
+
+// WithTelemetry binds the event log to a Telemetry instrument so Emit
+// also records metrics and opens/closes spans. Nil telem is a safe no-op.
+// Non-nil telem with empty branch returns ErrWithTelemetryEmptyBranch.
+func (el *EventLog) WithTelemetry(telem *Telemetry, branch string) (*EventLog, error) {
+	el.mu.Lock()
+	defer el.mu.Unlock()
+	if telem == nil {
+		el.telem = nil
+		el.branch = ""
+		return el, nil
+	}
+	if branch == "" {
+		return nil, ErrWithTelemetryEmptyBranch
+	}
+	el.telem = telem
+	el.branch = branch
+	return el, nil
 }
 
 // NewEventLog creates or opens an event log at the given path.
@@ -113,8 +155,11 @@ func NewEventLog(path string) (*EventLog, error) {
 	return &EventLog{file: f, path: path}, nil
 }
 
-// Emit appends a single event to the log. Thread-safe.
-// Sets Timestamp to now if zero.
+// Emit appends a single event to the log. Thread-safe. Sets Timestamp to now if zero.
+//
+// Audit trail is primary: the JSONL write holds the lock, the telemetry
+// record runs after. A panic from the OTel layer is recovered so a broken
+// exporter cannot skip deferred Cleanup in the caller.
 func (el *EventLog) Emit(e Event) error {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = time.Now()
@@ -127,10 +172,21 @@ func (el *EventLog) Emit(e Event) error {
 	data = append(data, '\n')
 
 	el.mu.Lock()
-	defer el.mu.Unlock()
-
+	telem, branch := el.telem, el.branch
 	if _, err := el.file.Write(data); err != nil {
+		el.mu.Unlock()
 		return fmt.Errorf("eventlog: write: %w", err)
+	}
+	el.mu.Unlock()
+
+	if telem != nil {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[OBS-04] telemetry record panicked for event %s (task=%s): %v\n",
+					e.Kind, e.TaskID, r)
+			}
+		}()
+		telem.Record(context.Background(), e, branch)
 	}
 	return nil
 }

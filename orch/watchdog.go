@@ -319,6 +319,7 @@ func (w *Watchdog) CheckOnce() error {
 			if err := emitAndNotify(w.log, w.progress, Event{
 				Kind:    EventHandoffLimitReached,
 				TaskID:  task.ID,
+				Role:    role,
 				Worker:  worker.Name,
 				Summary: "watchdog handoff limit reached",
 				Detail:  fmt.Sprintf("branch=%s role=%s", w.branch, role),
@@ -334,6 +335,7 @@ func (w *Watchdog) CheckOnce() error {
 		if err := emitAndNotify(w.log, w.progress, Event{
 			Kind:    EventTaskHandoff,
 			TaskID:  task.ID,
+			Role:    role,
 			Worker:  worker.Name,
 			Summary: fmt.Sprintf("watchdog restart (handoff %d)", count),
 			Detail:  fmt.Sprintf("reason=session_dead branch=%s role=%s count=%d", w.branch, role, count),

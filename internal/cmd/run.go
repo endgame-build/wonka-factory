@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/endgame/wonka-factory/orch"
 	"github.com/spf13/cobra"
@@ -57,6 +58,26 @@ func runLifecycle(flags CLIFlags, invoke lifecycleFn, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "warning:", w)
 	}
 	fmt.Fprintf(stderr, "run dir: %s\n", cfg.RunDir)
+
+	// Telemetry is optional; nil *Telemetry is treated as no-op by orch.
+	// Build *before* engine init so invalid flags (unknown --otel-protocol,
+	// --otel-insecure against a non-loopback endpoint) fail fast before
+	// touching the lifecycle lock or the ledger. Exporter reachability is
+	// lazy — an unreachable collector surfaces asynchronously via the OBS-04
+	// error handler or at shutdown flush, not here.
+	telem, shutdownTelem, err := BuildTelemetry(flags)
+	if err != nil {
+		return die(stderr, exitConfigError, "telemetry init failed: %s", err)
+	}
+	defer func() {
+		// Flush budget: don't let a stuck collector block shutdown forever.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if shutdownErr := shutdownTelem(ctx); shutdownErr != nil {
+			fmt.Fprintln(stderr, "warning: telemetry shutdown:", shutdownErr)
+		}
+	}()
+	cfg.Telemetry = telem
 
 	engine, err := orch.NewEngine(cfg)
 	if err != nil {

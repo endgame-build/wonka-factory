@@ -1,0 +1,336 @@
+{
+  "uid": "wonka-orch",
+  "title": "Wonka Orchestrator",
+  "tags": [
+    "wonka",
+    "orchestrator",
+    "bvv"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "branch",
+        "label": "Branch",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(wonka_task_terminal_total, branch)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*"
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Active workers",
+      "description": "Current count of worker sessions holding a task (OBS-04).",
+      "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(wonka_workers_active)",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 4},
+              {"color": "red", "value": 8}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "In-progress tasks",
+      "description": "Tasks currently dispatched but not yet terminal.",
+      "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (branch)(wonka_tasks_in_progress{branch=~\"$branch\"})",
+          "instant": true,
+          "legendFormat": "{{branch}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Gap counter",
+      "description": "Current gap tolerance state per branch (BVV-ERR-04).",
+      "gridPos": {"x": 8, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (branch)(wonka_gap_count{branch=~\"$branch\"})",
+          "instant": true,
+          "legendFormat": "{{branch}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 2},
+              {"color": "red", "value": 3}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Lock held",
+      "description": "Lifecycle locks currently held (BVV-S-01). One per active branch.",
+      "gridPos": {"x": 12, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(wonka_lock_held)",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Escalations (1h)",
+      "description": "Escalation tasks created in the last hour across all branches.",
+      "gridPos": {"x": 16, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(wonka_escalations_total{branch=~\"$branch\"}[1h]))",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Handoff limit hits (1h)",
+      "description": "Tasks that exceeded the BVV-L-04 handoff limit in the last hour.",
+      "gridPos": {"x": 20, "y": 0, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(wonka_handoff_limit_total{branch=~\"$branch\"}[1h]))",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Task throughput by outcome",
+      "description": "Completed / failed / blocked tasks per minute. The primary pulse of the orchestrator.",
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome)(rate(wonka_task_terminal_total{branch=~\"$branch\"}[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "stacking": {"mode": "normal", "group": "A"}
+          }
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Task duration (p50 / p95)",
+      "description": "Histogram-derived latency percentiles for task sessions, by role.",
+      "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le, role)(rate(wonka_task_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50 {{role}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, role)(rate(wonka_task_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{role}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "s"}
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Retries + handoffs",
+      "description": "Exit-1 retries (BVV-ERR-01) and exit-3 handoffs (BVV-DSP-14) per minute.",
+      "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(wonka_retry_total{branch=~\"$branch\"}[5m]))",
+          "legendFormat": "retries"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(wonka_handoff_total{branch=~\"$branch\"}[5m]))",
+          "legendFormat": "handoffs"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "cps"}
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Escalations + handoff-limit hits",
+      "description": "Escalation tasks created by the dispatcher, and separate handoff-limit counter emitted by both the dispatcher (exit-3 overshoot) and the watchdog (session-dead overshoot) (BVV-L-04, BVV-ERR-11). Separate so handoff-limit hits aren't double-counted against escalations when a critical task also escalates.",
+      "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason)(rate(wonka_escalations_total{branch=~\"$branch\"}[15m]))",
+          "legendFormat": "escalation:{{reason}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(wonka_handoff_limit_total{branch=~\"$branch\"}[15m]))",
+          "legendFormat": "handoff_limit"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "cps"}
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Graph validation (BVV-TG-07..10)",
+      "description": "Post-planner graph-validation outcomes. Invalid results trigger lifecycle abort.",
+      "gridPos": {"x": 0, "y": 20, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result)(rate(wonka_graph_validation_total{branch=~\"$branch\"}[15m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "cps"}
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "PR gate outcomes",
+      "description": "Gate creation, pass, and fail rate (BVV-GT-01..03).",
+      "gridPos": {"x": 12, "y": 20, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(wonka_gates_created_total{branch=~\"$branch\"}[15m]))",
+          "legendFormat": "created"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(wonka_gates_passed_total{branch=~\"$branch\"}[15m]))",
+          "legendFormat": "passed"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(wonka_gates_failed_total{branch=~\"$branch\"}[15m]))",
+          "legendFormat": "failed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "cps"}
+      }
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Lifecycle duration (p50 / p95)",
+      "description": "End-to-end lifecycle timing by outcome (completed / aborted / failed).",
+      "gridPos": {"x": 0, "y": 28, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le, outcome)(rate(wonka_lifecycle_duration_seconds_bucket{branch=~\"$branch\"}[1h])))",
+          "legendFormat": "p50 {{outcome}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, outcome)(rate(wonka_lifecycle_duration_seconds_bucket{branch=~\"$branch\"}[1h])))",
+          "legendFormat": "p95 {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "s"}
+      }
+    }
+  ]
+}

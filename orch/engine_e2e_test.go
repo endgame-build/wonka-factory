@@ -14,6 +14,10 @@ import (
 	"github.com/endgame/wonka-factory/orch/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // --- E2E integration tests (Tier 3) ---
@@ -1332,4 +1336,132 @@ func TestE2E_ParallelGapExhaustion(t *testing.T) {
 		"failed count must reach tolerance before abort (got %d)", failed)
 	assert.GreaterOrEqual(t, blocked, 1,
 		"at least one task must be blocked by BVV-ERR-04a cleanup (got %d)", blocked)
+}
+
+// TestOBS04_E2EEmission verifies the OBS-04 observability pipeline
+// end-to-end: a live lifecycle with an attached OTel meter/tracer produces
+// the expected counters, histograms, and spans. Unlike the unit tests in
+// telemetry_test.go, this exercises the actual EventLog.Emit → Telemetry
+// Record path driven by the real dispatch loop — the spot where the CLI's
+// --otel-endpoint ends up wiring.
+//
+// Hermetic: uses in-memory ManualReader and SpanRecorder, not a real OTLP
+// collector. Runs a 3-task linear builder graph with mock-agents that exit 0.
+func TestOBS04_E2EEmission(t *testing.T) {
+	skipWithoutTmux(t)
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	spanRec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRec))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	telem, err := orch.NewTelemetry(mp, tp)
+	require.NoError(t, err)
+
+	runDir := t.TempDir()
+	lifecycle := testutil.MockLifecycleConfig("feat/telemetry", "builder", "verifier")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "e2e-telemetry"
+	cfg.MaxWorkers = 2
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+	cfg.Telemetry = telem
+
+	ledgerDir := filepath.Join(runDir, "ledger")
+	require.NoError(t, os.MkdirAll(ledgerDir, 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "logs"), 0o755))
+	store, _, err := orch.NewStore("", ledgerDir)
+	require.NoError(t, err)
+	testutil.LinearGraph(t, store, "feat/telemetry", "builder", 3)
+	require.NoError(t, store.Close())
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	require.NoError(t, e.Run(ctx), "happy path should complete")
+
+	// Collect after the lifecycle — the metrics shut-down path flushes last-
+	// second exports, but our ManualReader pulls them inline on Collect().
+	rm := metricdata.ResourceMetrics{}
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+
+	metrics := flattenMetrics(&rm)
+
+	// All 3 tasks dispatched → completed.
+	assert.Equal(t, int64(3), sumInt64(metrics["wonka_task_terminal_total"]),
+		"every completion should increment the terminal counter once")
+
+	// Task duration histogram observed 3 samples (one per completion).
+	assert.Equal(t, uint64(3), histCount(metrics["wonka_task_duration_seconds"]),
+		"task duration recorded per completion")
+
+	// Lifecycle duration histogram observed one sample.
+	assert.Equal(t, uint64(1), histCount(metrics["wonka_lifecycle_duration_seconds"]),
+		"lifecycle duration recorded once at completion")
+
+	// Traces: lifecycle span + one span per task = exactly 4 ended spans.
+	ended := spanRec.Ended()
+	assert.Equal(t, 4, len(ended), "lifecycle + 3 task spans expected, got %d", len(ended))
+
+	// Find the lifecycle span and verify its branch attribute round-tripped.
+	var hasLifecycle bool
+	for _, s := range ended {
+		if s.Name() == "wonka.lifecycle" {
+			hasLifecycle = true
+			var branchAttr string
+			for _, a := range s.Attributes() {
+				if string(a.Key) == "branch" {
+					branchAttr = a.Value.AsString()
+				}
+			}
+			assert.Equal(t, "feat/telemetry", branchAttr, "lifecycle span must carry branch")
+		}
+	}
+	assert.True(t, hasLifecycle, "lifecycle span must be present")
+}
+
+// flattenMetrics collapses the scope → metrics hierarchy into a name-keyed
+// map for easy assertion. Mirrors collectMetrics from the unit test but
+// lives in orch_test to avoid exporting test helpers.
+func flattenMetrics(rm *metricdata.ResourceMetrics) map[string]metricdata.Metrics {
+	out := make(map[string]metricdata.Metrics)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			out[m.Name] = m
+		}
+	}
+	return out
+}
+
+func sumInt64(m metricdata.Metrics) int64 {
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		return 0
+	}
+	var total int64
+	for _, dp := range sum.DataPoints {
+		total += dp.Value
+	}
+	return total
+}
+
+func histCount(m metricdata.Metrics) uint64 {
+	h, ok := m.Data.(metricdata.Histogram[float64])
+	if !ok {
+		return 0
+	}
+	var total uint64
+	for _, dp := range h.DataPoints {
+		total += dp.Count
+	}
+	return total
 }

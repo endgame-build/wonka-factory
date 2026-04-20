@@ -70,6 +70,25 @@ task lint              # or: golangci-lint run --build-tags=verify --timeout=5m
 
 The `-tags verify` build tag enables runtime invariant assertions that panic with requirement IDs (e.g., `[BVV-DSP-01]`, `[BVV-S-03]`). CI always runs with this tag.
 
+## Local observability stack
+
+`docker-compose.yaml` spins up OTel collector + Prometheus + Grafana. Metrics from `wonka run` reach Grafana when `--otel-endpoint` is set:
+
+```bash
+docker compose up -d                                      # stack on localhost
+bin/wonka run --branch feat/x --otel-endpoint localhost:14317 --otel-insecure
+```
+
+- Grafana: http://localhost:3000 (admin/changeme) — "Telemetry" folder has `Wonka Orchestrator` and `Claude Code Telemetry` dashboards.
+- Prometheus: http://localhost:9090 — 90-day retention.
+- OTel collector: OTLP gRPC on `localhost:14317`, HTTP on `localhost:14318` (remapped from 4317/4318 to avoid conflicts with a host jaeger).
+
+**Traces.** Per-task and per-lifecycle spans are produced but the local stack currently exports them only to the collector's `debug` stdout exporter — there is no Tempo/Jaeger backend wired into `docker-compose.yaml` yet, and Grafana has no trace datasource. `docker compose logs otel-collector` shows the span JSON. Wiring Tempo (or equivalent) and a Grafana datasource is a follow-up.
+
+The default for `--otel-endpoint` is empty — no network I/O occurs unless the flag is set. Telemetry is never on by default.
+
+**Transport security.** `--otel-insecure` defaults to `false` (TLS required). The local docker-compose stack ships without TLS, so the command above passes `--otel-insecure` explicitly. `BuildTelemetry` refuses `--otel-insecure` combined with a non-loopback endpoint — pointing `--otel-endpoint` at a remote collector without TLS would transmit branch names, task IDs, and error text in cleartext.
+
 ## Continuous Integration
 
 GitHub Actions workflows in `.github/workflows/`:
@@ -112,6 +131,7 @@ Forked from `facet-scan/orch` and simplified per BVV Appendix B:
 | `invariant.go` | Runtime assertions (build tag `verify`) | BVV-S-01..10 |
 | `validate.go` | Post-planner task-graph well-formedness check | BVV-TG-07..10 |
 | `signal.go` | Graceful shutdown (SIGINT/SIGTERM), no status modification | BVV-ERR-09..10a |
+| `telemetry.go` | OTel metrics + spans (nil-safe). Attached via `EventLog.WithTelemetry`; counters/histograms/gauges listed in `docs/BVV_IMPLEMENTATION_PLAN.md` §Phase 10 | OBS-04 |
 
 ### What was removed from facet-scan/orch
 

@@ -2,11 +2,13 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -144,4 +146,120 @@ func TestRunCmd_NoValidateGraphFlag(t *testing.T) {
 	)
 	require.Error(t, err)
 	assert.NotContains(t, stderr, "unknown flag", "--no-validate-graph must parse")
+}
+
+// TestOBS04_BuildTelemetry_EmptyEndpointReturnsNil verifies the no-op path: with
+// no --otel-endpoint, BuildTelemetry returns (nil, noop-shutdown, nil) so
+// the engine attaches a nil *Telemetry and the whole observability surface
+// stays dormant. This is the default posture — running wonka without an
+// OTel collector MUST NOT fail or block.
+func TestOBS04_BuildTelemetry_EmptyEndpointReturnsNil(t *testing.T) {
+	telem, shutdown, err := BuildTelemetry(CLIFlags{})
+	require.NoError(t, err)
+	assert.Nil(t, telem, "no endpoint => nil telemetry")
+	require.NotNil(t, shutdown, "shutdown func must always be callable")
+	// noop shutdown must not panic or error even when telemetry is disabled.
+	assert.NoError(t, shutdown(nil))
+}
+
+// TestOBS04_BuildTelemetry_UnknownProtocol rejects a bad --otel-protocol before
+// any network I/O, so operators see a clear error rather than a misleading
+// "connection refused" from an OTLP exporter attempting to dial with the
+// wrong wire format.
+func TestOBS04_BuildTelemetry_UnknownProtocol(t *testing.T) {
+	_, _, err := BuildTelemetry(CLIFlags{
+		OTelEndpoint: "localhost:14317",
+		OTelProtocol: "thrift", // not supported
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "thrift")
+}
+
+// TestOBS04_BuildTelemetry_RefusesInsecureRemote verifies the non-loopback
+// guard: an operator who sets --otel-insecure against a non-local endpoint
+// is rejected at startup. Without this guard, branch names, task IDs, and
+// error text would transmit in cleartext to any remote collector — the
+// insecure flag is a local-dev convenience, not a production toggle.
+func TestOBS04_BuildTelemetry_RefusesInsecureRemote(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		loopback bool
+	}{
+		{"localhost", "localhost:14317", true},
+		{"localhost-mixed-case", "LocalHost:4317", true},
+		{"ipv4-loopback", "127.0.0.1:4317", true},
+		{"ipv4-loopback-range", "127.1.2.3:4317", true},
+		{"ipv6-loopback", "[::1]:4317", true},
+		{"ipv6-loopback-bare-bracket", "[::1]", true},
+		// Zone IDs like "::1%lo0" classify correctly in isLoopbackEndpoint
+		// (netip.ParseAddr accepts them, unlike net.ParseIP) but the gRPC
+		// URL resolver rejects "%" as an invalid escape before any dial
+		// happens, so no end-to-end endpoint value is viable. Not tested.
+		{"remote-host", "collector.example.com:4317", false},
+		{"remote-ipv4", "10.0.0.1:4317", false},
+		{"remote-ipv4-unspecified", "0.0.0.0:4317", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, shutdown, err := BuildTelemetry(CLIFlags{
+				OTelEndpoint: tc.endpoint,
+				OTelProtocol: "grpc",
+				OTelInsecure: true,
+			})
+			if tc.loopback {
+				require.NoError(t, err, "loopback + insecure must be accepted")
+				// Providers were built; shut them down to avoid leaked
+				// PeriodicReader / BatchSpanProcessor goroutines.
+				t.Cleanup(func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+					defer cancel()
+					_ = shutdown(ctx)
+				})
+				return
+			}
+			require.Error(t, err, "non-loopback + insecure must be refused")
+			assert.Contains(t, err.Error(), "loopback",
+				"error must name the loopback requirement so operators know the fix")
+		})
+	}
+}
+
+// TestOBS04_BuildTelemetry_SecureRemoteAllowed: the loopback guard only
+// fires on insecure+remote; secure+remote must pass startup validation.
+// Shutdown uses a tight timeout because no collector is listening.
+func TestOBS04_BuildTelemetry_SecureRemoteAllowed(t *testing.T) {
+	telem, shutdown, err := BuildTelemetry(CLIFlags{
+		OTelEndpoint: "collector.example.com:4317",
+		OTelProtocol: "grpc",
+		OTelInsecure: false,
+	})
+	require.NoError(t, err, "secure remote endpoint must be accepted")
+	require.NotNil(t, telem)
+	require.NotNil(t, shutdown)
+	// Shutdown will likely error (no collector reachable); we only
+	// assert it returns within the timeout rather than hanging.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_ = shutdown(ctx)
+}
+
+// TestOBS04_RunCmd_OTelFlagsParse confirms --otel-endpoint, --otel-protocol, and
+// --otel-insecure all parse through cobra. Short-circuits before engine
+// init via an invalid ledger so the test stays hermetic (no collector
+// needed).
+func TestOBS04_RunCmd_OTelFlagsParse(t *testing.T) {
+	repo := seedRepoWithAgents(t)
+	err, stderr := runCobra(t,
+		"run",
+		"--branch", "test",
+		"--repo", repo,
+		"--agent-dir", filepath.Join(repo, "agents"),
+		"--otel-endpoint", "localhost:14317",
+		"--otel-protocol", "grpc",
+		"--otel-insecure=true",
+		"--ledger", "dolt",
+	)
+	require.Error(t, err)
+	assert.NotContains(t, stderr, "unknown flag", "OTel flags must parse")
 }

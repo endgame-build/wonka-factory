@@ -791,6 +791,60 @@ The dispatch loop already handles this: after the planner exits 0 (plan task com
 
 ---
 
+## Phase 10: Observability ✓ Complete
+
+### 10.1 OTel wiring
+
+Implemented in `orch/telemetry.go`:
+- `NewTelemetry(meterProvider, tracerProvider)` — builds counters, histograms, gauges, and a tracer.
+- `*Telemetry` is nil-safe: the exported methods (`Record`, `StartLifecycle`, `EndLifecycle`) check for a nil receiver, matching the `ProgressReporter` convention.
+- `EventLog.WithTelemetry(telem, branch)` attaches telemetry to the log so every `Emit()` also drives a metric/span update, keeping dispatcher/watchdog/engine signatures unchanged. A nil `telem` disables the side-channel; a non-nil `telem` with an empty `branch` returns `ErrWithTelemetryEmptyBranch` (Prometheus would otherwise emit un-filterable `branch=""` series).
+- Lifecycle-scope span: `Engine.emitLifecycleStarted` opens it via `Telemetry.StartLifecycle`; the engine's completion paths `defer telem.EndLifecycle(...)` directly to close it with the outcome attribute. `EndLifecycle` is idempotent (nils its span after `End`) so a double-call on a retry path doesn't double-record the histogram.
+- Task-scope spans: opened on `EventTaskDispatched`, closed on any terminal event for the same task ID. `tasksInProgress` gauge inc/dec is coupled to the `taskSpans` map lifetime so duplicate-dispatch (replay) doesn't drive it +1 and terminal-without-dispatch (resume) doesn't drive it −1.
+
+### 10.2 Emitted metrics
+
+Fifteen instruments, all under the `github.com/endgame/wonka-factory/orch` scope:
+
+| Metric | Type | Attributes | Requirement |
+|---|---|---|---|
+| `wonka_task_terminal_total` | counter | branch, outcome | throughput |
+| `wonka_task_duration_seconds` | histogram | role, outcome | duration p50/p95 |
+| `wonka_workers_active` | gauge | branch | OBS-04 |
+| `wonka_tasks_in_progress` | gauge | branch | OBS-04 |
+| `wonka_retry_total` | counter | branch | BVV-ERR-01 |
+| `wonka_handoff_total` | counter | branch | BVV-DSP-14 |
+| `wonka_handoff_limit_total` | counter | branch | BVV-L-04 — separate from escalations to avoid double-count when handoff-limit hits a critical task |
+| `wonka_graph_validation_total` | counter | branch, result | BVV-TG-07..10 |
+| `wonka_escalations_total` | counter | branch, reason | OBS-04 |
+| `wonka_gap_count` | gauge | branch | BVV-ERR-04 |
+| `wonka_lock_held` | gauge | branch | BVV-S-01 |
+| `wonka_gates_created_total` | counter | branch | BVV-GT-01 |
+| `wonka_gates_passed_total` | counter | branch | BVV-GT-02 |
+| `wonka_gates_failed_total` | counter | branch | BVV-GT-03 |
+| `wonka_lifecycle_duration_seconds` | histogram | branch, outcome | end-to-end timing |
+
+### 10.3 CLI wiring
+
+`internal/cmd/telemetry.go` builds OTLP exporters (gRPC or HTTP) when `--otel-endpoint` is set:
+
+- `--otel-endpoint <host:port>` — empty default = no telemetry. Non-empty triggers OTLP exporter init before engine start. Flag-shaped errors (unknown protocol, insecure-against-remote) fail synchronously, before the lifecycle lock; exporter reachability is lazy, so an unreachable collector surfaces asynchronously via the `[OBS-04]` error handler or during shutdown flush.
+- `--otel-protocol grpc|http` — default `grpc`.
+- `--otel-insecure` — default `false`. Enable it explicitly for the local non-TLS docker-compose collector (`localhost:14317`). Refused against any non-loopback endpoint to avoid leaking branch names, task IDs, and error text in cleartext.
+
+Shutdown is deferred inside `runLifecycle` with a 5-second flush budget so a stuck collector doesn't block CLI exit.
+
+### 10.4 Local stack
+
+`docker-compose.yaml` runs OTel collector (v0.99.0) + Prometheus (v3.8.0, 90-day retention) + Grafana (v11.0.0). Grafana auto-provisions two dashboards from `config/grafana/dashboards/`:
+
+- `wonka-orchestrator.json` — orchestrator-side panels (dispatch rate, task/lifecycle duration, gap/gate/escalation counters, handoff-limit hits).
+- `claude-code.json` — agent-side cost/token/session panels (Claude Code's own OTel exporter).
+
+Both dashboards live in the same "Telemetry" folder. The OTLP receiver listens on `localhost:14317` (gRPC) and `localhost:14318` (HTTP) — remapped from the OTel default ports to avoid collisions with a host-level Jaeger.
+
+---
+
 ## Implementation Sequence Summary
 
 | Step | Files | Depends On | Effort |
@@ -806,6 +860,7 @@ The dispatch loop already handles this: after the planner exits 0 (plan task com
 | 9. CLI | cmd/wonka/, internal/cmd/ | Step 7 | M |
 | 10. Agent instructions | agents/OOMPA.md, LOOMPA.md | Step 9 | M |
 | 11. Level 2 planner | agents/CHARLIE.md, validation | Step 10 | L ✓ Phase 9 |
+| 12. Observability | orch/telemetry.go, internal/cmd/telemetry.go, config/grafana/dashboards/wonka-orchestrator.json, docker-compose.yaml | Step 11 | M ✓ Phase 10 |
 
 ---
 
