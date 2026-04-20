@@ -83,7 +83,7 @@ The `-tags verify` build tag enables runtime invariant assertions that panic wit
 |----------------|-----------------------------------------------------------------|
 | `wonka run`    | Start a fresh lifecycle on a branch (acquires per-branch lock). |
 | `wonka resume` | Re-enter an interrupted lifecycle (reconciles stale state).     |
-| `wonka status` | Print ledger + gap + lock state for a branch.                   |
+| `wonka status` | Print tasks for the branch (table; `--json` for scripts).       |
 
 CLI-level exit codes (distinct from the agent exit-code protocol described below):
 `1` runtime error, `2` config error, `3` lock corrupt, `4` lock busy, `130` SIGINT.
@@ -202,14 +202,14 @@ Four test categories in `orch/`:
 - **Atomic writes**: All JSON writes via tmp+rename pattern.
 - **Cycle detection**: `AddDep` runs DFS reachability check before adding any edge.
 - **Per-branch lifecycle lock**: `O_CREATE|O_EXCL` semantics, staleness-based recovery, lock path scoped by branch name.
-- **Runtime state at `.wonka/`**: Event log (`events-<branch>.jsonl`), per-branch lifecycle locks, and gap counters. Created on first `wonka run`. Safe to delete only when no lifecycle is active.
+- **Runtime state at `.wonka/<branch>/`**: Event log (`events.jsonl`), ledger store (`ledger/`), and lifecycle lock (`.wonka-<branch>.lock`). Run dir defaults to `<repo>/.wonka/<sanitized-branch>/` (override with `--run-dir`). Gap state is not persisted as a file — `GapTracker` is recreated per run, and resume replays `gap_recorded` events to rebuild it. Safe to delete only when no lifecycle is active.
 - **Worker lifecycle**: validate → side-effect (tmux) → persist. `SpawnSession` uses defer-flag pattern for rollback.
 - **Idempotent cleanup**: Cleanup operations suppress "not found" errors. Use `KillSessionIfExists`.
 - **Tmux socket isolation**: Socket `"wonka-{runID}"`, session names `{runID}-{workerName}`.
 - **Exit code protocol replaces command interface**: No `prime`/`done`/`fail`/`heartbeat` commands. Agent reads `$ORCH_TASK_ID`, executes, exits with 0/1/2/3.
 - **Watchdog uses tmux presence, not heartbeats**: `tmux has-session -t <name>` replaces heartbeat writes.
 - **Gap tolerance**: `GapTracker` recovered from event log by scanning `gap_recorded` events.
-- **Circuit breaker**: 3 consecutive rapid failures (session < 60s) suspends worker.
+- **Circuit breaker**: 3 consecutive rapid failures (session < 60s) trip the CB — watchdog still restarts; the dispatcher reads `CBTripped()` to decide whether to halt.
 - **Handoff counter monotonic within lifecycle**: Not reset on retry (exit 1). Reset only on human re-open.
 
 ## Conventions

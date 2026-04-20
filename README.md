@@ -20,7 +20,7 @@ Each session runs exactly one task. Agents signal outcome through exit codes (`0
 | **Formally verified** | TLA+ encodes 52 of 70 requirements as safety invariants and liveness properties; TLC model-checks them before Go code lands. |
 | **Crash-recoverable** | Per-branch lifecycle locks detect staleness; `wonka resume` replays the event log to rebuild state. |
 | **Gap-tolerant** | Non-critical failures accumulate against a threshold; critical failures abort immediately. |
-| **Audited** | Append-only JSONL trail (19 event kinds) at `.wonka/events-<branch>.jsonl` — every assignment, exit, and lifecycle transition. |
+| **Audited** | Append-only JSONL trail (19 event kinds) at `<runDir>/events.jsonl` (default: `.wonka/<branch>/events.jsonl`) — every assignment, exit, and lifecycle transition. |
 
 ## Quickstart
 
@@ -71,7 +71,7 @@ CLI exit codes: `1` runtime error, `2` config error, `3` lock corrupt (needs hum
                               PR gate → CI → merge
 ```
 
-Each task runs in an isolated tmux session (socket `wonka-<runID>`, session name `<runID>-<workerName>`). The watchdog tracks liveness via `tmux has-session`, not heartbeat writes. Three consecutive sessions under 60 seconds trip the circuit breaker and suspend the worker.
+Each task runs in an isolated tmux session (socket `wonka-<runID>`, session name `<runID>-<workerName>`). The watchdog tracks liveness via `tmux has-session`, not heartbeat writes. Three consecutive sessions under 60 seconds trip the circuit breaker — the watchdog still restarts the session, and the dispatcher decides whether to halt.
 
 ## Commands
 
@@ -79,7 +79,7 @@ Each task runs in an isolated tmux session (socket `wonka-<runID>`, session name
 |----------------|-----------------------------------------------------------------|
 | `wonka run`    | Start a fresh lifecycle on a branch (acquires per-branch lock). |
 | `wonka resume` | Re-enter an interrupted lifecycle (reconciles stale state).     |
-| `wonka status` | Print ledger, gap counter, and lock state.                      |
+| `wonka status` | Print tasks for the branch (table; `--json` for scripts).       |
 
 ## Formal verification
 
