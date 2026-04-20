@@ -1338,7 +1338,7 @@ func TestE2E_ParallelGapExhaustion(t *testing.T) {
 		"at least one task must be blocked by BVV-ERR-04a cleanup (got %d)", blocked)
 }
 
-// TestE2E_TelemetryEmission verifies the OBS-04 observability pipeline
+// TestOBS04_E2EEmission verifies the OBS-04 observability pipeline
 // end-to-end: a live lifecycle with an attached OTel meter/tracer produces
 // the expected counters, histograms, and spans. Unlike the unit tests in
 // telemetry_test.go, this exercises the actual EventLog.Emit → Telemetry
@@ -1346,8 +1346,7 @@ func TestE2E_ParallelGapExhaustion(t *testing.T) {
 // --otel-endpoint ends up wiring.
 //
 // Hermetic: uses in-memory ManualReader and SpanRecorder, not a real OTLP
-// collector. Runs a 3-task linear graph (builder → verifier → gate) with
-// mock-agents that exit 0.
+// collector. Runs a 3-task linear builder graph with mock-agents that exit 0.
 func TestOBS04_E2EEmission(t *testing.T) {
 	skipWithoutTmux(t)
 
@@ -1409,9 +1408,9 @@ func TestOBS04_E2EEmission(t *testing.T) {
 	assert.Equal(t, uint64(1), histCount(metrics["wonka_lifecycle_duration_seconds"]),
 		"lifecycle duration recorded once at completion")
 
-	// Traces: lifecycle span + one span per task = 4 ended spans.
+	// Traces: lifecycle span + one span per task = exactly 4 ended spans.
 	ended := spanRec.Ended()
-	assert.GreaterOrEqual(t, len(ended), 4, "lifecycle + per-task spans expected, got %d", len(ended))
+	assert.Equal(t, 4, len(ended), "lifecycle + 3 task spans expected, got %d", len(ended))
 
 	// Find the lifecycle span and verify its branch attribute round-tripped.
 	var hasLifecycle bool

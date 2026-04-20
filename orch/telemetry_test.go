@@ -15,7 +15,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
-// TestTelemetry_NilSafe verifies every Telemetry method is safe to invoke on
+// TestOBS04_NilSafe verifies every Telemetry method is safe to invoke on
 // a nil receiver. Production code paths frequently hold a nil *Telemetry
 // when no exporter is configured (the CLI --otel-endpoint flag default);
 // a single missing nil check would turn every lifecycle run into a panic.
@@ -29,7 +29,7 @@ func TestOBS04_NilSafe(t *testing.T) {
 	nilT.Record(ctx, Event{Kind: EventTaskCompleted, TaskID: "t1"}, "main")
 }
 
-// TestTelemetry_NoopProvidersDoNotPanic verifies that NoopTelemetry() produces
+// TestOBS04_NoopProvidersDoNotPanic verifies that NoopTelemetry() produces
 // a Telemetry that accepts every event kind without panicking. Catches drift
 // where a new event kind is added to the enum but not handled by Record()'s
 // switch — even unhandled kinds must be no-ops, not panics.
@@ -49,7 +49,7 @@ func TestOBS04_NoopProvidersDoNotPanic(t *testing.T) {
 	telem.EndLifecycle(ctx, "main", "completed")
 }
 
-// TestTelemetry_RecordsCounters sets up a ManualReader, drives a realistic
+// TestOBS04_RecordsCounters sets up a ManualReader, drives a realistic
 // lifecycle through Record(), and asserts the expected counter deltas.
 // Pins the metric-name contract that the Grafana dashboard panels depend on.
 func TestOBS04_RecordsCounters(t *testing.T) {
@@ -119,7 +119,7 @@ func TestOBS04_RecordsCounters(t *testing.T) {
 }
 
 // TestOBS04_RecordsAllSwitchArms walks every arm of Record()'s switch and
-// asserts the expected metric deltas. The existing TestTelemetry_RecordsCounters
+// asserts the expected metric deltas. The existing TestOBS04_RecordsCounters
 // covers the happy path; this one plugs the coverage gaps the code review
 // flagged (EventTaskFailed/Blocked, EventTaskHandoff, gauge-pair symmetry,
 // gate events, escalation reason fallback, EventGraphInvalid).
@@ -194,19 +194,9 @@ func TestOBS04_RecordsAllSwitchArms(t *testing.T) {
 	// Handoff counter fires on EventTaskHandoff (BVV-DSP-14).
 	assert.Equal(t, int64(1), sumCounter(metrics, "wonka_handoff_total"))
 
-	// Gauge symmetry — UpDownCounters accumulate in sum-over-window; the
-	// final reading should be zero for every pair that balanced.
-	//
-	//   tasksInProgress: 3 dispatches, 3 terminal events (handoff is NOT
-	//   terminal per BVV-DSP-14, so it does NOT decrement), = 0.
-	//   gapCount: +1 from gap_recorded, -1 from escalation_resolved, = 0.
-	//   lockHeld: +1 from StartLifecycle, -1 from lifecycle_completed, = 0.
-	//
-	// Note: EventLifecycleStarted increments lockHeld via the switch;
-	// StartLifecycle opens the span. We emitted both by using
-	// Record with EventLifecycleStarted … actually we didn't — only
-	// StartLifecycle which doesn't drive lockHeld. Close the pair manually
-	// so this test exercises the lockHeld symmetry.
+	// Gauge symmetry — balanced inc/dec pairs must sum to zero.
+	// StartLifecycle doesn't drive lockHeld; drive it via Record to
+	// exercise the lockHeld inc/dec pair.
 	telem.Record(ctx, Event{Kind: EventLifecycleStarted}, branch)
 	telem.Record(ctx, Event{Kind: EventLifecycleCompleted}, branch)
 	require.NoError(t, reader.Collect(ctx, &rm))
@@ -346,7 +336,7 @@ func TestOBS04_UnknownTaskTerminalIsNoOp(t *testing.T) {
 		"terminal without prior dispatch must not record a duration sample")
 }
 
-// TestTelemetry_RecordThroughEventLog verifies the EventLog side-channel
+// TestOBS04_RecordThroughEventLog verifies the EventLog side-channel
 // actually reaches the telemetry. Catches regressions in the EventLog.Emit
 // wiring (the one line that makes Phase 10 functional).
 func TestOBS04_RecordThroughEventLog(t *testing.T) {

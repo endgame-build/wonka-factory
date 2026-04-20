@@ -28,13 +28,11 @@ import (
 type TelemetryShutdown func(context.Context) error
 
 // BuildTelemetry constructs an orch.Telemetry bound to the OTLP exporter
-// configured by the flags. Empty OTelEndpoint → (nil, noopShutdown, nil);
-// malformed flags (unknown --otel-protocol, --otel-insecure against a
-// non-loopback host) fail here at startup. Note that network reachability
-// is NOT checked at startup: the OTel SDK's exporter constructors use
-// grpc.NewClient / non-blocking HTTP dials, so an unreachable collector
-// only surfaces via the OTel global error handler on the first failed
-// export (see otel.SetErrorHandler in run.go).
+// configured by the flags. Empty OTelEndpoint → (nil, noopShutdown, nil).
+// Flag errors are eager; network reachability is lazy (OTel exporter
+// constructors use grpc.NewClient / non-blocking HTTP dials), so an
+// unreachable collector surfaces via the global error handler on first
+// failed export.
 func BuildTelemetry(flags CLIFlags) (*orch.Telemetry, TelemetryShutdown, error) {
 	if flags.OTelEndpoint == "" {
 		return nil, noopShutdown, nil
@@ -93,28 +91,34 @@ func BuildTelemetry(flags CLIFlags) (*orch.Telemetry, TelemetryShutdown, error) 
 		return nil, noopShutdown, fmt.Errorf("telemetry: build: %w", err)
 	}
 
-	// Install an OTel global error handler so asynchronous export failures
-	// (unreachable collector, TLS handshake error, auth reject) surface
-	// once to stderr instead of vanishing. The exporter constructors are
-	// non-blocking, so a misconfigured endpoint only shows up here. We
-	// install it lazily (exactly once per process, first endpoint wins)
-	// to avoid clobbering a handler the test harness may have set.
+	// Surface async OTel export failures to stderr (OBS-04).
 	installOTelErrorHandlerOnce()
 
+	// ForceFlush and Shutdown are independent across providers; run each
+	// pair concurrently so shutdown doesn't serialize two round-trips to
+	// an unreachable collector on Ctrl-C.
 	shutdown := func(ctx context.Context) error {
-		// Force-flush before Shutdown so the final batch reaches the
-		// collector; attempt all four operations so a partial failure
-		// doesn't leak goroutines.
+		var mu sync.Mutex
 		var firstErr error
 		record := func(err error) {
-			if err != nil && firstErr == nil {
+			if err == nil {
+				return
+			}
+			mu.Lock()
+			if firstErr == nil {
 				firstErr = err
 			}
+			mu.Unlock()
 		}
-		record(mp.ForceFlush(ctx))
-		record(tp.ForceFlush(ctx))
-		record(mp.Shutdown(ctx))
-		record(tp.Shutdown(ctx))
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); record(mp.ForceFlush(ctx)) }()
+		go func() { defer wg.Done(); record(tp.ForceFlush(ctx)) }()
+		wg.Wait()
+		wg.Add(2)
+		go func() { defer wg.Done(); record(mp.Shutdown(ctx)) }()
+		go func() { defer wg.Done(); record(tp.Shutdown(ctx)) }()
+		wg.Wait()
 		return firstErr
 	}
 	return telem, shutdown, nil
@@ -122,30 +126,21 @@ func BuildTelemetry(flags CLIFlags) (*orch.Telemetry, TelemetryShutdown, error) 
 
 func noopShutdown(context.Context) error { return nil }
 
-// otelErrorHandlerOnce ensures the global OTel error handler is installed
-// at most once. Tests that run BuildTelemetry multiple times in a single
-// process (the non-loopback guard test uses a table of cases) would
-// otherwise reset the handler on each call.
+// otelErrorHandlerOnce guards otel.SetErrorHandler so repeated
+// BuildTelemetry calls (table tests) don't clobber a prior handler.
 var otelErrorHandlerOnce sync.Once
 
 func installOTelErrorHandlerOnce() {
 	otelErrorHandlerOnce.Do(func() {
 		otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
-			// Async SDK failures land here. Rate-limiting isn't necessary
-			// because OTel's BatchSpanProcessor / PeriodicReader log once
-			// per batch, not per span/point. Tag with [OBS-04] so
-			// operators can grep regardless of exporter diagnostics shape.
 			fmt.Fprintf(os.Stderr, "[OBS-04] otel async error: %v\n", err)
 		}))
 	})
 }
 
-// isLoopbackEndpoint reports whether the host portion of an OTLP endpoint
-// refers to the local machine. Accepts bare hosts ("localhost"), host:port
-// ("localhost:14317"), IPv4 ("127.0.0.1:4317"), and IPv6 ("[::1]:4317").
-// Used to gate the --otel-insecure flag: transmitting telemetry in
-// cleartext is a local-dev convenience; it should not silently apply when
-// an operator aims a dev flag at a production collector.
+// isLoopbackEndpoint reports whether the host portion of "host:port" (or a
+// bare host) refers to the local machine. "localhost" is accepted without
+// DNS resolution; IPs go through net.IP.IsLoopback.
 func isLoopbackEndpoint(endpoint string) bool {
 	host := endpoint
 	if h, _, err := net.SplitHostPort(endpoint); err == nil {

@@ -810,7 +810,7 @@ Fifteen instruments, all under the `github.com/endgame/wonka-factory/orch` scope
 |---|---|---|---|
 | `wonka_task_terminal_total` | counter | branch, outcome | throughput |
 | `wonka_task_duration_seconds` | histogram | role, outcome | duration p50/p95 |
-| `wonka_workers_active` | gauge | — | OBS-04 |
+| `wonka_workers_active` | gauge | branch | OBS-04 |
 | `wonka_tasks_in_progress` | gauge | branch | OBS-04 |
 | `wonka_retry_total` | counter | branch | BVV-ERR-01 |
 | `wonka_handoff_total` | counter | branch | BVV-DSP-14 |

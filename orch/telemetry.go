@@ -41,14 +41,8 @@ type Telemetry struct {
 
 	taskSpans sync.Map // taskID → *taskSpanRecord
 
-	// lifecycleMu guards lifecycleSpan and lifecycleStarted. StartLifecycle
-	// and EndLifecycle mutate them; Record reads lifecycleSpan in
-	// onTaskDispatched to parent the task span. Current call sites
-	// serialize access (dispatch goroutine writes, Drain reads post-Wait),
-	// but the race detector flagged a narrow window during test-mode
-	// shutdown where a trailing outcome goroutine could Emit after the
-	// main goroutine entered EndLifecycle. Mutex-guarded access removes
-	// the hazard at negligible cost.
+	// lifecycleMu guards lifecycleSpan + lifecycleStarted against the
+	// EndLifecycle / onTaskDispatched read-write race under -race.
 	lifecycleMu      sync.Mutex
 	lifecycleSpan    trace.Span
 	lifecycleStarted time.Time
@@ -238,12 +232,8 @@ func (t *Telemetry) Record(ctx context.Context, ev Event, branch string) {
 		t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
 	case EventTaskHandoff:
-		// BVV-DSP-14: the task remains in_progress across a handoff;
-		// only the tmux session restarts. We keep the dispatch span
-		// open, annotate it with a handoff marker, and leave
-		// tasksInProgress alone. Decrementing here (and ending the
-		// span) would drift the gauge permanently low per handoff and
-		// drop the post-handoff segment from wonka_task_duration_seconds.
+		// BVV-DSP-14: task stays in_progress across handoff; annotate
+		// the live span and leave tasksInProgress / the span open.
 		if raw, ok := t.taskSpans.Load(ev.TaskID); ok {
 			rec := raw.(*taskSpanRecord)
 			rec.span.AddEvent("handoff", trace.WithAttributes(
@@ -253,10 +243,10 @@ func (t *Telemetry) Record(ctx context.Context, ev Event, branch string) {
 		t.handoffs.Add(ctx, 1, metric.WithAttributes(branchAttr))
 
 	case EventWorkerSpawned:
-		t.workersActive.Add(ctx, 1)
+		t.workersActive.Add(ctx, 1, metric.WithAttributes(branchAttr))
 
 	case EventWorkerReleased:
-		t.workersActive.Add(ctx, -1)
+		t.workersActive.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
 	case EventGapRecorded:
 		t.gapCount.Add(ctx, 1, metric.WithAttributes(branchAttr))
@@ -328,16 +318,12 @@ func (t *Telemetry) onTaskDispatched(ctx context.Context, ev Event, branchAttr a
 		started: time.Now(),
 		role:    ev.Role,
 	}
-	// LoadOrStore protects against duplicate dispatch events (crash
-	// recovery / resume replay can re-emit task_dispatched for a task
-	// whose first span is still in taskSpans). A plain Store would
-	// orphan the prior span — never End()-ed, never exported. Instead
-	// we end the prior span with outcome="superseded" and take over.
-	if prior, loaded := t.taskSpans.LoadOrStore(ev.TaskID, newRec); loaded {
+	// Resume replay can re-emit task_dispatched; end the prior span as
+	// superseded rather than orphan it.
+	if prior, loaded := t.taskSpans.Swap(ev.TaskID, newRec); loaded {
 		priorRec := prior.(*taskSpanRecord)
 		priorRec.span.SetAttributes(attribute.String("outcome", "superseded"))
 		priorRec.span.End()
-		t.taskSpans.Store(ev.TaskID, newRec)
 	}
 	t.tasksInProgress.Add(ctx, 1, metric.WithAttributes(branchAttr))
 }
@@ -348,9 +334,7 @@ func (t *Telemetry) onTaskTerminal(ctx context.Context, ev Event, outcome string
 		return
 	}
 	rec := raw.(*taskSpanRecord)
-	// Use the role captured at dispatch time. Watchdog-initiated events
-	// (EventTaskHandoff) carry Role too, but the dispatch record is the
-	// single source of truth for the attempt.
+	// Use the role captured at dispatch time — single source of truth per attempt.
 	role := rec.role
 	if role == "" {
 		role = "unknown"

@@ -148,7 +148,7 @@ func TestRunCmd_NoValidateGraphFlag(t *testing.T) {
 	assert.NotContains(t, stderr, "unknown flag", "--no-validate-graph must parse")
 }
 
-// TestBuildTelemetry_EmptyEndpointReturnsNil verifies the no-op path: with
+// TestOBS04_BuildTelemetry_EmptyEndpointReturnsNil verifies the no-op path: with
 // no --otel-endpoint, BuildTelemetry returns (nil, noop-shutdown, nil) so
 // the engine attaches a nil *Telemetry and the whole observability surface
 // stays dormant. This is the default posture — running wonka without an
@@ -162,7 +162,7 @@ func TestOBS04_BuildTelemetry_EmptyEndpointReturnsNil(t *testing.T) {
 	assert.NoError(t, shutdown(nil))
 }
 
-// TestBuildTelemetry_UnknownProtocol rejects a bad --otel-protocol before
+// TestOBS04_BuildTelemetry_UnknownProtocol rejects a bad --otel-protocol before
 // any network I/O, so operators see a clear error rather than a misleading
 // "connection refused" from an OTLP exporter attempting to dial with the
 // wrong wire format.
@@ -194,16 +194,20 @@ func TestOBS04_BuildTelemetry_RefusesInsecureRemote(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := BuildTelemetry(CLIFlags{
+			_, shutdown, err := BuildTelemetry(CLIFlags{
 				OTelEndpoint: tc.endpoint,
 				OTelProtocol: "grpc",
 				OTelInsecure: true,
 			})
 			if tc.loopback {
-				// Loopback + insecure is allowed; no startup error on flags.
-				// The exporter still constructs lazily so this stays
-				// hermetic (no collector needs to be up).
 				require.NoError(t, err, "loopback + insecure must be accepted")
+				// Providers were built; shut them down to avoid leaked
+				// PeriodicReader / BatchSpanProcessor goroutines.
+				t.Cleanup(func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+					defer cancel()
+					_ = shutdown(ctx)
+				})
 				return
 			}
 			require.Error(t, err, "non-loopback + insecure must be refused")
@@ -213,13 +217,9 @@ func TestOBS04_BuildTelemetry_RefusesInsecureRemote(t *testing.T) {
 	}
 }
 
-// TestOBS04_BuildTelemetry_SecureRemoteAllowed verifies the guard only
-// fires on the insecure combination — a secure (TLS) OTLP connection to a
-// remote collector passes startup flag validation. The exporter is lazy
-// (grpc.NewClient is non-blocking) so no TLS handshake happens at
-// construction; this test only exercises the guard path. Shutdown uses a
-// tight timeout because no real collector is listening — the point is the
-// flag check, not the network.
+// TestOBS04_BuildTelemetry_SecureRemoteAllowed: the loopback guard only
+// fires on insecure+remote; secure+remote must pass startup validation.
+// Shutdown uses a tight timeout because no collector is listening.
 func TestOBS04_BuildTelemetry_SecureRemoteAllowed(t *testing.T) {
 	telem, shutdown, err := BuildTelemetry(CLIFlags{
 		OTelEndpoint: "collector.example.com:4317",
@@ -236,7 +236,7 @@ func TestOBS04_BuildTelemetry_SecureRemoteAllowed(t *testing.T) {
 	_ = shutdown(ctx)
 }
 
-// TestRunCmd_OTelFlagsParse confirms --otel-endpoint, --otel-protocol, and
+// TestOBS04_RunCmd_OTelFlagsParse confirms --otel-endpoint, --otel-protocol, and
 // --otel-insecure all parse through cobra. Short-circuits before engine
 // init via an invalid ledger so the test stays hermetic (no collector
 // needed).
