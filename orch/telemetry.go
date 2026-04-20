@@ -120,12 +120,12 @@ func NewTelemetry(meterProvider metric.MeterProvider, tracerProvider trace.Trace
 		return nil, fmt.Errorf("telemetry: lifecycle duration histogram: %w", err)
 	}
 	if t.workersActive, err = m.Int64UpDownCounter("wonka_workers_active",
-		metric.WithDescription("Active worker sessions (BVV-S-04)"),
+		metric.WithDescription("Active worker sessions per branch (OBS-04)"),
 	); err != nil {
 		return nil, fmt.Errorf("telemetry: workers_active gauge: %w", err)
 	}
 	if t.tasksInProgress, err = m.Int64UpDownCounter("wonka_tasks_in_progress",
-		metric.WithDescription("Tasks currently in_progress by role"),
+		metric.WithDescription("Tasks currently in_progress per branch"),
 	); err != nil {
 		return nil, fmt.Errorf("telemetry: tasks_in_progress gauge: %w", err)
 	}
@@ -206,30 +206,26 @@ func (t *Telemetry) Record(ctx context.Context, ev Event, branch string) {
 		t.onTaskDispatched(ctx, ev, branchAttr)
 
 	case EventTaskCompleted:
-		t.onTaskTerminal(ctx, ev, "completed")
+		t.onTaskTerminal(ctx, ev, "completed", branchAttr)
 		t.taskTerminal.Add(ctx, 1, metric.WithAttributes(
 			branchAttr, attribute.String("outcome", "completed"),
 		))
-		t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
 	case EventTaskFailed:
-		t.onTaskTerminal(ctx, ev, "failed")
+		t.onTaskTerminal(ctx, ev, "failed", branchAttr)
 		t.taskTerminal.Add(ctx, 1, metric.WithAttributes(
 			branchAttr, attribute.String("outcome", "failed"),
 		))
-		t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
 	case EventTaskBlocked:
-		t.onTaskTerminal(ctx, ev, "blocked")
+		t.onTaskTerminal(ctx, ev, "blocked", branchAttr)
 		t.taskTerminal.Add(ctx, 1, metric.WithAttributes(
 			branchAttr, attribute.String("outcome", "blocked"),
 		))
-		t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
 	case EventTaskRetried:
-		t.onTaskTerminal(ctx, ev, "retried")
+		t.onTaskTerminal(ctx, ev, "retried", branchAttr)
 		t.retries.Add(ctx, 1, metric.WithAttributes(branchAttr))
-		t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
 	case EventTaskHandoff:
 		// BVV-DSP-14: task stays in_progress across handoff; annotate
@@ -318,17 +314,26 @@ func (t *Telemetry) onTaskDispatched(ctx context.Context, ev Event, branchAttr a
 		started: time.Now(),
 		role:    ev.Role,
 	}
-	// Resume replay can re-emit task_dispatched; end the prior span as
-	// superseded rather than orphan it.
+	// Resume replay can re-emit task_dispatched. Only fresh inserts drive
+	// tasksInProgress, pairing with the decrement in onTaskTerminal that
+	// fires only when LoadAndDelete succeeds — so duplicate dispatches
+	// don't double-count and the superseded span still ends cleanly.
 	if prior, loaded := t.taskSpans.Swap(ev.TaskID, newRec); loaded {
 		priorRec := prior.(*taskSpanRecord)
 		priorRec.span.SetAttributes(attribute.String("outcome", "superseded"))
 		priorRec.span.End()
+	} else {
+		t.tasksInProgress.Add(ctx, 1, metric.WithAttributes(branchAttr))
 	}
-	t.tasksInProgress.Add(ctx, 1, metric.WithAttributes(branchAttr))
 }
 
-func (t *Telemetry) onTaskTerminal(ctx context.Context, ev Event, outcome string) {
+// onTaskTerminal closes the dispatch span, records duration, and decrements
+// tasksInProgress — all gated on finding a prior dispatch record. A resume
+// or replay can deliver a terminal event for a task dispatched in a prior
+// process; in that case this is a silent no-op so the gauge can't drift
+// negative. The outer switch still records the outcome counter, which
+// tracks terminal emissions regardless of dispatch provenance.
+func (t *Telemetry) onTaskTerminal(ctx context.Context, ev Event, outcome string, branchAttr attribute.KeyValue) {
 	raw, ok := t.taskSpans.LoadAndDelete(ev.TaskID)
 	if !ok {
 		return
@@ -353,6 +358,7 @@ func (t *Telemetry) onTaskTerminal(ctx context.Context, ev Event, outcome string
 			attribute.String("outcome", outcome),
 		),
 	)
+	t.tasksInProgress.Add(ctx, -1, metric.WithAttributes(branchAttr))
 }
 
 type taskSpanRecord struct {

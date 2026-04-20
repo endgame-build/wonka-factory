@@ -124,6 +124,14 @@ type EventLog struct {
 func (el *EventLog) WithTelemetry(telem *Telemetry, branch string) *EventLog {
 	el.mu.Lock()
 	defer el.mu.Unlock()
+	// Empty branch would emit points with branch="" — Prometheus stores
+	// that as a distinct time series and Grafana panels can't filter on
+	// it, so a miswired caller silently produces un-usable metrics.
+	if telem == nil || branch == "" {
+		el.telem = nil
+		el.branch = ""
+		return el
+	}
 	el.telem = telem
 	el.branch = branch
 	return el

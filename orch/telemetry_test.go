@@ -334,6 +334,84 @@ func TestOBS04_UnknownTaskTerminalIsNoOp(t *testing.T) {
 	// But no duration sample — the dispatch span record was absent.
 	assert.Equal(t, uint64(0), histogramCount(metrics, "wonka_task_duration_seconds"),
 		"terminal without prior dispatch must not record a duration sample")
+	// A resume/replay terminal without a matching dispatch is not a −1
+	// signal — the dispatch came from a prior process that already
+	// decremented.
+	assert.Equal(t, int64(0), gaugeSum(metrics, "wonka_tasks_in_progress"),
+		"terminal without prior dispatch must not decrement tasks_in_progress")
+}
+
+// TestOBS04_DuplicateDispatchNoDoubleIncrement verifies that a duplicate
+// EventTaskDispatched for the same task ID does not drive tasksInProgress
+// +2 — the terminal only decrements once, so a duplicated inc would drift
+// the gauge permanently.
+func TestOBS04_DuplicateDispatchNoDoubleIncrement(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	telem, err := NewTelemetry(mp, nil)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	telem.StartLifecycle(ctx, "branch-dup")
+	telem.Record(ctx, Event{Kind: EventTaskDispatched, TaskID: "T", Role: "builder"}, "branch-dup")
+	// Duplicate dispatch — must NOT re-increment tasksInProgress.
+	telem.Record(ctx, Event{Kind: EventTaskDispatched, TaskID: "T", Role: "builder"}, "branch-dup")
+
+	// Observe the gauge mid-lifecycle: exactly one task is in progress.
+	rm := metricdata.ResourceMetrics{}
+	require.NoError(t, reader.Collect(ctx, &rm))
+	metrics := collectMetrics(t, &rm)
+	assert.Equal(t, int64(1), gaugeSum(metrics, "wonka_tasks_in_progress"),
+		"duplicate dispatch must not inflate tasks_in_progress")
+
+	// Terminal — decrements once, balancing the single increment.
+	telem.Record(ctx, Event{Kind: EventTaskCompleted, TaskID: "T", Role: "builder"}, "branch-dup")
+	telem.EndLifecycle(ctx, "branch-dup", "completed")
+
+	require.NoError(t, reader.Collect(ctx, &rm))
+	metrics = collectMetrics(t, &rm)
+	assert.Equal(t, int64(0), gaugeSum(metrics, "wonka_tasks_in_progress"),
+		"single terminal must balance the (deduplicated) dispatch")
+}
+
+// TestOBS04_WithTelemetryEmptyBranchDisables verifies the WithTelemetry
+// contract that an empty branch disables the side-channel. Production
+// always passes a validated non-empty branch, but the guard prevents a
+// call-site mistake from emitting un-branched metrics that Prometheus
+// would store as a distinct time series and Grafana panels can't filter.
+func TestOBS04_WithTelemetryEmptyBranchDisables(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	telem, err := NewTelemetry(mp, nil)
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	log, err := NewEventLog(dir + "/events.jsonl")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = log.Close() })
+	// Empty branch must disable the side-channel.
+	log.WithTelemetry(telem, "")
+
+	require.NoError(t, log.Emit(Event{
+		Kind:   EventTaskDispatched,
+		TaskID: "t1",
+		Role:   "builder",
+	}))
+	require.NoError(t, log.Emit(Event{
+		Kind:   EventTaskCompleted,
+		TaskID: "t1",
+		Role:   "builder",
+	}))
+
+	rm := metricdata.ResourceMetrics{}
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	metrics := collectMetrics(t, &rm)
+	assert.Equal(t, int64(0), sumCounter(metrics, "wonka_task_terminal_total"),
+		"empty branch must disable EventLog.Emit → telemetry")
 }
 
 // TestOBS04_RecordThroughEventLog verifies the EventLog side-channel

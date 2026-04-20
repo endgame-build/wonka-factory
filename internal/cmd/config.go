@@ -292,5 +292,5 @@ func addLifecycleFlags(cmd *cobra.Command, flags *CLIFlags) {
 	cmd.Flags().BoolVar(&flags.NoValidateGraph, "no-validate-graph", false, "disable post-planner task-graph validation (BVV-TG-07..10); required for Level 1 operation against pre-populated ledgers")
 	cmd.Flags().StringVar(&flags.OTelEndpoint, "otel-endpoint", "", "OTLP receiver endpoint (host:port). Empty = no telemetry emitted. Example: localhost:14317")
 	cmd.Flags().StringVar(&flags.OTelProtocol, "otel-protocol", "grpc", "OTLP transport: grpc or http. Only consulted when --otel-endpoint is set")
-	cmd.Flags().BoolVar(&flags.OTelInsecure, "otel-insecure", false, "skip TLS on the OTLP connection. Required for the local docker-compose stack (localhost:14317). Refused for non-loopback endpoints unless combined with an explicit loopback host")
+	cmd.Flags().BoolVar(&flags.OTelInsecure, "otel-insecure", false, "skip TLS on the OTLP connection. Only allowed for loopback endpoints (localhost / 127.0.0.1 / ::1); refused against any non-loopback endpoint. Required for the local docker-compose stack (localhost:14317)")
 }

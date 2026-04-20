@@ -60,8 +60,11 @@ func runLifecycle(flags CLIFlags, invoke lifecycleFn, stderr io.Writer) error {
 	fmt.Fprintf(stderr, "run dir: %s\n", cfg.RunDir)
 
 	// Telemetry is optional; nil *Telemetry is treated as no-op by orch.
-	// Build *before* engine init so a bad --otel-endpoint fails loudly
-	// before acquiring the lifecycle lock or touching the ledger.
+	// Build *before* engine init so invalid flags (unknown --otel-protocol,
+	// --otel-insecure against a non-loopback endpoint) fail fast before
+	// touching the lifecycle lock or the ledger. Exporter reachability is
+	// lazy — an unreachable collector surfaces asynchronously via the OBS-04
+	// error handler or at shutdown flush, not here.
 	telem, shutdownTelem, err := BuildTelemetry(flags)
 	if err != nil {
 		return die(stderr, exitConfigError, "telemetry init failed: %s", err)
