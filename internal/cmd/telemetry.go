@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -96,18 +98,18 @@ func BuildTelemetry(flags CLIFlags) (*orch.Telemetry, TelemetryShutdown, error) 
 
 	// ForceFlush and Shutdown are independent across providers; run each
 	// pair concurrently so shutdown doesn't serialize two round-trips to
-	// an unreachable collector on Ctrl-C.
+	// an unreachable collector on Ctrl-C. All errors are joined — a TLS
+	// failure on the metrics pipeline must not mask a DNS failure on
+	// traces, else an operator "fixes" the wrong layer next run.
 	shutdown := func(ctx context.Context) error {
 		var mu sync.Mutex
-		var firstErr error
+		var errs []error
 		record := func(err error) {
 			if err == nil {
 				return
 			}
 			mu.Lock()
-			if firstErr == nil {
-				firstErr = err
-			}
+			errs = append(errs, err)
 			mu.Unlock()
 		}
 		var wg sync.WaitGroup
@@ -119,7 +121,7 @@ func BuildTelemetry(flags CLIFlags) (*orch.Telemetry, TelemetryShutdown, error) 
 		go func() { defer wg.Done(); record(mp.Shutdown(ctx)) }()
 		go func() { defer wg.Done(); record(tp.Shutdown(ctx)) }()
 		wg.Wait()
-		return firstErr
+		return errors.Join(errs...)
 	}
 	return telem, shutdown, nil
 }
@@ -140,21 +142,27 @@ func installOTelErrorHandlerOnce() {
 
 // isLoopbackEndpoint reports whether the host portion of "host:port" (or a
 // bare host) refers to the local machine. "localhost" is accepted without
-// DNS resolution; IPs go through net.IP.IsLoopback.
+// DNS resolution. Uses netip.ParseAddr so IPv6 zone IDs (e.g. "::1%lo0")
+// and bare-bracket forms like "[::1]" classify correctly.
 func isLoopbackEndpoint(endpoint string) bool {
 	host := endpoint
 	if h, _, err := net.SplitHostPort(endpoint); err == nil {
 		host = h
 	}
 	host = strings.TrimSpace(host)
+	// Bare-bracket form like "[::1]" (no port): SplitHostPort rejects it,
+	// so strip a single balanced bracket pair before parsing.
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
 	if host == "" {
 		return false
 	}
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return addr.IsLoopback()
 	}
 	return false
 }

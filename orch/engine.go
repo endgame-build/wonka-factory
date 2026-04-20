@@ -158,6 +158,12 @@ func (e *Engine) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Backstop: closes the lifecycle span and decrements wonka_lock_held on
+	// signal-cancel (BVV-ERR-09 is audit-silent, so emitLifecycle{Completed,
+	// Failed} don't run) and on panic. Idempotent, so happy-path emits with
+	// their own outcome still win.
+	defer e.cfg.Telemetry.EndLifecycle(context.Background(), e.cfg.Lifecycle.Branch, outcomeInterrupted)
+
 	// 6. Run dispatch loop.
 	return e.runLoop(ctx)
 }
@@ -242,6 +248,11 @@ func (e *Engine) Resume(ctx context.Context) error {
 	if err := e.emitLifecycleStarted(summary, result); err != nil {
 		return err
 	}
+
+	// Backstop — also covers the step-7 replayPlannerValidation failure
+	// window (a failure there returns before runLoop, leaking the span and
+	// wonka_lock_held gauge).
+	defer e.cfg.Telemetry.EndLifecycle(context.Background(), e.cfg.Lifecycle.Branch, outcomeInterrupted)
 
 	// 7. Re-fire post-planner validation for completed planner tasks
 	// whose hook never emitted graph_validated / graph_invalid (BVV-TG-07..10
@@ -350,7 +361,14 @@ func (e *Engine) initCommon(ledgerDir string) error {
 	}
 	// Attach optional OTel side-channel. Nil telemetry is a no-op; the
 	// audit trail remains the primary observability surface regardless.
-	log.WithTelemetry(e.cfg.Telemetry, e.cfg.Lifecycle.Branch)
+	// WithTelemetry errors only when telemetry is configured but branch is
+	// empty — the CLI validates branch upstream, so this returns a loud
+	// wiring error rather than silently producing un-filterable metrics.
+	if _, err := log.WithTelemetry(e.cfg.Telemetry, e.cfg.Lifecycle.Branch); err != nil {
+		_ = log.Close()
+		e.store.Close()
+		return fmt.Errorf("engine: %w", err)
+	}
 	e.log = log
 
 	// 3. Create and start tmux.
@@ -575,11 +593,10 @@ func (e *Engine) runLoop(ctx context.Context) error {
 	sigCtx, sigCancel := SetupSignalHandler()
 	defer sigCancel()
 
-	// 1a. Backstop for the signal-cancel branch (BVV-ERR-09 is audit-silent
-	// but the OTel span still needs to close). EndLifecycle is idempotent,
-	// so the normal-path emit functions' own deferred calls run first and
-	// this becomes a no-op.
-	defer e.cfg.Telemetry.EndLifecycle(context.Background(), e.cfg.Lifecycle.Branch, "interrupted")
+	// (Signal-cancel + panic coverage is provided by the EndLifecycle backstop
+	// registered in Run/Resume right after emitLifecycleStarted succeeds. Placing
+	// it there rather than here also covers any step-7 (Resume replay) failure
+	// that returns before runLoop.)
 
 	// 2. Merge parent context with signal context.
 	mergedCtx, mergedCancel := context.WithCancel(ctx)

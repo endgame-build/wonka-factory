@@ -72,7 +72,7 @@ The `-tags verify` build tag enables runtime invariant assertions that panic wit
 
 ## Local observability stack
 
-`docker-compose.yaml` spins up OTel collector + Prometheus + Grafana. Metrics and traces from `wonka run` reach Grafana when `--otel-endpoint` is set:
+`docker-compose.yaml` spins up OTel collector + Prometheus + Grafana. Metrics from `wonka run` reach Grafana when `--otel-endpoint` is set:
 
 ```bash
 docker compose up -d                                      # stack on localhost
@@ -82,6 +82,8 @@ bin/wonka run --branch feat/x --otel-endpoint localhost:14317 --otel-insecure
 - Grafana: http://localhost:3000 (admin/changeme) — "Telemetry" folder has `Wonka Orchestrator` and `Claude Code Telemetry` dashboards.
 - Prometheus: http://localhost:9090 — 90-day retention.
 - OTel collector: OTLP gRPC on `localhost:14317`, HTTP on `localhost:14318` (remapped from 4317/4318 to avoid conflicts with a host jaeger).
+
+**Traces.** Per-task and per-lifecycle spans are produced but the local stack currently exports them only to the collector's `debug` stdout exporter — there is no Tempo/Jaeger backend wired into `docker-compose.yaml` yet, and Grafana has no trace datasource. `docker compose logs otel-collector` shows the span JSON. Wiring Tempo (or equivalent) and a Grafana datasource is a follow-up.
 
 The default for `--otel-endpoint` is empty — no network I/O occurs unless the flag is set. Telemetry is never on by default.
 

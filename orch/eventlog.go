@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -65,11 +66,15 @@ var AllEventKinds = []EventKind{
 // Event is a single JSONL audit record (BVV spec §10.3).
 // BVV-DSN-04: phase-agnostic — no Phase field; agents are identified by
 // role labels carried on the referenced Task, not by an Agent field.
+//
+// Empty Role means an infrastructure-level event (lifecycle, gap,
+// escalation, gate). Telemetry uses Role as the low-cardinality role
+// attribute on wonka_task_duration_seconds.
 type Event struct {
 	Timestamp time.Time    `json:"timestamp"`
 	Kind      EventKind    `json:"kind"`
 	TaskID    string       `json:"task_id,omitempty"`
-	Role      string       `json:"role,omitempty"`
+	Role      Role         `json:"role,omitempty"`
 	Worker    string       `json:"worker,omitempty"`
 	Summary   string       `json:"summary"`
 	Detail    string       `json:"detail,omitempty"`
@@ -116,25 +121,28 @@ type EventLog struct {
 	branch string
 }
 
+// ErrWithTelemetryEmptyBranch is returned by WithTelemetry when a non-nil
+// Telemetry is supplied with an empty branch. An empty branch would emit
+// un-filterable metric points (branch=""), so fail loud at wiring time.
+var ErrWithTelemetryEmptyBranch = errors.New("eventlog: WithTelemetry requires non-empty branch when telemetry is configured")
+
 // WithTelemetry binds the event log to a Telemetry instrument so Emit
-// also records metrics and opens/closes spans. branch is the lifecycle
-// branch label used as an attribute on branch-scoped metrics. Passing a
-// nil telem or an empty branch is safe and disables the side-channel.
-// Returns the receiver for chainable configuration.
-func (el *EventLog) WithTelemetry(telem *Telemetry, branch string) *EventLog {
+// also records metrics and opens/closes spans. Nil telem is a safe no-op.
+// Non-nil telem with empty branch returns ErrWithTelemetryEmptyBranch.
+func (el *EventLog) WithTelemetry(telem *Telemetry, branch string) (*EventLog, error) {
 	el.mu.Lock()
 	defer el.mu.Unlock()
-	// Empty branch would emit points with branch="" — Prometheus stores
-	// that as a distinct time series and Grafana panels can't filter on
-	// it, so a miswired caller silently produces un-usable metrics.
-	if telem == nil || branch == "" {
+	if telem == nil {
 		el.telem = nil
 		el.branch = ""
-		return el
+		return el, nil
+	}
+	if branch == "" {
+		return nil, ErrWithTelemetryEmptyBranch
 	}
 	el.telem = telem
 	el.branch = branch
-	return el
+	return el, nil
 }
 
 // NewEventLog creates or opens an event log at the given path.

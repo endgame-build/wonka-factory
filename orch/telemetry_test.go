@@ -4,6 +4,7 @@ package orch
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,6 +14,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 // TestOBS04_NilSafe verifies every Telemetry method is safe to invoke on
@@ -91,7 +94,7 @@ func TestOBS04_RecordsCounters(t *testing.T) {
 
 	metrics := collectMetrics(t, &rm)
 
-	// Counters: one task completed, one retry, one watchdog event, one graph validated.
+	// Counters: one task completed, one retry, one handoff-limit hit, one graph validated.
 	assert.Equal(t, int64(1), sumCounter(metrics, "wonka_task_terminal_total"),
 		"one task_completed emission should increment terminal counter once")
 	assert.Equal(t, int64(1), sumCounter(metrics, "wonka_retry_total"),
@@ -138,7 +141,7 @@ func TestOBS04_RecordsAllSwitchArms(t *testing.T) {
 	branch := "branch-cov"
 
 	// Build a scenario that hits every switch arm at least once.
-	// Start lifecycle → lockHeld=+1.
+	// StartLifecycle drives lockHeld=+1 (coupled to the span lifetime).
 	telem.StartLifecycle(ctx, branch)
 
 	// Task A: dispatch → fail (outcome=failed).
@@ -174,7 +177,7 @@ func TestOBS04_RecordsAllSwitchArms(t *testing.T) {
 	// Graph invalid branch (sibling of graph_validated).
 	telem.Record(ctx, Event{Kind: EventGraphInvalid, TaskID: "plan-bad"}, branch)
 
-	// End lifecycle → lockHeld=-1.
+	// EndLifecycle drives lockHeld=-1 (paired with the span close).
 	telem.EndLifecycle(ctx, branch, "completed")
 
 	rm := metricdata.ResourceMetrics{}
@@ -195,19 +198,13 @@ func TestOBS04_RecordsAllSwitchArms(t *testing.T) {
 	assert.Equal(t, int64(1), sumCounter(metrics, "wonka_handoff_total"))
 
 	// Gauge symmetry — balanced inc/dec pairs must sum to zero.
-	// StartLifecycle doesn't drive lockHeld; drive it via Record to
-	// exercise the lockHeld inc/dec pair.
-	telem.Record(ctx, Event{Kind: EventLifecycleStarted}, branch)
-	telem.Record(ctx, Event{Kind: EventLifecycleCompleted}, branch)
-	require.NoError(t, reader.Collect(ctx, &rm))
-	metrics = collectMetrics(t, &rm)
-
+	// StartLifecycle + EndLifecycle above already drove the lockHeld pair.
 	assert.Equal(t, int64(0), gaugeSum(metrics, "wonka_tasks_in_progress"),
 		"handoff is non-terminal per BVV-DSP-14 — dispatches and terminals must balance")
 	assert.Equal(t, int64(0), gaugeSum(metrics, "wonka_gap_count"),
 		"gap_recorded and escalation_resolved must balance")
 	assert.Equal(t, int64(0), gaugeSum(metrics, "wonka_lock_held"),
-		"lifecycle_started and lifecycle_completed must balance")
+		"StartLifecycle + EndLifecycle must balance")
 
 	// Gate counters — one each.
 	assert.Equal(t, int64(2), sumCounter(metrics, "wonka_gates_created_total"))
@@ -232,11 +229,11 @@ func TestOBS04_RecordsAllSwitchArms(t *testing.T) {
 		"expected 3 task spans (A, B, C) + 1 lifecycle span — handoff must not end the task span early")
 }
 
-// TestOBS04_DuplicateDispatchSupersedes verifies the LoadOrStore fix at
+// TestOBS04_DuplicateDispatchSupersedes verifies the Swap behavior at
 // onTaskDispatched: a second EventTaskDispatched for the same task ID
 // ends the first span with outcome=superseded and installs a new span.
-// Regression shape: plain Store would silently orphan the first span
-// (never End()-ed, leaks via the batch exporter).
+// Regression shape: a plain Store (no Swap) would silently orphan the
+// first span (never End()-ed, leaks via the batch exporter).
 func TestOBS04_DuplicateDispatchSupersedes(t *testing.T) {
 	spanRec := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRec))
@@ -376,42 +373,211 @@ func TestOBS04_DuplicateDispatchNoDoubleIncrement(t *testing.T) {
 		"single terminal must balance the (deduplicated) dispatch")
 }
 
-// TestOBS04_WithTelemetryEmptyBranchDisables verifies the WithTelemetry
-// contract that an empty branch disables the side-channel. Production
-// always passes a validated non-empty branch, but the guard prevents a
-// call-site mistake from emitting un-branched metrics that Prometheus
-// would store as a distinct time series and Grafana panels can't filter.
-func TestOBS04_WithTelemetryEmptyBranchDisables(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
-
-	telem, err := NewTelemetry(mp, nil)
+// TestOBS04_WithTelemetry_RejectsEmptyBranch: non-nil telem + empty branch
+// must error so miswired callers don't silently produce un-filterable metrics.
+func TestOBS04_WithTelemetry_RejectsEmptyBranch(t *testing.T) {
+	telem, err := NewTelemetry(nil, nil)
 	require.NoError(t, err)
 
 	dir := t.TempDir()
 	log, err := NewEventLog(dir + "/events.jsonl")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = log.Close() })
-	// Empty branch must disable the side-channel.
-	log.WithTelemetry(telem, "")
 
-	require.NoError(t, log.Emit(Event{
-		Kind:   EventTaskDispatched,
-		TaskID: "t1",
-		Role:   "builder",
-	}))
-	require.NoError(t, log.Emit(Event{
-		Kind:   EventTaskCompleted,
-		TaskID: "t1",
-		Role:   "builder",
-	}))
+	_, err = log.WithTelemetry(telem, "")
+	require.ErrorIs(t, err, ErrWithTelemetryEmptyBranch,
+		"non-nil telemetry + empty branch must return ErrWithTelemetryEmptyBranch")
+}
+
+// TestOBS04_WithTelemetry_NilTelemDisables: nil telem is the no-telemetry-
+// configured case; must remain a safe silent no-op, not an error.
+func TestOBS04_WithTelemetry_NilTelemDisables(t *testing.T) {
+	dir := t.TempDir()
+	log, err := NewEventLog(dir + "/events.jsonl")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = log.Close() })
+
+	out, err := log.WithTelemetry(nil, "")
+	require.NoError(t, err)
+	require.NotNil(t, out, "nil-telemetry disable must return the receiver for chain continuation")
+	// Emit must not panic when no telemetry is wired.
+	require.NoError(t, log.Emit(Event{Kind: EventTaskDispatched, TaskID: "t1", Role: "builder"}))
+}
+
+// TestOBS04_LifecycleInterruptedOutcome pins the outcome="interrupted"
+// contract the signal-cancel backstop in Run/Resume relies on. Also locks
+// the invariant that wonka_lock_held is coupled to the span lifecycle (not
+// to EventLifecycleStarted/Completed in Record) so signal-cancel doesn't
+// leak the gauge.
+func TestOBS04_LifecycleInterruptedOutcome(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	spanRec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRec))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	telem, err := NewTelemetry(mp, tp)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	telem.StartLifecycle(ctx, "branch-sig")
+	// Simulate signal-cancel: no EventLifecycleCompleted emit. Only the
+	// backstop defer (EndLifecycle) runs.
+	telem.EndLifecycle(ctx, "branch-sig", "interrupted")
 
 	rm := metricdata.ResourceMetrics{}
-	require.NoError(t, reader.Collect(context.Background(), &rm))
+	require.NoError(t, reader.Collect(ctx, &rm))
 	metrics := collectMetrics(t, &rm)
-	assert.Equal(t, int64(0), sumCounter(metrics, "wonka_task_terminal_total"),
-		"empty branch must disable EventLog.Emit → telemetry")
+
+	assert.Equal(t, uint64(1), histogramCountWithAttr(
+		metrics, "wonka_lifecycle_duration_seconds", "outcome", "interrupted"),
+		"interrupted outcome must reach the lifecycle duration histogram with the exact label")
+
+	assert.Equal(t, int64(0), gaugeSum(metrics, "wonka_lock_held"),
+		"StartLifecycle+EndLifecycle must balance wonka_lock_held even without a Completed emit — otherwise signal-cancel leaks the gauge")
+
+	// Span must carry outcome=interrupted.
+	var found bool
+	for _, s := range spanRec.Ended() {
+		if s.Name() != "wonka.lifecycle" {
+			continue
+		}
+		for _, a := range s.Attributes() {
+			if a.Key == "outcome" && a.Value.AsString() == "interrupted" {
+				found = true
+			}
+		}
+	}
+	assert.True(t, found, "lifecycle span must end with outcome=interrupted attribute")
+}
+
+// TestOBS04_TaskDurationCarriesRole verifies wonka_task_duration_seconds is
+// attributed by role (builder/verifier/gate_keeper). If onTaskTerminal
+// regressed to read ev.Role (which is often empty on terminal events) rather
+// than rec.role (captured at dispatch), every duration sample would collapse
+// into role="unknown" — silently breaking the Grafana dashboard's per-role
+// breakdown without failing any test that only asserts total histogram count.
+func TestOBS04_TaskDurationCarriesRole(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	telem, err := NewTelemetry(mp, nil)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	// Dispatch with Role=builder, then complete with empty Role on the
+	// terminal event. The captured rec.role must drive the attribute.
+	telem.StartLifecycle(ctx, "branch-role")
+	telem.Record(ctx, Event{Kind: EventTaskDispatched, TaskID: "t-b", Role: "builder"}, "branch-role")
+	telem.Record(ctx, Event{Kind: EventTaskCompleted, TaskID: "t-b"}, "branch-role")
+
+	// Dispatch with empty Role → fallback to "unknown".
+	telem.Record(ctx, Event{Kind: EventTaskDispatched, TaskID: "t-u"}, "branch-role")
+	telem.Record(ctx, Event{Kind: EventTaskCompleted, TaskID: "t-u"}, "branch-role")
+
+	rm := metricdata.ResourceMetrics{}
+	require.NoError(t, reader.Collect(ctx, &rm))
+	metrics := collectMetrics(t, &rm)
+
+	assert.Equal(t, uint64(1), histogramCountWithAttr(
+		metrics, "wonka_task_duration_seconds", "role", "builder"),
+		"dispatch-time role must propagate to duration histogram even when terminal event omits Role")
+	assert.Equal(t, uint64(1), histogramCountWithAttr(
+		metrics, "wonka_task_duration_seconds", "role", "unknown"),
+		"empty dispatch-time role must map to role=unknown, not drop the sample")
+	assert.Equal(t, uint64(0), histogramCountWithAttr(
+		metrics, "wonka_task_duration_seconds", "role", ""),
+		"no sample should carry role=\"\" — that would break Grafana label filtering")
+}
+
+// TestOBS04_HandoffChainSingleDurationSample: two handoffs + one terminal
+// must give handoff_total=2 and exactly one duration sample (BVV-DSP-14).
+func TestOBS04_HandoffChainSingleDurationSample(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	spanRec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRec))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	telem, err := NewTelemetry(mp, tp)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	telem.StartLifecycle(ctx, "branch-hc")
+	telem.Record(ctx, Event{Kind: EventTaskDispatched, TaskID: "T", Role: "builder", Worker: "w1"}, "branch-hc")
+	telem.Record(ctx, Event{Kind: EventTaskHandoff, TaskID: "T", Role: "builder", Worker: "w1"}, "branch-hc")
+	telem.Record(ctx, Event{Kind: EventTaskHandoff, TaskID: "T", Role: "builder", Worker: "w2"}, "branch-hc")
+	telem.Record(ctx, Event{Kind: EventTaskCompleted, TaskID: "T", Role: "builder", Worker: "w2"}, "branch-hc")
+	telem.EndLifecycle(ctx, "branch-hc", "completed")
+
+	rm := metricdata.ResourceMetrics{}
+	require.NoError(t, reader.Collect(ctx, &rm))
+	metrics := collectMetrics(t, &rm)
+
+	assert.Equal(t, int64(2), sumCounter(metrics, "wonka_handoff_total"),
+		"two handoff events must increment the handoff counter twice")
+	assert.Equal(t, uint64(1), histogramCount(metrics, "wonka_task_duration_seconds"),
+		"handoff is non-terminal — only the final complete must record a duration sample")
+	assert.Equal(t, uint64(1), histogramCountWithAttr(
+		metrics, "wonka_task_duration_seconds", "role", "builder"),
+		"final duration sample must carry the builder role captured at dispatch")
+
+	// Spans: 1 lifecycle + 1 task (survives both handoffs, ends at completion).
+	assert.Equal(t, 2, len(spanRec.Ended()),
+		"expected 1 lifecycle span + 1 task span — handoff must annotate, not end, the task span")
+}
+
+// TestOBS04_EmitSurvivesRecordPanic: a telemetry panic must not escape
+// EventLog.Emit — otherwise a buggy exporter would skip caller-side
+// deferred Cleanup (lock release + tmux kill).
+func TestOBS04_EmitSurvivesRecordPanic(t *testing.T) {
+	// Meter is fine; only the tracer panics — exercises the onTaskDispatched
+	// path which calls tracer.Start.
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	telem, err := NewTelemetry(mp, panickingTracerProvider{})
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	log, err := NewEventLog(dir + "/events.jsonl")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = log.Close() })
+	_, err = log.WithTelemetry(telem, "branch-panic")
+	require.NoError(t, err)
+
+	// Must not propagate the panic. The JSONL line must still be written.
+	assert.NotPanics(t, func() {
+		err := log.Emit(Event{Kind: EventTaskDispatched, TaskID: "t1", Role: "builder"})
+		assert.NoError(t, err, "Emit must return nil even when telemetry panics — audit trail already committed")
+	})
+
+	// Audit trail is the canonical surface — verify the event did land.
+	data, readErr := os.ReadFile(log.Path())
+	require.NoError(t, readErr)
+	assert.Contains(t, string(data), `"kind":"task_dispatched"`,
+		"JSONL write must complete before telemetry runs, so a panic after can't erase audit trail")
+}
+
+// panickingTracerProvider simulates a misbehaving OTel exporter: Start panics.
+// Must embed tracenoop types to satisfy OTel's unexported embedded-guard
+// interface methods.
+type panickingTracerProvider struct{ tracenoop.TracerProvider }
+
+func (panickingTracerProvider) Tracer(string, ...trace.TracerOption) trace.Tracer {
+	return panickingTracer{}
+}
+
+type panickingTracer struct{ tracenoop.Tracer }
+
+func (panickingTracer) Start(context.Context, string, ...trace.SpanStartOption) (context.Context, trace.Span) {
+	panic("simulated OTel exporter panic")
 }
 
 // TestOBS04_RecordThroughEventLog verifies the EventLog side-channel
@@ -429,7 +595,8 @@ func TestOBS04_RecordThroughEventLog(t *testing.T) {
 	log, err := NewEventLog(dir + "/events.jsonl")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = log.Close() })
-	log.WithTelemetry(telem, "branch-x")
+	_, err = log.WithTelemetry(telem, "branch-x")
+	require.NoError(t, err)
 
 	// Event.Role populated by emission sites (dispatch.go, watchdog.go) —
 	// telemetry uses the structured field, never scraping Summary.
@@ -542,6 +709,29 @@ func gaugeSum(metrics map[string]metricdata.Metrics, name string) int64 {
 	var total int64
 	for _, dp := range sum.DataPoints {
 		total += dp.Value
+	}
+	return total
+}
+
+// histogramCountWithAttr returns the observation count on a histogram metric
+// restricted to points whose attribute set contains key=value. Symmetric with
+// counterWithAttr for histograms — needed to assert that role/outcome labels
+// are populated correctly on duration samples, not just that the histogram
+// fired.
+func histogramCountWithAttr(metrics map[string]metricdata.Metrics, name, key, value string) uint64 {
+	m, ok := metrics[name]
+	if !ok {
+		return 0
+	}
+	h, ok := m.Data.(metricdata.Histogram[float64])
+	if !ok {
+		return 0
+	}
+	var total uint64
+	for _, dp := range h.DataPoints {
+		if v, present := dp.Attributes.Value(attribute.Key(key)); present && v.AsString() == value {
+			total += dp.Count
+		}
 	}
 	return total
 }

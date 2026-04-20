@@ -798,7 +798,7 @@ The dispatch loop already handles this: after the planner exits 0 (plan task com
 Implemented in `orch/telemetry.go`:
 - `NewTelemetry(meterProvider, tracerProvider)` — builds counters, histograms, gauges, and a tracer.
 - `*Telemetry` is nil-safe: the exported methods (`Record`, `StartLifecycle`, `EndLifecycle`) check for a nil receiver, matching the `ProgressReporter` convention.
-- `EventLog.WithTelemetry(telem, branch)` attaches telemetry to the log so every `Emit()` also drives a metric/span update, keeping dispatcher/watchdog/engine signatures unchanged. A nil `telem` or empty `branch` disables the side-channel.
+- `EventLog.WithTelemetry(telem, branch)` attaches telemetry to the log so every `Emit()` also drives a metric/span update, keeping dispatcher/watchdog/engine signatures unchanged. A nil `telem` disables the side-channel; a non-nil `telem` with an empty `branch` returns `ErrWithTelemetryEmptyBranch` (Prometheus would otherwise emit un-filterable `branch=""` series).
 - Lifecycle-scope span: `Engine.emitLifecycleStarted` opens it via `Telemetry.StartLifecycle`; the engine's completion paths `defer telem.EndLifecycle(...)` directly to close it with the outcome attribute. `EndLifecycle` is idempotent (nils its span after `End`) so a double-call on a retry path doesn't double-record the histogram.
 - Task-scope spans: opened on `EventTaskDispatched`, closed on any terminal event for the same task ID. `tasksInProgress` gauge inc/dec is coupled to the `taskSpans` map lifetime so duplicate-dispatch (replay) doesn't drive it +1 and terminal-without-dispatch (resume) doesn't drive it −1.
 
@@ -838,7 +838,7 @@ Shutdown is deferred inside `runLifecycle` with a 5-second flush budget so a stu
 
 `docker-compose.yaml` runs OTel collector (v0.99.0) + Prometheus (v3.8.0, 90-day retention) + Grafana (v11.0.0). Grafana auto-provisions two dashboards from `config/grafana/dashboards/`:
 
-- `wonka-orchestrator.json` — orchestrator-side dispatch/duration/gate/watchdog panels.
+- `wonka-orchestrator.json` — orchestrator-side panels (dispatch rate, task/lifecycle duration, gap/gate/escalation counters, handoff-limit hits).
 - `claude-code.json` — agent-side cost/token/session panels (Claude Code's own OTel exporter).
 
 Both dashboards live in the same "Telemetry" folder. The OTLP receiver listens on `localhost:14317` (gRPC) and `localhost:14318` (HTTP) — remapped from the OTel default ports to avoid collisions with a host-level Jaeger.

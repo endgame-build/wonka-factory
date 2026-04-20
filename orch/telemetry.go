@@ -15,6 +15,17 @@ import (
 
 const instrumentationName = "github.com/endgame/wonka-factory/orch"
 
+// Outcome label values (Prometheus/OTel wire format). Unexported so
+// typos at emission sites become compile errors.
+const (
+	outcomeCompleted   = "completed"
+	outcomeFailed      = "failed"
+	outcomeBlocked     = "blocked"
+	outcomeRetried     = "retried"
+	outcomeSuperseded  = "superseded"
+	outcomeInterrupted = "interrupted"
+)
+
 // Telemetry bundles OTel instruments for orchestrator observability (OBS-04).
 // A nil *Telemetry is valid and makes every method a no-op, matching the
 // nil-safe convention used elsewhere (e.g. ProgressReporter in emitAndNotify).
@@ -150,8 +161,13 @@ func NoopTelemetry() *Telemetry {
 	return t
 }
 
-// StartLifecycle opens the lifecycle-scope span. Called once per engine run
-// from emitLifecycleStarted. Safe on a nil receiver. Concurrent-safe.
+// StartLifecycle opens the lifecycle-scope span and increments the lock-held
+// gauge. Called once per engine run from emitLifecycleStarted. Safe on a nil
+// receiver. Concurrent-safe.
+//
+// The gauge inc/dec is tied to the span (not to the EventLifecycleStarted /
+// Completed events in Record) so signal-cancel — which suppresses the
+// Completed event per BVV-ERR-09 — doesn't leave wonka_lock_held pinned at 1.
 func (t *Telemetry) StartLifecycle(ctx context.Context, branch string) context.Context {
 	if t == nil {
 		return ctx
@@ -162,11 +178,13 @@ func (t *Telemetry) StartLifecycle(ctx context.Context, branch string) context.C
 	ctx, t.lifecycleSpan = t.tracer.Start(ctx, "wonka.lifecycle",
 		trace.WithAttributes(attribute.String("branch", branch)),
 	)
+	t.lockHeld.Add(ctx, 1, metric.WithAttributes(attribute.String("branch", branch)))
 	return ctx
 }
 
-// EndLifecycle closes the lifecycle span and records duration. Idempotent —
-// nils lifecycleSpan after End so a second call is a no-op. Safe on a nil
+// EndLifecycle closes the lifecycle span, records duration, and decrements
+// the lock-held gauge. Idempotent — nils lifecycleSpan after End so a second
+// call is a no-op (and does not double-decrement the gauge). Safe on a nil
 // receiver or if StartLifecycle was never called. Concurrent-safe.
 func (t *Telemetry) EndLifecycle(ctx context.Context, branch, outcome string) {
 	if t == nil {
@@ -189,6 +207,7 @@ func (t *Telemetry) EndLifecycle(ctx context.Context, branch, outcome string) {
 	)
 	span.SetAttributes(attribute.String("outcome", outcome))
 	span.End()
+	t.lockHeld.Add(ctx, -1, metric.WithAttributes(attribute.String("branch", branch)))
 }
 
 // Record dispatches an event to the right instruments. Attributes stay low-
@@ -206,25 +225,16 @@ func (t *Telemetry) Record(ctx context.Context, ev Event, branch string) {
 		t.onTaskDispatched(ctx, ev, branchAttr)
 
 	case EventTaskCompleted:
-		t.onTaskTerminal(ctx, ev, "completed", branchAttr)
-		t.taskTerminal.Add(ctx, 1, metric.WithAttributes(
-			branchAttr, attribute.String("outcome", "completed"),
-		))
-
+		t.recordTerminal(ctx, ev, outcomeCompleted, branchAttr)
 	case EventTaskFailed:
-		t.onTaskTerminal(ctx, ev, "failed", branchAttr)
-		t.taskTerminal.Add(ctx, 1, metric.WithAttributes(
-			branchAttr, attribute.String("outcome", "failed"),
-		))
-
+		t.recordTerminal(ctx, ev, outcomeFailed, branchAttr)
 	case EventTaskBlocked:
-		t.onTaskTerminal(ctx, ev, "blocked", branchAttr)
-		t.taskTerminal.Add(ctx, 1, metric.WithAttributes(
-			branchAttr, attribute.String("outcome", "blocked"),
-		))
+		t.recordTerminal(ctx, ev, outcomeBlocked, branchAttr)
 
 	case EventTaskRetried:
-		t.onTaskTerminal(ctx, ev, "retried", branchAttr)
+		// Retried records duration (via onTaskTerminal) but routes to the
+		// retry counter instead of taskTerminal.
+		t.onTaskTerminal(ctx, ev, outcomeRetried, branchAttr)
 		t.retries.Add(ctx, 1, metric.WithAttributes(branchAttr))
 
 	case EventTaskHandoff:
@@ -259,11 +269,11 @@ func (t *Telemetry) Record(ctx context.Context, ev Event, branch string) {
 	case EventEscalationResolved:
 		t.gapCount.Add(ctx, -1, metric.WithAttributes(branchAttr))
 
-	case EventLifecycleStarted:
-		t.lockHeld.Add(ctx, 1, metric.WithAttributes(branchAttr))
-
-	case EventLifecycleCompleted:
-		t.lockHeld.Add(ctx, -1, metric.WithAttributes(branchAttr))
+	// EventLifecycleStarted / EventLifecycleCompleted: intentionally not
+	// handled here. The wonka_lock_held gauge inc/dec is driven by
+	// StartLifecycle / EndLifecycle so it pairs with the span — otherwise
+	// signal-cancel (which skips the Completed event per BVV-ERR-09) would
+	// leave the gauge pinned at 1.
 
 	case EventGateCreated:
 		t.gatesCreated.Add(ctx, 1, metric.WithAttributes(branchAttr))
@@ -304,7 +314,7 @@ func (t *Telemetry) onTaskDispatched(ctx context.Context, ev Event, branchAttr a
 	_, span := t.tracer.Start(parent, "wonka.task",
 		trace.WithAttributes(
 			attribute.String("task.id", ev.TaskID),
-			attribute.String("role", ev.Role),
+			attribute.String("role", string(ev.Role)),
 			branchAttr,
 			attribute.String("worker", ev.Worker),
 		),
@@ -312,7 +322,7 @@ func (t *Telemetry) onTaskDispatched(ctx context.Context, ev Event, branchAttr a
 	newRec := &taskSpanRecord{
 		span:    span,
 		started: time.Now(),
-		role:    ev.Role,
+		role:    string(ev.Role),
 	}
 	// Resume replay can re-emit task_dispatched. Only fresh inserts drive
 	// tasksInProgress, pairing with the decrement in onTaskTerminal that
@@ -320,11 +330,20 @@ func (t *Telemetry) onTaskDispatched(ctx context.Context, ev Event, branchAttr a
 	// don't double-count and the superseded span still ends cleanly.
 	if prior, loaded := t.taskSpans.Swap(ev.TaskID, newRec); loaded {
 		priorRec := prior.(*taskSpanRecord)
-		priorRec.span.SetAttributes(attribute.String("outcome", "superseded"))
+		priorRec.span.SetAttributes(attribute.String("outcome", outcomeSuperseded))
 		priorRec.span.End()
 	} else {
 		t.tasksInProgress.Add(ctx, 1, metric.WithAttributes(branchAttr))
 	}
+}
+
+// recordTerminal closes the dispatch span + duration and increments
+// taskTerminal with the outcome label. Shared by Completed/Failed/Blocked.
+func (t *Telemetry) recordTerminal(ctx context.Context, ev Event, outcome string, branchAttr attribute.KeyValue) {
+	t.onTaskTerminal(ctx, ev, outcome, branchAttr)
+	t.taskTerminal.Add(ctx, 1, metric.WithAttributes(
+		branchAttr, attribute.String("outcome", outcome),
+	))
 }
 
 // onTaskTerminal closes the dispatch span, records duration, and decrements

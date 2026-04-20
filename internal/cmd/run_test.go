@@ -187,10 +187,18 @@ func TestOBS04_BuildTelemetry_RefusesInsecureRemote(t *testing.T) {
 		loopback bool
 	}{
 		{"localhost", "localhost:14317", true},
+		{"localhost-mixed-case", "LocalHost:4317", true},
 		{"ipv4-loopback", "127.0.0.1:4317", true},
+		{"ipv4-loopback-range", "127.1.2.3:4317", true},
 		{"ipv6-loopback", "[::1]:4317", true},
+		{"ipv6-loopback-bare-bracket", "[::1]", true},
+		// Zone IDs like "::1%lo0" classify correctly in isLoopbackEndpoint
+		// (netip.ParseAddr accepts them, unlike net.ParseIP) but the gRPC
+		// URL resolver rejects "%" as an invalid escape before any dial
+		// happens, so no end-to-end endpoint value is viable. Not tested.
 		{"remote-host", "collector.example.com:4317", false},
 		{"remote-ipv4", "10.0.0.1:4317", false},
+		{"remote-ipv4-unspecified", "0.0.0.0:4317", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
