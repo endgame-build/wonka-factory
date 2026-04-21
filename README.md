@@ -92,7 +92,7 @@ bin/wonka run --branch feat/x --otel-endpoint localhost:14317 --otel-insecure
 - **Prometheus** — http://localhost:9090 (90-day retention)
 - **OTel collector** — OTLP gRPC on `:14317`, HTTP on `:14318`
 
-Telemetry is off by default. `--otel-insecure` works only for loopback endpoints; `BuildTelemetry` rejects cleartext to remote collectors.
+Telemetry defaults to off. `--otel-insecure` works only for loopback endpoints; `BuildTelemetry` rejects cleartext to remote collectors.
 
 ## Project layout
 
@@ -116,7 +116,7 @@ Telemetry is off by default. `--otel-insecure` works only for loopback endpoints
 
 ## Status
 
-Working draft. Core dispatch, per-branch locking, resume, gap tolerance, circuit breaker, PR gate, and OTel observability have shipped. The library and CLI remain under active development. Production requires a Beads/Dolt backend; the FS backend exists for local development.
+Working draft. Core dispatch, per-branch locking, resume, gap tolerance, circuit breaker, PR gate, and OTel observability ship today; the library and CLI keep evolving. Production requires a Beads/Dolt backend; the FS backend supports local development.
 
 ## License
 
