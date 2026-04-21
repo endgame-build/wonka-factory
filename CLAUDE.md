@@ -8,42 +8,7 @@ DAG-driven task dispatch for builder (Oompa), verifier (Loompa), and planner (Ch
 
 Two deliverables in one repo:
 - `orch/` — domain-agnostic orchestrator library
-- `cmd/wonka/` — CLI wiring `orch/` to BVV lifecycle dispatch
-
-## Specifications
-
-| Document | Purpose |
-|----------|---------|
-| `docs/specs/BUILD_VERIFY_VALIDATE_SPEC.md` | Primary spec — 70 normative requirements (BVV-*) |
-| `docs/specs/BVV_VALIDATION_REPORT.md` | Prose validation: state matrix, deadlock analysis, termination proof |
-| `docs/specs/MULTI_AGENT_PIPELINE_ORCHESTRATION_SPEC.md` | Infrastructure layer — BVV reuses Sections 4-11a (LDG-*, WKR-*, SUP-*, RCV-*, CTY-*) |
-| `docs/BVV_IMPLEMENTATION_PLAN.md` | Phase-by-phase rollout plan; source of truth for metric/span definitions |
-| `docs/BVV_VV_STRATEGY.md` | Verification & validation strategy — maps BVV requirements to test tiers |
-
-## Formal Verification (TLA+)
-
-TLA+ model in `docs/specs/tla/` encodes 52 of 70 BVV requirements as mechanically verifiable invariants and temporal properties. TLC model checking precedes Go implementation.
-
-```bash
-# Install TLA+ tooling
-brew install tlaplus  # or download tla2tools.jar
-
-# Run model checking (smoke → small → lifecycle → full)
-java -jar tla2tools.jar -config smoke.cfg BVV.tla       # seconds
-java -jar tla2tools.jar -config small.cfg BVV.tla       # minutes
-java -jar tla2tools.jar -config lifecycle.cfg BVV.tla   # hours
-java -jar tla2tools.jar -config full.cfg -workers 8 BVV.tla  # overnight
-```
-
-| Module | Purpose |
-|--------|---------|
-| `BVVTypes.tla` | Constants, status sets, graph helpers (ReachableFrom, IsAcyclic) |
-| `BVVTaskMachine.tla` | 8 task actions: Assign, SessionStart, 4 exit codes, handoff, handoff-limit |
-| `BVVDispatch.tla` | 9 system actions: timeout, crash, watchdog, human reopen, reconcile, locks |
-| `BVVLifecycle.tla` | Dynamic planner task creation, concurrent lifecycle support |
-| `BVV.tla` | Top-level: Init, Next, Spec, 11 safety invariants, 4 liveness properties |
-
-When TLC finds a violation, classify it: **spec bug** (fix prose spec + model), **model bug** (fix TLA+ only), or **expected violation** (document as known result).
+- `cmd/wonka/` — CLI wiring `orch/` to the builder/verifier/planner lifecycle
 
 ## Build and Test
 
@@ -124,33 +89,27 @@ Third-party actions are pinned to 40-char SHAs. External binaries (gitleaks, svu
 
 ## Architecture
 
-### Spec-driven design
-
-Every function traces to a requirement ID from the BVV spec. Test names reference these IDs (e.g., `TestBVV_DSP01_DispatchAllReady`, `TestBVV_S03_SingleAssignment`). TLA+ findings inform implementation — comments reference TLC counterexamples where applicable.
-
 ### orch/ package (the orchestrator library)
 
-Forked from `facet-scan/orch` and simplified per BVV Appendix B:
-
-| File | Purpose | Key requirement IDs |
-|------|---------|-------------------|
-| `types.go` | Task, Worker, Preset, typed enums (TaskStatus, Criticality, WorkerStatus, Model, LedgerKind), label key constants, LockConfig, LifecycleConfig | — |
-| `ledger_beads.go` | Beads/Dolt Store implementation (default) | LDG-01..19, BVV-DSP-16 |
-| `dispatch.go` | DAG-driven dispatch loop — query ready tasks, assign to idle workers | BVV-DSP-01..02, BVV-DSP-08 |
-| `agent.go` | Role-to-instruction-file routing, exit-code-based outcome | BVV-AI-02, BVV-DSP-03..04 |
-| `engine.go` | Top-level: `Engine.Run()` (fresh) and `Engine.Resume()` (interrupted) | BVV-ERR-06..08 |
-| `session.go` | WorkerPool lifecycle (Allocate/Spawn/Release) | WKR-04..12 |
-| `tmux.go` | Socket-isolated tmux wrapper | — |
-| `lock.go` | Per-branch lifecycle lock with staleness detection | BVV-S-01, BVV-ERR-06, BVV-ERR-10a, BVV-L-02 |
-| `recovery.go` | RetryState (exit code 1), GapTracker (BVV-ERR-03..05), abort cleanup, handoff counter | BVV-ERR-01..05, BVV-ERR-04a |
-| `resume.go` | State reconciliation: stale assignments, orphan cleanup, counter recovery | BVV-ERR-07..08 |
-| `gate.go` | PR gate: create PR, poll CI, exit code protocol | BVV-GT-01..03 |
-| `watchdog.go` | Tmux liveness detection + circuit breaker | BVV-ERR-11..11a, SUP-05..06 |
-| `eventlog.go` | Append-only JSONL audit trail (19 event kinds) | BVV-SS, Section 10.3, BVV-TG-07..10 |
-| `invariant.go` | Runtime assertions (build tag `verify`) | BVV-S-01..10 |
-| `validate.go` | Post-planner task-graph well-formedness check | BVV-TG-07..10 |
-| `signal.go` | Graceful shutdown (SIGINT/SIGTERM), no status modification | BVV-ERR-09..10a |
-| `telemetry.go` | OTel metrics + spans (nil-safe). Attached via `EventLog.WithTelemetry`; counters/histograms/gauges listed in `docs/BVV_IMPLEMENTATION_PLAN.md` §Phase 10 | OBS-04 |
+| File | Purpose |
+|------|---------|
+| `types.go` | Task, Worker, Preset, typed enums (TaskStatus, Criticality, WorkerStatus, Model, LedgerKind), label key constants, LockConfig, LifecycleConfig |
+| `ledger_beads.go` | Beads/Dolt Store implementation (default) |
+| `dispatch.go` | DAG-driven dispatch loop — query ready tasks, assign to idle workers |
+| `agent.go` | Role-to-instruction-file routing, exit-code-based outcome |
+| `engine.go` | Top-level: `Engine.Run()` (fresh) and `Engine.Resume()` (interrupted) |
+| `session.go` | WorkerPool lifecycle (Allocate/Spawn/Release) |
+| `tmux.go` | Socket-isolated tmux wrapper |
+| `lock.go` | Per-branch lifecycle lock with staleness detection |
+| `recovery.go` | RetryState (exit code 1), GapTracker, abort cleanup, handoff counter |
+| `resume.go` | State reconciliation: stale assignments, orphan cleanup, counter recovery |
+| `gate.go` | PR gate: create PR, poll CI, exit code protocol |
+| `watchdog.go` | Tmux liveness detection + circuit breaker |
+| `eventlog.go` | Append-only JSONL audit trail (19 event kinds) |
+| `invariant.go` | Runtime assertions (build tag `verify`) |
+| `validate.go` | Post-planner task-graph well-formedness check |
+| `signal.go` | Graceful shutdown (SIGINT/SIGTERM), no status modification |
+| `telemetry.go` | OTel metrics + spans (nil-safe). Attached via `EventLog.WithTelemetry`. |
 
 ### Key concepts
 
@@ -181,7 +140,7 @@ The orchestrator injects these files as system prompts. Never modify their conte
 Terminal: {completed, failed, blocked}
 ```
 
-Valid transitions (from BVV validation report Section 1):
+Valid transitions:
 - `open → assigned → in_progress → completed|failed|blocked`
 - `in_progress → open` (exit 1 with retries remaining)
 - `in_progress → in_progress` (exit 3 handoff, atomic session respawn)
@@ -190,7 +149,7 @@ Valid transitions (from BVV validation report Section 1):
 ### Test structure
 
 Four test categories in `orch/`:
-- **`*_spec_test.go`** — One test per BVV requirement ID (e.g., `TestBVV_DSP01`, `TestBVV_S03`)
+- **`*_spec_test.go`** — Spec-style tests named after the assertion they cover (e.g., `TestBVV_DSP01`, `TestBVV_S03`)
 - **`*_prop_test.go`** — Property-based tests with random task graphs using `pgregory.net/rapid`
 - **`ledger_contract_test.go`** — Store contract suite run against both Beads and FS implementations
 - **`engine_e2e_test.go`** — Integration tests with real tmux + mock agent scripts (build tag `integration`)
@@ -214,8 +173,6 @@ Four test categories in `orch/`:
 
 ## Conventions
 
-- Comments and test names reference BVV requirement IDs as canonical spec references
-- `scripts/trace-requirement.sh <BVV-ID>` greps code, tests, and spec for a requirement ID — run it before deciding whether a clause has coverage
 - `errors.go` defines sentinel errors in 3 groups — match with `errors.Is()`
 - Error wrapping: `%w` for sentinel, `%v` for diagnostic context. Prefix with operation name.
 - `testify/require` for preconditions, `testify/assert` for assertions
