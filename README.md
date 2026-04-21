@@ -16,15 +16,13 @@ Each session runs exactly one task. Agents signal outcome through exit codes (`0
 
 | Property | How |
 |----------|-----|
-| **Spec-driven** | Every function traces to a requirement ID in [`docs/specs/BUILD_VERIFY_VALIDATE_SPEC.md`](docs/specs/BUILD_VERIFY_VALIDATE_SPEC.md) (70 normative requirements). |
-| **Formally verified** | TLA+ encodes 52 of 70 requirements as safety invariants and liveness properties; TLC model-checks them before Go code lands. |
 | **Crash-recoverable** | Per-branch lifecycle locks detect staleness; `wonka resume` replays the event log to rebuild state. |
 | **Gap-tolerant** | Non-critical failures accumulate against a threshold; critical failures abort immediately. |
 | **Audited** | Append-only JSONL trail (19 event kinds) at `<runDir>/events.jsonl` (default: `.wonka/<branch>/events.jsonl`) — every assignment, exit, and lifecycle transition. |
 
 ## Quickstart
 
-**Prerequisites:** Go 1.25+, `tmux`, [Task](https://taskfile.dev), optional: Docker (for observability), `java` (for TLA+).
+**Prerequisites:** Go 1.25+, `tmux`, [Task](https://taskfile.dev), optional: Docker (for observability).
 
 ```bash
 # Build
@@ -81,21 +79,6 @@ Each task runs in an isolated tmux session (socket `wonka-<runID>`, session name
 | `wonka resume` | Re-enter an interrupted lifecycle (reconciles stale state).     |
 | `wonka status` | Print tasks for the branch (table; `--json` for scripts).       |
 
-## Formal verification
-
-The TLA+ model in [`docs/specs/tla/`](docs/specs/tla/) encodes 52 BVV requirements. Check them in four escalating configurations:
-
-```bash
-brew install tlaplus  # or download tla2tools.jar
-
-java -jar tla2tools.jar -config smoke.cfg BVV.tla       # seconds
-java -jar tla2tools.jar -config small.cfg BVV.tla       # minutes
-java -jar tla2tools.jar -config lifecycle.cfg BVV.tla   # hours
-java -jar tla2tools.jar -config full.cfg -workers 8 BVV.tla  # overnight
-```
-
-When TLC finds a violation, classify it: **spec bug** (fix prose spec + model), **model bug** (fix TLA+ only), or **expected violation** (document).
-
 ## Observability
 
 Optional stack (OTel collector, Prometheus, Grafana) in `docker-compose.yaml`:
@@ -117,29 +100,23 @@ Telemetry is off by default. `--otel-insecure` works only for loopback endpoints
 ├── cmd/wonka/              # CLI entry point (thin main)
 ├── internal/cmd/           # Cobra subcommands
 ├── orch/                   # Reusable orchestrator library (DAG dispatch)
-│   ├── dispatch.go         #   BVV-DSP-01..02
+│   ├── dispatch.go         #   DAG dispatch loop
 │   ├── engine.go           #   Run() / Resume()
-│   ├── ledger_beads.go     #   LDG-01..19 (beads backend)
+│   ├── ledger_beads.go     #   Beads/Dolt backend
 │   ├── recovery.go         #   retry, gap tracking, abort cleanup
 │   └── ...                 #   see CLAUDE.md for full file map
 ├── agents/                 # OOMPA.md, LOOMPA.md, CHARLIE.md — agent prompts
-├── docs/
-│   ├── BVV_IMPLEMENTATION_PLAN.md
-│   ├── BVV_VV_STRATEGY.md
-│   └── specs/              # BVV spec + TLA+ model
 └── config/                 # OTel collector, Prometheus, Grafana provisioning
 ```
 
 ## Developing
 
 - **Claude Code users** — [`CLAUDE.md`](CLAUDE.md) is the execution-focused working reference (commands, conventions, design decisions).
-- **Specification** — [`docs/specs/BUILD_VERIFY_VALIDATE_SPEC.md`](docs/specs/BUILD_VERIFY_VALIDATE_SPEC.md) is the single source of truth. Every PR traces changes to requirement IDs.
-- **Implementation plan** — [`docs/BVV_IMPLEMENTATION_PLAN.md`](docs/BVV_IMPLEMENTATION_PLAN.md) tracks phase rollout.
-- **Contributing** — Conventional commits (`feat`, `fix`, `refactor`, `docs`, `chore`, `test`, `ci`, `build`, `perf`). CI lints PR titles against this list. Run `scripts/trace-requirement.sh <BVV-ID>` to find spec/test/code references.
+- **Contributing** — Conventional commits (`feat`, `fix`, `refactor`, `docs`, `chore`, `test`, `ci`, `build`, `perf`). CI lints PR titles against this list.
 
 ## Status
 
-Working draft. Phases 1–10 of the implementation plan have shipped, including observability. The library, CLI, and spec (1.0.0-draft) remain under active development. Production requires a Beads/Dolt backend; the FS backend exists for local development.
+Working draft. Core dispatch, per-branch locking, resume, gap tolerance, circuit breaker, PR gate, and OTel observability have shipped. The library and CLI remain under active development. Production requires a Beads/Dolt backend; the FS backend exists for local development.
 
 ## License
 
