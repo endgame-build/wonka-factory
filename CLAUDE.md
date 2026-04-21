@@ -149,7 +149,7 @@ Valid transitions:
 ### Test structure
 
 Four test categories in `orch/`:
-- **`*_spec_test.go`** — Spec-style tests named after the assertion they cover (e.g., `TestBVV_DSP01`, `TestBVV_S03`)
+- **`*_spec_test.go`** — Spec-style verification tests named by BVV requirement ID (e.g., `TestBVV_DSP01`, `TestBVV_S03`)
 - **`*_prop_test.go`** — Property-based tests with random task graphs using `pgregory.net/rapid`
 - **`ledger_contract_test.go`** — Store contract suite run against both Beads and FS implementations
 - **`engine_e2e_test.go`** — Integration tests with real tmux + mock agent scripts (build tag `integration`)
