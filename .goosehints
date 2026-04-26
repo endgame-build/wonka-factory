@@ -1,0 +1,45 @@
+# wonka-factory — agent hints
+
+DAG-driven task dispatch for Oompa (builder), Loompa (verifier), Charlie (planner). Two deliverables: `orch/` (library) + `cmd/wonka/` (CLI).
+
+## Rules that change behavior
+
+1. **Always run tests with `-tags verify`.** The tag gates runtime invariant assertions that panic with requirement IDs (e.g., `[BVV-DSP-01]`). CI runs with it; local runs without it skip the checks silently.
+2. **Use `task` commands before raw `go`.** `task check` / `task test` / `task lint` / `task build` wrap the canonical flags. `Taskfile.yml` is the source of truth.
+3. **Spec tests are named by BVV requirement ID.** New spec tests follow `TestBVV_<AREA><NUM>` (e.g., `TestBVV_DSP01`, `TestBVV_S03`). Property tests use `pgregory.net/rapid`; integration tests require build tag `integration`.
+4. **Never modify `agents/OOMPA.md`, `agents/LOOMPA.md`, `agents/CHARLIE.md`.** The orchestrator injects these as system prompts. Edits change agent behavior in production.
+5. **ZFC principle.** The orchestrator never reads agent output content. Routing uses role metadata (labels). Outcome uses exit codes. Diagnostics go to the audit trail only. Don't add code paths that parse stdout.
+6. **Exit code protocol is the agent-orchestrator contract.** `0`=done, `1`=retryable fail, `2`=terminal block, `3`=handoff. Don't invent new codes; don't reinterpret existing ones.
+7. **Terminal status is irreversible by the orchestrator.** Only human CLI intervention re-opens `completed`/`failed`/`blocked` tasks. Dispatch logic must never write a terminal→non-terminal transition.
+8. **Conventional commits, with scope.** `feat(orch):`, `fix(dispatch):`, `test(orch):`. `feat`/`fix` drive svu version bumps.
+9. **Error conventions.** Sentinels in `errors.go`, matched via `errors.Is()`. Wrap with `%w` for sentinels, `%v` for diagnostic context, prefix with operation name. `testify/require` for preconditions, `testify/assert` for assertions.
+10. **Never commit without explicit approval.**
+
+## CLI exit codes (distinct from agent protocol)
+
+`wonka run` / `wonka resume` / `wonka status` exit with:
+`1` runtime error, `2` config error, `3` lock corrupt, `4` lock busy, `130` SIGINT. Wrapper scripts should branch on 3/4.
+
+## When you need more detail, read
+
+- **User-facing overview, quickstart, architecture narrative** → `README.md`
+- **Build/test/lint/coverage commands** → `Taskfile.yml`
+- **Package file map, design decisions, concept tables** → `CLAUDE.md` (the human-facing doc; same repo)
+- **BVV requirement specifications** → `docs/BVV_VV_STRATEGY.md`, `docs/BVV_IMPLEMENTATION_PLAN.md`
+- **Formal specs (TLA+)** → `docs/specs/`
+- **CI pipeline** → `.github/workflows/ci.yml`
+- **Observability stack** → `docker-compose.yaml` (OTel + Prometheus + Grafana on localhost; off by default unless `--otel-endpoint` is set)
+- **Runtime state layout** → `.wonka/<branch>/` contains `events.jsonl`, `ledger/`, and the per-branch lock
+
+## Task status enum (load-bearing)
+
+```
+{open, assigned, in_progress, completed, failed, blocked}
+Terminal: {completed, failed, blocked}
+```
+
+Valid transitions:
+- `open → assigned → in_progress → completed|failed|blocked`
+- `in_progress → open` (exit 1 with retries remaining)
+- `in_progress → in_progress` (exit 3 handoff, atomic session respawn)
+- `terminal → open` (human re-open only; resets retry + handoff counters)
