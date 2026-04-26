@@ -166,13 +166,18 @@ func (l *listErrSession) KillSessionIfExists(string) error { return nil }
 
 // --- Engine-level resume error paths ---
 
-// TestEngine_ResumeNoLedgerReturnsSentinel pins the ErrResumeNoLedger wrap.
-// Callers (Phase 7 CLI) branch on errors.Is(err, ErrResumeNoLedger) to
+// TestEngine_ResumeNoEventLogReturnsSentinel pins the ErrResumeNoEventLog wrap.
+// Callers (Phase 7 CLI) branch on errors.Is(err, ErrResumeNoEventLog) to
 // decide whether to offer "fresh start" — a regression that dropped the
 // %w wrap would break that CLI surface invisibly.
-func TestEngine_ResumeNoLedgerReturnsSentinel(t *testing.T) {
+//
+// Sentinel switched from ErrResumeNoLedger to ErrResumeNoEventLog because
+// --ledger beads now shares <repo>/.beads/ across branches; a ledger-stat
+// would falsely succeed on any bd-installed repo. The event log is wonka-owned
+// and per-RunDir, so its absence is the canonical "no prior wonka run" signal.
+func TestEngine_ResumeNoEventLogReturnsSentinel(t *testing.T) {
 	runDir := t.TempDir()
-	// No ledger directory on purpose.
+	// No event log on purpose.
 
 	cfg := orch.DefaultEngineConfig(
 		testutil.MockLifecycleConfig("feat-x", "builder"),
@@ -184,30 +189,72 @@ func TestEngine_ResumeNoLedgerReturnsSentinel(t *testing.T) {
 
 	err = e.Resume(context.Background())
 	require.Error(t, err)
-	assert.ErrorIs(t, err, orch.ErrResumeNoLedger)
+	assert.ErrorIs(t, err, orch.ErrResumeNoEventLog)
 }
 
-// TestEngine_ResumeNonNotExistLedgerStatErrorDoesNotMapToSentinel covers I4.
-// A permission-denied or other non-IsNotExist Stat error must NOT be
-// reported as ErrResumeNoLedger, because a caller taking the "fresh start"
-// branch on that sentinel would clobber the inaccessible ledger.
-//
-// The clean way to trigger this is a ledger path that exists but is
-// unreadable. We make the parent directory unreadable so Stat fails with
-// EACCES rather than ENOENT.
-func TestEngine_ResumeNonNotExistLedgerStatErrorDoesNotMapToSentinel(t *testing.T) {
+// TestEngine_ResumeEmptyEventLogTreatedAsMissing covers the "init created
+// the file via O_CREATE but crashed before the first emit" race. A zero-byte
+// events.jsonl must surface as ErrResumeNoEventLog so the operator gets the
+// "use `wonka run`" hint, not the corrupt sentinel.
+func TestEngine_ResumeEmptyEventLogTreatedAsMissing(t *testing.T) {
+	runDir := t.TempDir()
+	logPath := filepath.Join(runDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(logPath, []byte{}, 0o644))
+
+	cfg := orch.DefaultEngineConfig(
+		testutil.MockLifecycleConfig("feat-x", "builder"),
+		runDir, "/repo")
+	cfg.RunID = "run-1"
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+
+	err = e.Resume(context.Background())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, orch.ErrResumeNoEventLog)
+}
+
+// TestEngine_ResumeCorruptEventLogReturnsCorruptSentinel pins the
+// ErrCorruptEventLog wrap. A first record that fails JSON parse means a
+// prior run started and crashed mid-write — operator-intervention territory.
+// Recovery would otherwise replay an undefined event stream.
+func TestEngine_ResumeCorruptEventLogReturnsCorruptSentinel(t *testing.T) {
+	runDir := t.TempDir()
+	logPath := filepath.Join(runDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(logPath, []byte("{not valid json\n"), 0o644))
+
+	cfg := orch.DefaultEngineConfig(
+		testutil.MockLifecycleConfig("feat-x", "builder"),
+		runDir, "/repo")
+	cfg.RunID = "run-1"
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+
+	err = e.Resume(context.Background())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, orch.ErrCorruptEventLog)
+	assert.NotErrorIs(t, err, orch.ErrResumeNoEventLog,
+		"corrupt-log must not be squashed into the missing sentinel — different recovery action")
+}
+
+// TestEngine_ResumeNonNotExistEventLogStatErrorDoesNotMapToSentinel covers I4
+// adapted for the event-log sentinel. A permission-denied stat must NOT be
+// reported as ErrResumeNoEventLog, because a caller taking the "fresh start"
+// branch on that sentinel would clobber the inaccessible run state.
+func TestEngine_ResumeNonNotExistEventLogStatErrorDoesNotMapToSentinel(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("root bypasses permission bits")
 	}
 
 	parent := t.TempDir()
-	// Create a subdir we'll strip read perms from, then point RunDir inside it.
 	sealed := filepath.Join(parent, "sealed")
 	require.NoError(t, os.Mkdir(sealed, 0o755))
 	runDir := filepath.Join(sealed, "run")
 	require.NoError(t, os.Mkdir(runDir, 0o755))
-	// Create ledger dir, then seal the outer so Stat can't traverse.
-	require.NoError(t, os.Mkdir(filepath.Join(runDir, "ledger"), 0o755))
+	// Pre-create the event log so it exists, then seal the outer dir so
+	// Stat fails with EACCES rather than ENOENT.
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, "events.jsonl"), []byte(`{"kind":"lifecycle_started","summary":"x","timestamp":"2026-01-01T00:00:00Z"}`+"\n"), 0o644))
 	require.NoError(t, os.Chmod(sealed, 0o000))
 	t.Cleanup(func() {
 		_ = os.Chmod(sealed, 0o755) // restore so TempDir cleanup works
@@ -223,9 +270,9 @@ func TestEngine_ResumeNonNotExistLedgerStatErrorDoesNotMapToSentinel(t *testing.
 
 	err = e.Resume(context.Background())
 	require.Error(t, err)
-	assert.NotErrorIs(t, err, orch.ErrResumeNoLedger,
-		"EACCES must not be squashed into ErrResumeNoLedger — would trigger silent ledger clobber")
-	assert.Contains(t, err.Error(), "stat ledger dir")
+	assert.NotErrorIs(t, err, orch.ErrResumeNoEventLog,
+		"EACCES must not be squashed into ErrResumeNoEventLog — would trigger silent run-dir clobber")
+	assert.Contains(t, err.Error(), "stat event log")
 }
 
 // TestEngine_ResumeCorruptLockAborts verifies C3: a lock file that cannot be
@@ -235,8 +282,9 @@ func TestEngine_ResumeCorruptLockAborts(t *testing.T) {
 	runDir := t.TempDir()
 	branch := "feat-x"
 
-	// Pre-create ledger so initForResume passes the existence check.
-	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "ledger"), 0o755))
+	// Pre-create event log so initForResume passes the existence check.
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, "events.jsonl"),
+		[]byte(`{"kind":"lifecycle_started","summary":"prior","timestamp":"2026-01-01T00:00:00Z"}`+"\n"), 0o644))
 
 	// Write a corrupt lock file.
 	lockPath := filepath.Join(runDir, ".wonka-"+branch+".lock")

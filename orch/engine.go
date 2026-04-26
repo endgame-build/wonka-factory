@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -72,6 +73,7 @@ type Engine struct {
 	started sync.Once
 
 	testSpawnFunc SpawnFunc // test-only override; see SetTestSpawnFunc in testhooks_test.go
+	testLedgerDir string    // test-only override; see SetTestLedgerDir in testhooks_test.go
 }
 
 // ErrEngineAlreadyStarted is returned by Run or Resume if the Engine has
@@ -290,8 +292,31 @@ func (e *Engine) Resume(ctx context.Context) error {
 // --- Internal infrastructure ---
 
 // init creates directories and shared infrastructure for a fresh run.
+//
+// For --ledger beads with no override, the ledger directory is the bd
+// database at <RepoPath>/.beads/ — shared with Charlie (BVV-DSN-04). When
+// that directory does not exist, EnsureBeadsInitialised runs `bd init` so
+// the operator does not need a separate bootstrap step. The init mutates
+// the operator's working tree; a one-time stderr warning surfaces this so
+// it shows up in the audit trail rather than silently.
+//
+// For --ledger fs (or test-injected paths), the ledger lives under RunDir
+// as before — no auto-init required because NewFSStore creates the dir.
 func (e *Engine) init() error {
-	ledgerDir := filepath.Join(e.cfg.RunDir, "ledger")
+	ledgerDir := ResolveLedgerDir(e.cfg.RepoPath, e.cfg.RunDir, e.cfg.LedgerKind, e.testLedgerDir)
+	// Auto-init only fires for explicit LedgerBeads. Empty kind (test/legacy)
+	// routes to the FS path and bypasses bd entirely; tests don't need `bd` on PATH.
+	if e.testLedgerDir == "" && e.cfg.LedgerKind == LedgerBeads {
+		created, err := EnsureBeadsInitialised(e.cfg.RepoPath)
+		if err != nil {
+			return fmt.Errorf("engine: ensure beads initialised: %w", err)
+		}
+		if created {
+			fmt.Fprintf(os.Stderr,
+				"warning: initialised beads at %s — review the diff in your repo before committing\n",
+				ledgerDir)
+		}
+	}
 	if err := os.MkdirAll(ledgerDir, 0o755); err != nil {
 		return fmt.Errorf("engine: create ledger dir: %w", err)
 	}
@@ -301,31 +326,33 @@ func (e *Engine) init() error {
 	return e.initCommon(ledgerDir)
 }
 
-// initForResume verifies the ledger exists, recovers the previous RunID from
-// the stale lock file (BVV-ERR-08: tmux socket reconnection), and opens
-// shared infrastructure.
+// initForResume verifies a prior wonka run touched this branch, recovers the
+// previous RunID from the stale lock file (BVV-ERR-08: tmux socket reconnection),
+// and opens shared infrastructure.
+//
+// "Prior run" is detected via events.jsonl rather than ledger-dir existence.
+// With --ledger beads sharing <RepoPath>/.beads/ across branches and operators,
+// a ledger-dir stat would falsely succeed on any bd-installed repo even when
+// wonka has never run on this branch. The event log is wonka-owned and
+// per-RunDir, so its presence + parseability is the canonical "wonka has
+// touched this branch" signal.
 //
 // Fails fast on:
-//   - ledger missing: wraps ErrResumeNoLedger so callers can distinguish
+//   - event log missing: wraps ErrResumeNoEventLog so callers can distinguish
 //     "fresh start needed" from any other Stat error (perm-denied, EIO).
+//   - event log first record unparseable: wraps ErrCorruptEventLog. A prior
+//     run started and crashed mid-write; recovery would replay an undefined
+//     stream, so this is operator-intervention territory.
 //   - lock corrupt: returns ErrCorruptLock. Silently fabricating a fresh
 //     RunID would orphan any live tmux socket (BVV-ERR-08 violation) and
 //     race the live orchestrator against the ledger (BVV-S-03 hazard).
-//     Corrupt-lock recovery is operator-intervention territory, not
-//     log-and-continue.
 func (e *Engine) initForResume() error {
-	ledgerDir := filepath.Join(e.cfg.RunDir, "ledger")
-	if _, err := os.Stat(ledgerDir); err != nil {
-		// Only IsNotExist qualifies as "no ledger found — fresh start OK".
-		// Permission-denied, EIO, and friends must not be squashed into
-		// ErrResumeNoLedger; callers that branch on errors.Is(…, ErrResumeNoLedger)
-		// would otherwise treat an unreadable ledger dir as "create a new one"
-		// and clobber the real ledger.
-		if os.IsNotExist(err) {
-			return fmt.Errorf("engine: %w: %v", ErrResumeNoLedger, err)
-		}
-		return fmt.Errorf("engine: stat ledger dir: %w", err)
+	logPath := filepath.Join(e.cfg.RunDir, "events.jsonl")
+	if err := verifyEventLogParseable(logPath); err != nil {
+		return err
 	}
+
+	ledgerDir := ResolveLedgerDir(e.cfg.RepoPath, e.cfg.RunDir, e.cfg.LedgerKind, e.testLedgerDir)
 
 	// Recover previous RunID from stale lock file so we can reconnect to
 	// the surviving tmux socket and detect live sessions (BVV-ERR-08).
@@ -341,6 +368,42 @@ func (e *Engine) initForResume() error {
 	}
 
 	return e.initCommon(ledgerDir)
+}
+
+// verifyEventLogParseable confirms logPath exists and its first record parses
+// as a JSON Event. Empty/zero-byte files are treated as "missing" because
+// initCommon opens the event log with O_CREATE — a crashed init can leave
+// the file present but empty, which is semantically a fresh-run state.
+func verifyEventLogParseable(logPath string) error {
+	f, err := os.Open(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("engine: %w: %v", ErrResumeNoEventLog, err)
+		}
+		return fmt.Errorf("engine: stat event log: %w", err)
+	}
+	defer f.Close()
+
+	scanner := newEventLogScanner(f)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("engine: read event log: %w", err)
+		}
+		// Zero-byte file or no lines — treat as missing so the operator
+		// gets a "use `wonka run`" hint rather than the corrupt sentinel.
+		return fmt.Errorf("engine: %w: %s is empty", ErrResumeNoEventLog, logPath)
+	}
+	var ev Event
+	if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
+		return fmt.Errorf("engine: %w: %s: %v", ErrCorruptEventLog, logPath, err)
+	}
+	// A `{}` line parses cleanly but carries no Kind — likely a placeholder
+	// from another tool, not a real wonka event. Treat it as corrupt rather
+	// than letting Resume proceed on garbage state.
+	if ev.Kind == "" {
+		return fmt.Errorf("engine: %w: %s: first record has no event kind", ErrCorruptEventLog, logPath)
+	}
+	return nil
 }
 
 // initCommon opens store, event log, tmux, lock, and pool. On any failure

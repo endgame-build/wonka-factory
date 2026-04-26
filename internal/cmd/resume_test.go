@@ -33,15 +33,15 @@ func TestResumeCmd_RejectsPositional(t *testing.T) {
 	assert.Contains(t, combined, "work-packages/demo", "must echo the user's argument so they recognize it")
 }
 
-// TestResumeCmd_NoLedger drives through real orch.Engine.Resume with no
-// prior state. orch/resume_errorpath_spec_test.go:170-187 pins the
-// ErrResumeNoLedger wrap — this test pins the *CLI-facing* error wording
-// and exit code so operators see a helpful message, not just the sentinel.
+// TestResumeCmd_NoEventLog drives through real orch.Engine.Resume with no
+// prior state. orch/resume_errorpath_spec_test.go pins the ErrResumeNoEventLog
+// wrap — this test pins the *CLI-facing* error wording and exit code so
+// operators see a helpful message, not just the sentinel.
 //
 // Uses --ledger fs so the test is tier 1 (no dolt dependency).
-func TestResumeCmd_NoLedger(t *testing.T) {
+func TestResumeCmd_NoEventLog(t *testing.T) {
 	repo := seedRepoWithAgents(t)
-	runDir := filepath.Join(t.TempDir(), "no-ledger")
+	runDir := filepath.Join(t.TempDir(), "no-event-log")
 
 	err, stderr := runCobra(t,
 		"resume",
