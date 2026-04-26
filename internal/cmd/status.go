@@ -12,13 +12,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Must agree with the ledger subdirectory orch's Engine opens under RunDir.
-// TODO(orch-seam): orch currently derives this literal inside Engine.init;
-// either export a LedgerSubdir constant or an OpenLedgerForRun(runDir,
-// kind) helper that returns (Store, LedgerKind, error). Today a rename in
-// orch would silently break `wonka status`.
-const ledgerSubdir = "ledger"
-
 // warnLedgerFallback prints a stderr warning when the store factory fell
 // back to a different backend than was requested. A scripted
 // `wonka status --json --ledger beads` on an FS fallback would otherwise
@@ -77,15 +70,18 @@ func showStatus(flags CLIFlags, format statusOutputFormat, stdout, stderr io.Wri
 	}
 
 	runDir := resolveRunDir(repoPath, branch, flags.RunDir)
-	ledgerDir := filepath.Join(runDir, ledgerSubdir)
-	// Pre-stat: opening the ledger may create the directory via the selected
-	// store backend constructor, so without this a typo'd --branch silently
-	// creates an empty ledger and renders an empty table.
-	if _, err := os.Stat(ledgerDir); err != nil {
+	// Branch-typo guard: stat the event log rather than the ledger dir.
+	// With --ledger beads sharing <repo>/.beads/ across branches, a
+	// ledger-dir stat would falsely succeed on any bd-installed repo even
+	// when wonka has never run on this branch, masking the typo. The event
+	// log is wonka-owned and per-RunDir, so its absence is a reliable
+	// "no prior run on this branch" signal.
+	logPath := filepath.Join(runDir, "events.jsonl")
+	if _, err := os.Stat(logPath); err != nil {
 		if os.IsNotExist(err) {
-			return die(stderr, exitConfigError, "no ledger at %s — is the branch spelled correctly, or run 'wonka run --branch %s' to create one", ledgerDir, branch)
+			return die(stderr, exitConfigError, "no event log at %s — is the branch spelled correctly, or run 'wonka run --branch %s' to create one", logPath, branch)
 		}
-		return die(stderr, exitRuntimeError, "stat ledger %s: %s", ledgerDir, err)
+		return die(stderr, exitRuntimeError, "stat event log %s: %s", logPath, err)
 	}
 
 	ledgerKind, err := parseLedgerKind(flags.Ledger)
@@ -93,6 +89,7 @@ func showStatus(flags CLIFlags, format statusOutputFormat, stdout, stderr io.Wri
 		return die(stderr, exitConfigError, "%s", err)
 	}
 
+	ledgerDir := orch.ResolveLedgerDir(repoPath, runDir, ledgerKind, "")
 	store, actualKind, err := orch.NewStore(ledgerKind, ledgerDir)
 	if err != nil {
 		return die(stderr, exitRuntimeError, "open ledger: %s", err)

@@ -22,7 +22,8 @@ import (
 //   - ErrLifecycleAborted → exit 0   (BVV-ERR-04: gap tolerance is expected)
 //   - context.Canceled    → exit 130 (BVV-ERR-09: signal cancellation silent)
 //   - context.DeadlineExceeded → exit 130 (same path as signal)
-//   - ErrResumeNoLedger   → exit 2   (BVV-ERR-07: config error, not failure)
+//   - ErrResumeNoEventLog → exit 2   (BVV-ERR-07: config error, not failure)
+//   - ErrCorruptEventLog  → exit 3   (operator intervention)
 //   - ErrLockContention   → exit 4   (BVV-ERR-06: retryable)
 //   - ErrCorruptLock      → exit 3   (BVV-ERR-08: human intervention)
 //   - os.ErrPermission    → exit 2   (operator fixable — chmod/chown)
@@ -59,10 +60,16 @@ func TestClassifyEngineError(t *testing.T) {
 			wantNoStderr: true,
 		},
 		{
-			name:       "resume_no_ledger_exit_2",
-			err:        orch.ErrResumeNoLedger,
+			name:       "resume_no_event_log_exit_2",
+			err:        orch.ErrResumeNoEventLog,
 			wantCode:   exitConfigError,
 			wantStderr: "wonka run",
+		},
+		{
+			name:       "corrupt_event_log_exit_3",
+			err:        orch.ErrCorruptEventLog,
+			wantCode:   exitLockCorrupt,
+			wantStderr: "event log corrupt",
 		},
 		{
 			name:       "lock_contention_exit_4",
@@ -78,13 +85,13 @@ func TestClassifyEngineError(t *testing.T) {
 		},
 		{
 			name:       "permission_denied_exit_2_with_hint",
-			err:        fmt.Errorf("engine: stat ledger dir: %w", os.ErrPermission),
+			err:        fmt.Errorf("engine: stat event log: %w", os.ErrPermission),
 			wantCode:   exitConfigError,
 			wantStderr: "ownership/mode",
 		},
 		{
 			name:       "wrapped_sentinel_still_classified",
-			err:        fmt.Errorf("orch: resume: %w", orch.ErrResumeNoLedger),
+			err:        fmt.Errorf("orch: resume: %w", orch.ErrResumeNoEventLog),
 			wantCode:   exitConfigError,
 			wantStderr: "wonka run",
 		},

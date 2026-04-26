@@ -143,6 +143,17 @@ func BuildEngineConfig(flags CLIFlags) (orch.EngineConfig, []string, error) {
 	}
 	warnings = append(warnings, roleWarnings...)
 
+	// Environment precondition: when the resolved ledger kind is beads (either
+	// explicit --ledger=beads or the empty default), require `bd` on PATH.
+	// The engine auto-inits <repo>/.beads/ via `bd init` if missing, and the
+	// beads SDK has no programmatic Init — without `bd` there is no way to
+	// make the lifecycle work. Checked after structural flag validation so a
+	// user passing --workers=0 sees the workers error first; environment
+	// errors come last.
+	if ledger == orch.LedgerBeads && !orch.BeadsCLIAvailable() {
+		return orch.EngineConfig{}, nil, fmt.Errorf("--ledger=beads requires the bd CLI on PATH: %w", orch.ErrBeadsCLIMissing)
+	}
+
 	lifecycle := &orch.LifecycleConfig{
 		Branch:       branch,
 		GapTolerance: flags.GapTolerance,
