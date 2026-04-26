@@ -275,6 +275,90 @@ func TestBuildEngineConfig_RelativeAgentDirResolvesUnderRepo(t *testing.T) {
 	assert.Equal(t, filepath.Join(agents, "OOMPA.md"), cfg.Lifecycle.Roles["builder"].InstructionFile)
 }
 
+// TestResolveWorkOrder_HappyPath confirms a well-formed work-order resolves to
+// an absolute path. Production callers (runLifecycle) pass the result into
+// SeedPlannerTask, which rejects relative paths — this test guards the
+// contract from the other side.
+func TestResolveWorkOrder_HappyPath(t *testing.T) {
+	repo := t.TempDir()
+	wo := filepath.Join(repo, "wp")
+	require.NoError(t, os.Mkdir(wo, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(wo, "functional-spec.md"), []byte("# CAP-1\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(wo, "vv-spec.md"), []byte("# V-1\n"), 0o644))
+
+	abs, err := ResolveWorkOrder(repo, "wp")
+	require.NoError(t, err)
+	assert.True(t, filepath.IsAbs(abs))
+	assert.Equal(t, wo, abs, "relative path must resolve under repo")
+}
+
+// TestResolveWorkOrder_AbsolutePassthrough verifies an absolute work-order
+// path bypasses the repo-rooted join. This matters when operators script
+// against work packages stored outside the target repo (a shared "specs"
+// repo, for instance).
+func TestResolveWorkOrder_AbsolutePassthrough(t *testing.T) {
+	repo := t.TempDir()
+	external := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(external, "functional-spec.md"), []byte("# x\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(external, "vv-spec.md"), []byte("# v\n"), 0o644))
+
+	abs, err := ResolveWorkOrder(repo, external)
+	require.NoError(t, err)
+	assert.Equal(t, external, abs)
+}
+
+// TestResolveWorkOrder_FailureModes is a single function rather than N tests
+// because each case is one-line and they share the same fail-fast contract:
+// any failure returns an error before any side effect, so runLifecycle can
+// die() with exitConfigError without touching the lifecycle lock.
+func TestResolveWorkOrder_FailureModes(t *testing.T) {
+	t.Run("missing directory", func(t *testing.T) {
+		repo := t.TempDir()
+		_, err := ResolveWorkOrder(repo, "nope")
+		require.Error(t, err)
+	})
+
+	t.Run("path is a file not a directory", func(t *testing.T) {
+		repo := t.TempDir()
+		f := filepath.Join(repo, "wp")
+		require.NoError(t, os.WriteFile(f, []byte("not a dir"), 0o644))
+		_, err := ResolveWorkOrder(repo, "wp")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not a directory")
+	})
+
+	t.Run("missing functional-spec", func(t *testing.T) {
+		repo := t.TempDir()
+		wo := filepath.Join(repo, "wp")
+		require.NoError(t, os.Mkdir(wo, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(wo, "vv-spec.md"), []byte("# v\n"), 0o644))
+		_, err := ResolveWorkOrder(repo, "wp")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "functional-spec.md")
+	})
+
+	t.Run("missing vv-spec", func(t *testing.T) {
+		repo := t.TempDir()
+		wo := filepath.Join(repo, "wp")
+		require.NoError(t, os.Mkdir(wo, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(wo, "functional-spec.md"), []byte("# f\n"), 0o644))
+		_, err := ResolveWorkOrder(repo, "wp")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "vv-spec.md")
+	})
+
+	t.Run("empty functional-spec", func(t *testing.T) {
+		repo := t.TempDir()
+		wo := filepath.Join(repo, "wp")
+		require.NoError(t, os.Mkdir(wo, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(wo, "functional-spec.md"), []byte{}, 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(wo, "vv-spec.md"), []byte("# v\n"), 0o644))
+		_, err := ResolveWorkOrder(repo, "wp")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "empty")
+	})
+}
+
 // TestBuildEngineConfig_ProductionAgents exercises BuildEngineConfig against
 // the real agents/ directory rather than a synthetic fixture. Closes the
 // drift gap between roleInstructionFiles (internal/cmd/config.go) and the

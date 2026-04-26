@@ -25,6 +25,12 @@ type EngineConfig struct {
 	Watchdog   WatchdogConfig
 	Progress   ProgressReporter // nil = no-op
 	Telemetry  *Telemetry       // nil = no-op; construct via NewTelemetry
+
+	// Seed runs once per Run, after lifecycle_started and before dispatch,
+	// with the lock held and the store open. A non-nil error aborts the run
+	// before any task dispatches. Resume never invokes Seed. Nil is a no-op.
+	// Kept as an opaque callback so orch stays phase-agnostic (BVV-DSN-04).
+	Seed func(Store) error
 }
 
 // DefaultEngineConfig returns sensible defaults with the given required parameters.
@@ -164,7 +170,20 @@ func (e *Engine) Run(ctx context.Context) error {
 	// their own outcome still win.
 	defer e.cfg.Telemetry.EndLifecycle(context.Background(), e.cfg.Lifecycle.Branch, outcomeInterrupted)
 
-	// 6. Run dispatch loop.
+	// 6. Optional pre-dispatch seed hook. The CLI uses this to inject a
+	// deterministic planner task from the work-package positional before the
+	// dispatch loop queries ReadyTasks for the first time. orch is
+	// intentionally opaque to what's being seeded (BVV-DSN-04). A Seed error
+	// unwinds the lifecycle — the run never started, so abort cleanly without
+	// emitting a completion event.
+	if e.cfg.Seed != nil {
+		if err := e.cfg.Seed(e.store); err != nil {
+			Cleanup(e.tmux, e.lock, e.log, e.store)
+			return fmt.Errorf("engine: seed: %w", err)
+		}
+	}
+
+	// 7. Run dispatch loop.
 	return e.runLoop(ctx)
 }
 

@@ -50,27 +50,82 @@ func runCobra(t *testing.T, args ...string) (error, string) {
 	return err, stderr.String()
 }
 
+// seedRepoWithWorkOrder extends seedRepoWithAgents by also dropping a valid
+// work-package under the repo. Tests that get past argument parsing into
+// runLifecycle need a real path to point at — without one, ResolveWorkOrder
+// would fail and mask the validation we're actually testing.
+func seedRepoWithWorkOrder(t *testing.T) (repo, woRel string) {
+	t.Helper()
+	repo = seedRepoWithAgents(t)
+	woRel = "wp"
+	wo := filepath.Join(repo, woRel)
+	require.NoError(t, os.Mkdir(wo, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(wo, "functional-spec.md"), []byte("# CAP-1\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(wo, "vv-spec.md"), []byte("# V-1\n"), 0o644))
+	return repo, woRel
+}
+
 // TestRunCmd_RequiresBranch verifies cobra's MarkPersistentFlagRequired
 // fires before any lifecycle side effects — no tmux, no lock, no store.
-// The error must name the missing flag so operators know what to add.
+// The error must name the missing flag so operators know what to add. Pass a
+// dummy positional so we test the --branch missing path specifically rather
+// than tripping ExactArgs first.
 func TestRunCmd_RequiresBranch(t *testing.T) {
-	err, stderr := runCobra(t, "run")
+	err, stderr := runCobra(t, "run", "anything")
 	require.Error(t, err)
 	assert.Contains(t, stderr+err.Error(), "branch")
 }
 
-// TestRunCmd_InvalidLedger exercises the unknown-ledger path through
-// BuildEngineConfig. The test uses --repo to avoid leaking into the CI
-// working directory (a default agent-dir stat against cwd would otherwise
-// either succeed or fail unpredictably).
-func TestRunCmd_InvalidLedger(t *testing.T) {
+// TestRunCmd_RequiresWorkOrder pins the new positional contract: `wonka run`
+// without a work-package argument must fail at cobra arg parsing, before any
+// engine init or store open. Operators get a clear "accepts 1 arg(s)" message
+// rather than a confusing config-validation failure deeper in the call.
+func TestRunCmd_RequiresWorkOrder(t *testing.T) {
 	repo := seedRepoWithAgents(t)
 	err, stderr := runCobra(t,
 		"run",
 		"--branch", "test",
 		"--repo", repo,
 		"--agent-dir", filepath.Join(repo, "agents"),
+	)
+	require.Error(t, err)
+	// cobra's ExactArgs(1) message phrasing: "accepts 1 arg(s), received 0".
+	// Don't pin the exact text (cobra version drift); pin the shape — the
+	// error must mention argument count so the operator knows what to fix.
+	assert.Contains(t, stderr+err.Error(), "arg")
+}
+
+// TestRunCmd_WorkOrderValidationFailsFast proves ResolveWorkOrder runs before
+// engine init: a non-existent work-package path errors with exitConfigError
+// without touching the lock. If this regresses, operators with typo'd paths
+// would acquire the lifecycle lock for a doomed run.
+func TestRunCmd_WorkOrderValidationFailsFast(t *testing.T) {
+	repo := seedRepoWithAgents(t)
+	err, stderr := runCobra(t,
+		"run",
+		"--branch", "test",
+		"--repo", repo,
+		"--agent-dir", filepath.Join(repo, "agents"),
+		"--ledger", "fs",
+		"work-packages/nope",
+	)
+	require.Error(t, err)
+	requireExitCode(t, err, exitConfigError)
+	assert.Contains(t, stderr, "work-order", "error must name the failing input")
+}
+
+// TestRunCmd_InvalidLedger exercises the unknown-ledger path through
+// BuildEngineConfig. Provides a positional so ExactArgs passes — the test is
+// about ledger validation, not argument count.
+func TestRunCmd_InvalidLedger(t *testing.T) {
+	repo, wo := seedRepoWithWorkOrder(t)
+	err, stderr := runCobra(t,
+		"run",
+		"--branch", "test",
+		"--repo", repo,
+		"--agent-dir", filepath.Join(repo, "agents"),
 		"--ledger", "dolt",
+		wo,
 	)
 	require.Error(t, err)
 	assert.Contains(t, stderr, "dolt")
@@ -82,13 +137,14 @@ func TestRunCmd_InvalidLedger(t *testing.T) {
 // BuildEngineConfig fires for explicit zero (cobra's IntVar happily accepts
 // zero at parse time; the semantic check is ours).
 func TestRunCmd_InvalidWorkers(t *testing.T) {
-	repo := seedRepoWithAgents(t)
+	repo, wo := seedRepoWithWorkOrder(t)
 	err, stderr := runCobra(t,
 		"run",
 		"--branch", "test",
 		"--repo", repo,
 		"--agent-dir", filepath.Join(repo, "agents"),
 		"--workers", "0",
+		wo,
 	)
 	require.Error(t, err)
 	assert.Contains(t, stderr, "workers")
@@ -133,7 +189,7 @@ func TestBuildEngineConfig_NoValidateGraph(t *testing.T) {
 // non-zero code because we don't actually run the engine, but flag parsing
 // must succeed (no "unknown flag" error).
 func TestRunCmd_NoValidateGraphFlag(t *testing.T) {
-	repo := seedRepoWithAgents(t)
+	repo, wo := seedRepoWithWorkOrder(t)
 	// Use an unrecognized ledger to short-circuit before engine init; we only
 	// care that --no-validate-graph parses cleanly.
 	err, stderr := runCobra(t,
@@ -143,6 +199,7 @@ func TestRunCmd_NoValidateGraphFlag(t *testing.T) {
 		"--agent-dir", filepath.Join(repo, "agents"),
 		"--no-validate-graph",
 		"--ledger", "dolt", // triggers exitConfigError — flag parsing happened first
+		wo,
 	)
 	require.Error(t, err)
 	assert.NotContains(t, stderr, "unknown flag", "--no-validate-graph must parse")
@@ -249,7 +306,7 @@ func TestOBS04_BuildTelemetry_SecureRemoteAllowed(t *testing.T) {
 // init via an invalid ledger so the test stays hermetic (no collector
 // needed).
 func TestOBS04_RunCmd_OTelFlagsParse(t *testing.T) {
-	repo := seedRepoWithAgents(t)
+	repo, wo := seedRepoWithWorkOrder(t)
 	err, stderr := runCobra(t,
 		"run",
 		"--branch", "test",
@@ -259,6 +316,7 @@ func TestOBS04_RunCmd_OTelFlagsParse(t *testing.T) {
 		"--otel-protocol", "grpc",
 		"--otel-insecure=true",
 		"--ledger", "dolt",
+		wo,
 	)
 	require.Error(t, err)
 	assert.NotContains(t, stderr, "unknown flag", "OTel flags must parse")

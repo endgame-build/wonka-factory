@@ -6,9 +6,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -647,6 +649,94 @@ func TestEngine_DoubleRunRejected(t *testing.T) {
 
 	err = e.Resume(context.Background())
 	assert.ErrorIs(t, err, orch.ErrEngineAlreadyStarted)
+}
+
+// TestEngine_RunInvokesSeed pins the EngineConfig.Seed contract: the callback
+// MUST fire exactly once on a fresh Run, with the engine's open store and
+// while the lifecycle lock is held. Without this test, a future refactor
+// could silently drop the `if e.cfg.Seed != nil` block in Engine.Run and
+// every CLI seeding test would still pass (the CLI tests assert SeedPlannerTask
+// in isolation, not its invocation by the engine).
+//
+// The callback creates a single task; we then prove it was created (proves
+// the store argument is real and writable) and that the lifecycle completed
+// (proves dispatch ran AFTER the seed, not before or instead of).
+func TestEngine_RunInvokesSeed(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "seed-invoked"
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	var calls atomic.Int32
+	cfg.Seed = func(store orch.Store) error {
+		calls.Add(1)
+		require.NotNil(t, store, "seed must receive the engine's open store")
+		// Create a task here so the dispatch loop has work — proves the seed
+		// runs *before* the loop starts polling, and proves the store is
+		// writable from inside the callback.
+		return store.CreateTask(testTask("seeded-task", "feat/x", "builder"))
+	}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, e.Run(ctx))
+
+	assert.Equal(t, int32(1), calls.Load(), "seed must fire exactly once per Run")
+
+	// Re-open the store to verify the seeded task survived (it should have
+	// been picked up and completed by the dispatch loop).
+	store, _, err := orch.NewStore("", filepath.Join(runDir, "ledger"))
+	require.NoError(t, err)
+	defer store.Close()
+	got, err := store.GetTask("seeded-task")
+	require.NoError(t, err, "seeded task must be persisted in the ledger")
+	assert.Equal(t, orch.StatusCompleted, got.Status, "seeded task must have been dispatched and completed")
+}
+
+// TestEngine_RunSeedErrorAborts verifies the failure semantics of the Seed
+// hook: a non-nil error returned from Seed unwinds the lifecycle before
+// dispatch starts. The error must wrap, so callers can errors.Is/As against
+// their own sentinels for triage.
+func TestEngine_RunSeedErrorAborts(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
+	cfg.RunID = "seed-error"
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	sentinel := errors.New("synthetic seed failure")
+	var dispatchEntered atomic.Bool
+	cfg.Seed = func(_ orch.Store) error { return sentinel }
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	// If dispatch were entered, this spawn func would record it. We expect
+	// it to never fire — the seed error must abort before runLoop polls.
+	e.SetTestSpawnFunc(func(_ context.Context, _ *orch.Task, _ *orch.Worker, _ orch.RoleConfig, _ int, _ chan<- orch.TaskOutcome) {
+		dispatchEntered.Store(true)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = e.Run(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, sentinel, "seed errors must wrap so callers can match their sentinels")
+	assert.False(t, dispatchEntered.Load(), "dispatch must not run when seed fails")
 }
 
 // --- Helpers ---

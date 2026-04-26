@@ -39,6 +39,12 @@ func BuildCommand(preset *Preset, instructionBody, model string, maxTurns int) [
 		// --max-turns is universal across supported presets (claude, codex, goose).
 		cmd = append(cmd, "--max-turns", strconv.Itoa(maxTurns))
 	}
+	// Kickoff prompt last, so it's the trailing positional. Required by CLIs
+	// like claude in --print mode where a positional prompt or stdin is
+	// mandatory; presets that don't need one leave it empty.
+	if preset.KickoffPrompt != "" {
+		cmd = append(cmd, preset.KickoffPrompt)
+	}
 	return cmd
 }
 

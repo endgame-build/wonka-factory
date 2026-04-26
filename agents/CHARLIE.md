@@ -22,6 +22,12 @@ When your instruction file, target `CLAUDE.md`, and the task body conflict:
 | **Protocol** (exit codes, `bd` usage, role labels, graph shape) | This instruction file | target `CLAUDE.md` | task body |
 | **Decomposition strategy** (how to split capabilities into tasks) | Work package specs | target `CLAUDE.md` | this instruction file |
 | **Scope** (which capabilities this lifecycle covers) | Task body + work package | target `CLAUDE.md` | this instruction file |
+| **Architecture** (layering, tech stack, cross-cutting constraints) | target `CLAUDE.md` | this instruction file | — |
+
+Architecture is no longer a per-feature input. The target repo's `CLAUDE.md` is
+the single source of truth for layering, tech stack, and cross-cutting
+constraints; the work package carries only the WHAT (`functional-spec.md`) and
+the PROOF (`vv-spec.md`).
 
 ---
 
@@ -40,16 +46,21 @@ When your instruction file, target `CLAUDE.md`, and the task body conflict:
 bd show "$ORCH_TASK_ID" --json
 ```
 
-The body names the **work package path** — a directory containing the specs you will decompose. Recommended layout (non-normative):
+The body names the **work package path** — a directory containing the specs you will decompose. Required layout:
 
 ```
 work-packages/<feature>/
   functional-spec.md    # capabilities (CAP-*), use cases (UC-*), acceptance criteria (AC-*)
-  technical-spec.md     # architecture decisions, tech stack, constraints
   vv-spec.md            # verification criteria (V-*) per capability, test strategy
 ```
 
-If the work package path does not exist or is unreadable, exit 2.
+Architectural context (layering, tech stack, cross-cutting constraints) lives
+in `$ORCH_PROJECT/CLAUDE.md` — the target repo's contract — not in any
+per-feature spec. You read it during ORIENT (Step E below) so decomposition
+aligns with the repo's chosen architecture.
+
+If the work package path does not exist, is unreadable, or is missing either
+required spec file, exit 2.
 
 ### Step C — Verify or create branch
 
@@ -72,15 +83,17 @@ If the result is non-empty, you are **re-running** on an existing graph. Treat t
 - `completed` — **do not touch** (BVV-TG-03). It is terminal.
 - `failed` or `blocked` — may reset to `open` if the blocking condition is resolved.
 
-### Step E — Read the work package
+### Step E — Read the work package + repo architecture
 
-Read the three spec files in parallel. Extract:
+Read three inputs in parallel:
 
-- From functional spec: the list of capabilities, their use cases, acceptance criteria. Note any stable IDs (CAP-*, UC-*).
-- From technical spec: architectural layers, tech stack, cross-cutting constraints.
-- From V&V spec: verification criteria per capability (V-*), test approach, non-functional checks.
+- **`<work-package>/functional-spec.md`** — capabilities, use cases, acceptance criteria. Note any stable IDs (CAP-*, UC-*, AC-*).
+- **`<work-package>/vv-spec.md`** — verification criteria per capability (V-*), test approach, non-functional checks.
+- **`$ORCH_PROJECT/CLAUDE.md`** — architectural layers, tech stack, cross-cutting constraints, conventions. This is the *only* source of architecture; per-feature work packages no longer carry a technical spec.
 
-If any file is missing or unparseable, exit 2.
+If `functional-spec.md` or `vv-spec.md` is missing or unparseable, exit 2. If `CLAUDE.md` is missing, you already exited 2 in Step A — but treat any unreadable error here the same way.
+
+When the work package and `CLAUDE.md` disagree on architecture, `CLAUDE.md` wins (see Precedence table). When they disagree on capability scope, the work package wins. When in doubt, follow the precedence table strictly rather than synthesizing a third option.
 
 ---
 
@@ -145,7 +158,7 @@ bd create \
 
 `--labels` takes one comma-separated string (repeating the flag is not supported on `bd create`). `--deps` takes one or more predecessor IDs (repeat the flag or comma-separate). Capture each returned task ID — later `--deps` arguments reference them. Per-role specifics:
 
-- **build task:** `role:builder`, `critical:true` for migrations/infrastructure, depends at minimum on `$ORCH_TASK_ID`. Description lists target files, success criteria (AC-*), and functional/technical spec refs.
+- **build task:** `role:builder`, `critical:true` for migrations/infrastructure, depends at minimum on `$ORCH_TASK_ID`. Description lists target files, success criteria (AC-*), `functional-spec.md` refs, and the `CLAUDE.md` sections that informed any architectural choices.
 - **V&V task:** `role:verifier`, typically non-critical, depends on the build task(s) it verifies. Description lists verification criteria (V-*) and vv-spec refs.
 - **gate task:** `role:gate`, `critical:true`, priority 999, depends on every V&V task (directly or transitively). Exactly one per lifecycle. Description names the PR flow.
 
@@ -161,7 +174,7 @@ Priority controls dispatch order among independent tasks; deeper builds dispatch
 
 Every task description MUST reference the spec sections it implements or verifies. Specifically:
 
-- Build task: list spec refs (functional spec sections, technical spec constraints) that inform its target files and success criteria.
+- Build task: list spec refs (functional-spec sections that define the unit) and `CLAUDE.md` sections that constrain the implementation (layering rules, naming conventions, stack choices).
 - V&V task: list the V-* or AC-* criteria it proves.
 
 Without these references, the lifecycle is untraceable after the fact.
