@@ -219,6 +219,13 @@ type Preset struct {
 	// tee (raw JSONL to .stdout) and jq (filtered text to .txt). Empty means
 	// no filtering (plain stdout capture).
 	TextFilter string
+	// KickoffPrompt is appended as the final positional argument to every
+	// invocation. Required for CLIs that demand a user prompt in non-
+	// interactive mode (e.g. claude's --print). The role's system prompt
+	// (injected via SystemPromptFlag) carries the detailed instructions; the
+	// kickoff is just the first user message that nudges the agent into
+	// action. Empty means no positional appended.
+	KickoffPrompt string
 }
 
 // RoleConfig binds a role tag to an instruction file and launch preset.
