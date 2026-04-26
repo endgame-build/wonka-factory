@@ -46,8 +46,8 @@ The `-tags verify` build tag enables runtime invariant assertions that panic wit
 
 | Subcommand     | Purpose                                                         |
 |----------------|-----------------------------------------------------------------|
-| `wonka run`    | Start a fresh lifecycle on a branch (acquires per-branch lock). |
-| `wonka resume` | Re-enter an interrupted lifecycle (reconciles stale state).     |
+| `wonka run`    | Start a fresh lifecycle on a branch. Takes a `<work-package>` positional; seeds a deterministic `plan-<branch>` planner task and acquires the per-branch lock. |
+| `wonka resume` | Re-enter an interrupted lifecycle (reconciles stale state). Reads the work-package from the existing planner task body. |
 | `wonka status` | Print tasks for the branch (table; `--json` for scripts).       |
 
 CLI-level exit codes (distinct from the agent exit-code protocol described below):
@@ -60,7 +60,7 @@ Wrapper scripts should branch on 3/4 (wait-and-retry vs human intervention).
 
 ```bash
 docker compose up -d                                      # stack on localhost
-bin/wonka run --branch feat/x --otel-endpoint localhost:14317 --otel-insecure
+bin/wonka run --branch feat/x --otel-endpoint localhost:14317 --otel-insecure work-packages/x/
 ```
 
 - Grafana: http://localhost:3000 (admin/changeme) — "Telemetry" folder has `Wonka Orchestrator` and `Claude Code Telemetry` dashboards.
@@ -116,6 +116,7 @@ Third-party actions are pinned to 40-char SHAs. External binaries (gitleaks, svu
 | Concept | Implementation |
 |---------|---------------|
 | **DAG dispatch** | `ReadyTasks()` returns tasks where status=open, all deps terminal, assignee empty. No phase logic. |
+| **Lifecycle entry** | `wonka run --branch X <work-package>` seeds a deterministic `plan-X` planner task via `EngineConfig.Seed` (CLI's `SeedPlannerTask`), then dispatches. Re-runs hash the work-package's `functional-spec.md` + `vv-spec.md`; matched hash = no-op, mismatch = reopen for replan. |
 | **Exit code protocol** | 0=done, 1=fail(retryable), 2=blocked(terminal), 3=handoff(new session) |
 | **One task per session** | Each `Assign` → `SpawnSession` → agent runs → exits → session ends. Orchestrator is the outer loop. |
 | **Role routing** | Task's `role` label → instruction file path → injected as system prompt via preset's `SystemPromptFlag` |

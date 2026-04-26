@@ -377,8 +377,10 @@ Dependency edges encode ordering:
 ```
 Input: work-packages/feature-x/
   functional-spec.md    (3 capabilities: client CRUD, validation rules, event publishing)
-  technical-spec.md     (hexagonal layout, PostgreSQL, domain events via NATS)
   vv-spec.md            (per-capability verification: trace + BR coverage + error paths)
+
+(Architectural context — hexagonal layout, PostgreSQL, NATS — comes from
+the target repo's CLAUDE.md, not from a per-feature technical spec.)
 
 Planner decomposes into:
 
@@ -395,19 +397,19 @@ pr-gate-feature-x           (role:gate, depends: vv-client-crud, vv-validation-r
 
 ### 7.3 Lifecycle Entry Point
 
-`[BVV-TG-05]` The orchestrator MUST NOT create the initial plan task. Lifecycle initiation is a human or external-system action.
+`[BVV-TG-05]` The orchestrator MUST NOT create the initial plan task as part of dispatch. Lifecycle initiation is a human or external-system action.
 
-A lifecycle begins when a human or CLI command creates the plan task in the ledger:
+In the reference implementation the human action is `wonka run --branch <name> <work-package-path>`, which seeds a deterministic `plan-<branch>` task in the ledger before dispatch begins. The seeding uses the `Store.CreateTask` API directly — operators no longer hand-craft `bd create` calls. Equivalent direct ledger writes (via `bd` or any other front end) remain valid lifecycle initiations.
 
-```bash
-bd create --title "plan-feature-x" \
-  --type plan \
-  --label "role:planner" \
-  --label "branch:feature-x" \
-  --description "Work package: work-packages/feature-x/"
-```
+The seeded plan task carries:
 
-The plan task's description references the work package path. `ReadyTasks()` surfaces it; the orchestrator dispatches it to a planner worker.
+- `Body` — absolute path to the work-package directory
+- `Labels.role` — `planner`
+- `Labels.branch` — `<name>`
+- `Labels.criticality` — `critical`
+- `Labels[wonka:work-order-hash]` — SHA-256 over the work-package spec files (used by re-runs to detect content changes and reopen the planner for idempotent reconciliation per BVV-TG-02)
+
+`ReadyTasks()` surfaces it; the orchestrator dispatches it to a planner worker.
 
 #### 7.3.1 Branch Creation
 

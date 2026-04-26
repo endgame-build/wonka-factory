@@ -31,10 +31,10 @@ task build
 # Full local quality gate (lint + test + build)
 task check
 
-# Start a lifecycle on a branch
-bin/wonka run --branch feat/my-change
+# Start a lifecycle on a branch (positional = work-package directory)
+bin/wonka run --branch feat/my-change work-packages/my-change/
 
-# Resume an interrupted lifecycle
+# Resume an interrupted lifecycle (work-package read from existing planner task)
 bin/wonka resume --branch feat/my-change
 
 # Inspect state
@@ -75,9 +75,23 @@ Each task runs in an isolated tmux session (socket `wonka-<runID>`, session name
 
 | Subcommand     | Purpose                                                         |
 |----------------|-----------------------------------------------------------------|
-| `wonka run`    | Start a fresh lifecycle on a branch (acquires per-branch lock). |
-| `wonka resume` | Re-enter an interrupted lifecycle (reconciles stale state).     |
+| `wonka run`    | Start a fresh lifecycle on a branch (acquires per-branch lock). Takes a `<work-package>` positional argument. |
+| `wonka resume` | Re-enter an interrupted lifecycle (reconciles stale state). Reads the work-package from existing state. |
 | `wonka status` | Print tasks for the branch (table; `--json` for scripts).       |
+
+## Work package
+
+A work package is a directory with two Markdown files:
+
+```
+work-packages/<feature>/
+  functional-spec.md    # WHAT — capabilities (CAP-*), use cases (UC-*), acceptance criteria (AC-*)
+  vv-spec.md            # PROOF — verification criteria per capability (V-*), test approach
+```
+
+Architectural context (layering, tech stack, conventions) lives in the target repo's `CLAUDE.md`, not in any per-feature spec. Charlie reads both work-package files plus `CLAUDE.md` during ORIENT and decomposes the result into a build/V&V/gate task graph.
+
+`wonka run` hashes the two spec files and stores the digest on the seeded planner task. Re-running with the same content is a no-op; editing either file and re-running reopens the planner so the graph reconciles against the new spec.
 
 ## Observability
 
@@ -85,7 +99,7 @@ Optional stack (OTel collector, Prometheus, Grafana) in `docker-compose.yaml`:
 
 ```bash
 docker compose up -d
-bin/wonka run --branch feat/x --otel-endpoint localhost:14317 --otel-insecure
+bin/wonka run --branch feat/x --otel-endpoint localhost:14317 --otel-insecure work-packages/x/
 ```
 
 - **Grafana** — http://localhost:3000 (admin/changeme), Telemetry folder

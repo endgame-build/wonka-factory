@@ -90,6 +90,12 @@ const (
 	LabelRole        = "role"
 	LabelBranch      = "branch"
 	LabelCriticality = "criticality"
+	// LabelWorkOrderHash carries a SHA-256 over the work-package spec files
+	// on the seeded planner task. The CLI's seed pass compares the current
+	// hash against this label to decide whether a re-run is a no-op or a
+	// replan trigger. Prefixed with "wonka:" so consumers can distinguish
+	// internal accounting from human-meaningful classification labels.
+	LabelWorkOrderHash = "wonka:work-order-hash"
 )
 
 // Role is the typed label value carried in Task.Labels[LabelRole]. A typed

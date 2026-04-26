@@ -16,33 +16,52 @@ import (
 // share wiring.
 type lifecycleFn func(*orch.Engine, context.Context) error
 
-// newLifecycleCmd builds a run-or-resume subcommand. The only thing that
-// varies between `wonka run` and `wonka resume` is the method invoked on
-// the engine and the help text.
-func newLifecycleCmd(use, short, long string, invoke lifecycleFn, flags *CLIFlags) *cobra.Command {
+// newRunCmd builds the `wonka run` subcommand. Distinct from newLifecycleCmd
+// because run takes a required positional <work-package> argument and seeds a
+// planner task before dispatch — neither of which applies to resume.
+func newRunCmd(flags *CLIFlags) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   use,
-		Short: short,
-		Long:  long,
+		Use:   "run <work-package>",
+		Short: "Start a fresh lifecycle for a branch",
+		Long: `Acquires a per-branch lifecycle lock, seeds a planner task pointing at
+the supplied work-package directory, and dispatches the resulting graph
+to completion or gap-tolerance abort. The work package must contain
+functional-spec.md (the WHAT) and vv-spec.md (the PROOF); architectural
+context is read from the target repo's CLAUDE.md, not from a per-feature
+technical spec.
+
+Re-running with the same work-package is a no-op (hash-matched). Re-running
+after edits to either spec file reopens the planner task so the graph
+reconciles against the new content.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLifecycle(*flags, invoke, cmd.ErrOrStderr())
+			// Capture the positional before runLifecycle reads CLIFlags. Doing
+			// this in RunE rather than PreRunE keeps the flag-to-struct
+			// translation single-pass and avoids a hidden mutation seam.
+			flags.WorkOrder = args[0]
+			return runLifecycle(*flags, (*orch.Engine).Run, cmd.ErrOrStderr())
 		},
 	}
 	addLifecycleFlags(cmd, flags)
 	return cmd
 }
 
-func newRunCmd(flags *CLIFlags) *cobra.Command {
-	return newLifecycleCmd(
-		"run",
-		"Start a fresh lifecycle for a branch",
-		`Acquires a per-branch lifecycle lock and dispatches ready tasks from
-the ledger until completion or gap-tolerance abort. Expects the ledger
-to be pre-populated with tasks labeled branch:<name> and role:<role> —
-populate via 'bd' or your own tooling.`,
-		(*orch.Engine).Run,
-		flags,
-	)
+// newLifecycleCmd builds a resume subcommand (run no longer uses this — see
+// newRunCmd). Kept for backward compatibility with the resume wiring; if a
+// future verb shares the same shape, prefer extending this helper rather than
+// duplicating it.
+func newLifecycleCmd(use, short, long string, invoke lifecycleFn, flags *CLIFlags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   use,
+		Short: short,
+		Long:  long,
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runLifecycle(*flags, invoke, cmd.ErrOrStderr())
+		},
+	}
+	addLifecycleFlags(cmd, flags)
+	return cmd
 }
 
 // runLifecycle is the shared run/resume body. Passes context.Background to
@@ -58,6 +77,27 @@ func runLifecycle(flags CLIFlags, invoke lifecycleFn, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "warning:", w)
 	}
 	fmt.Fprintf(stderr, "run dir: %s\n", cfg.RunDir)
+
+	// Resolve and validate the work-order ahead of NewEngine. Failing here
+	// keeps the lifecycle lock untouched and the telemetry pipeline cold —
+	// the cheapest possible failure mode for a typo'd path or empty spec
+	// file. ResolveWorkOrder reads no orch state, so this stays decoupled
+	// from the engine's init order.
+	var workOrderAbs string
+	if flags.WorkOrder != "" {
+		workOrderAbs, err = ResolveWorkOrder(cfg.RepoPath, flags.WorkOrder)
+		if err != nil {
+			return die(stderr, exitConfigError, "%s", err)
+		}
+		// Wire the seed callback. Closure captures workOrderAbs + branch so
+		// orch never sees the work-order semantics — it only sees an opaque
+		// "do this with the store before dispatch" hook (see Seed doc on
+		// orch.EngineConfig).
+		branch := cfg.Lifecycle.Branch
+		cfg.Seed = func(store orch.Store) error {
+			return SeedPlannerTask(store, branch, workOrderAbs)
+		}
+	}
 
 	// Telemetry is optional; nil *Telemetry is treated as no-op by orch.
 	// Build *before* engine init so invalid flags (unknown --otel-protocol,

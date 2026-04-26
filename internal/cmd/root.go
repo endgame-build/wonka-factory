@@ -34,10 +34,14 @@ func NewRootCmd() *cobra.Command {
 		Use:   "wonka",
 		Short: "DAG-driven orchestrator for autonomous software delivery agents",
 		Long: `wonka dispatches tasks from a ledger to agents, supervising workers
-through a per-branch lifecycle. Expects the ledger to be pre-populated
-with tasks labeled branch:<name> and role:<role>. Planner-driven task
-creation is not yet supported; populate the ledger directly via 'bd'
-or your own tooling.`,
+through a per-branch lifecycle.
+
+'wonka run --branch <name> <work-package>' seeds a planner task pointing
+at the supplied work-package directory and dispatches the resulting
+graph. The work package must contain functional-spec.md (the WHAT) and
+vv-spec.md (the PROOF); architectural context is read from the target
+repo's CLAUDE.md. 'wonka resume' re-enters an interrupted lifecycle
+without touching the ledger contents.`,
 		SilenceUsage:  true, // engine errors shouldn't dump help text
 		SilenceErrors: true, // main prints the error once in its own style
 	}

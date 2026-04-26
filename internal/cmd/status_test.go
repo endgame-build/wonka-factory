@@ -55,6 +55,25 @@ func TestStatusCmd_RequiresBranch(t *testing.T) {
 	assert.Contains(t, stderr+err.Error(), "branch")
 }
 
+// TestStatusCmd_RejectsPositional proves `wonka status` rejects extra args
+// rather than silently ignoring them. The most likely user mistake is
+// `wonka status feat/x` (intended `--branch feat/x`) — without this guard,
+// it would print an empty table for the cwd-derived branch and confuse the
+// operator.
+func TestStatusCmd_RejectsPositional(t *testing.T) {
+	err, _, stderr := runStatusCmd(t,
+		"status",
+		"--branch", "x",
+		"unexpected",
+	)
+	require.Error(t, err)
+	combined := stderr + err.Error()
+	// cobra phrases NoArgs as `unknown command "x" for "wonka status"`. We
+	// don't pin the exact text (cobra version drift) but require the user's
+	// rejected token shows up so they can identify what to fix.
+	assert.Contains(t, combined, "unexpected", "rejection must echo the user's mistaken argument")
+}
+
 // TestStatusCmd_RejectsLifecycleFlags proves --workers (and friends) are
 // scoped to run/resume, not status. Without this isolation, a user running
 // `wonka status --workers 4` would see a silent no-op, which is worse than
