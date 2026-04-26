@@ -54,9 +54,12 @@ func TestEngine_ResumeLockContentionPreservesLiveTmux(t *testing.T) {
 	require.NoError(t, live.Acquire(prevRunID, branch))
 	t.Cleanup(func() { _ = live.Release() })
 
-	// 3. Pre-create ledger dir so initForResume gets past the existence check.
+	// 3. Pre-create event log + ledger so initForResume gets past the
+	//    sentinel check (a parseable first record).
 	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "ledger"), 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "logs"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, "events.jsonl"),
+		[]byte(`{"kind":"lifecycle_started","summary":"prior","timestamp":"2026-01-01T00:00:00Z"}`+"\n"), 0o644))
 
 	// 4. Attempt Resume on a second Engine that will recover RunID=prevRunID
 	//    from the lock file, join the live tmux socket, then fail Acquire.
