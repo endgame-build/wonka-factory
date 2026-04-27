@@ -126,17 +126,29 @@ EOF
 # run_lifecycle starts wonka and waits for it to exit. Unlike the unit-test
 # smoke, we don't SIGINT here — we want a real lifecycle to run to completion
 # (or abort on its own). Output streams to stdout so the operator can watch
-# Claude sessions and dispatch progress in real time.
+# Claude sessions and dispatch progress in real time. The captured stderr
+# also lets us detect bd transport failures distinct from PR regressions.
 run_lifecycle() {
     local target="$1"
     local timeout="${2:-15m}"
+    local capture="$3"
     "$WONKA" run \
         --branch feat/greet \
         --ledger beads \
         --workers 2 \
         --timeout "$timeout" \
         --repo "$target" \
-        "$target/work-packages/greet/"
+        "$target/work-packages/greet/" 2>&1 | tee "$capture"
+    return "${PIPESTATUS[0]}"
+}
+
+# detect_bd_transport_failure looks for the specific upstream bd issue that
+# blocks wonka from opening the beads store on hosts where bd is in embedded
+# mode but wonka was built CGO_ENABLED=0 (SQL-server-mode beads SDK).
+# Returns 0 (true) when the failure is the bd transport issue.
+detect_bd_transport_failure() {
+    local capture="$1"
+    grep -qE "Dolt server unreachable|not supported in embedded mode" "$capture"
 }
 
 # verify_routing pins the BVV-DSN-04 contract: <repo>/.beads/ exists (auto-init
@@ -280,11 +292,44 @@ echo "  branch: feat/greet | ledger: beads | workers: 2 | timeout: 15m"
 echo "  watch tmux sessions via:  tmux -L wonka-<runID> ls"
 echo ""
 LIFECYCLE_RC=0
-run_lifecycle "$TARGET" 15m || LIFECYCLE_RC=$?
+WONKA_STDERR="$TARGET/.wonka-stderr.log"
+mkdir -p "$(dirname "$WONKA_STDERR")"
+run_lifecycle "$TARGET" 15m "$WONKA_STDERR" || LIFECYCLE_RC=$?
 echo ""
 echo "  wonka exit code: $LIFECYCLE_RC"
 
 verify_routing "$TARGET"
+
+# bd transport failure is upstream (bd 1.0.0 embedded mode vs wonka's
+# CGO_ENABLED=0 SQL-server-mode beads SDK). Treat as ENVIRONMENT-BLOCKED
+# rather than a PR regression — the routing contract has already been
+# verified above, which is the load-bearing assertion of this script.
+if detect_bd_transport_failure "$WONKA_STDERR"; then
+    section "Lifecycle outcome (skipped — bd transport unavailable)"
+    warn "wonka could not open the beads store: bd 1.0.0 is in embedded mode but wonka built CGO_ENABLED=0 expects a Dolt SQL server"
+    warn "this is upstream, out of scope per docs/SINGLE_LEDGER_ROUTING_PLAN.md non-goals"
+    warn "build artifacts cannot be verified — Charlie never ran"
+    print_run_summary "$TARGET"
+
+    section "Summary"
+    printf "  passed: \033[32m%d\033[0m  (routing contract only)\n" "$PASS"
+    printf "  failed: \033[31m%d\033[0m\n" "$FAIL"
+    if [ "$FAIL" -gt 0 ]; then
+        echo ""
+        printf "\033[31mLEVEL 4 FAILED\033[0m (last: %s)\n" "$LAST_FAIL"
+        echo "target preserved for inspection: $TARGET"
+        exit 1
+    fi
+    echo ""
+    printf "\033[33mLEVEL 4 ENVIRONMENT-BLOCKED\033[0m — routing verified, full lifecycle requires working bd/Dolt transport\n"
+    if [ "$KEEP" = "1" ]; then
+        echo "target preserved (--keep): $TARGET"
+    else
+        rm -rf "$TARGET"
+    fi
+    exit 0
+fi
+
 verify_lifecycle "$TARGET"
 verify_artifacts "$TARGET"
 print_run_summary "$TARGET"
