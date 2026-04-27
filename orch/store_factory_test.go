@@ -24,6 +24,25 @@ func requireBd(t *testing.T) {
 	}
 }
 
+// initBdRepo creates a fresh bd-initialised .beads/ directory under a temp
+// directory and returns its path. Encapsulates the git-init + bd-init
+// dance every BDCLIStore test needs (bd init's --stealth setup expects to
+// run inside a git repo even when no hooks are installed). Takes
+// testing.TB so contract tests, benchmarks, and the differential test can
+// all reuse it.
+func initBdRepo(tb testing.TB) string {
+	tb.Helper()
+	dir := tb.TempDir()
+	gitInit := exec.Command("git", "init", "-q")
+	gitInit.Dir = dir
+	require.NoError(tb, gitInit.Run())
+	bdInit := exec.Command("bd", "init", "--stealth", "--non-interactive", "--quiet")
+	bdInit.Dir = dir
+	out, err := bdInit.CombinedOutput()
+	require.NoError(tb, err, "bd init: %s", out)
+	return filepath.Join(dir, ".beads")
+}
+
 // TestResolveLedgerDir pins the path-resolution contract. Three input
 // classes (LedgerBeads, LedgerFS, empty) map to deterministic outputs.
 // A regression that flipped beads to runDir or fs to repoPath would route

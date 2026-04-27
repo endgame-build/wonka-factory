@@ -64,11 +64,18 @@ const (
 
 // LedgerKind selects the backing store implementation.
 // BVV-DSP-16: beads (Dolt-backed) is the default; fs is the fallback.
+//
+// LedgerBDCLI shells out to the `bd` CLI rather than linking the Beads Go SDK.
+// It shares <repo>/.beads/ with LedgerBeads (and with Charlie's bd invocations)
+// so operators can run either backend against the same database. Added in the
+// BDCLI migration's PR-A as an opt-in; PR-B flips LedgerBeads to construct the
+// CLI-backed store, and PR-C drops this alias.
 type LedgerKind string
 
 const (
 	LedgerFS    LedgerKind = "fs"
 	LedgerBeads LedgerKind = "beads"
+	LedgerBDCLI LedgerKind = "bd-cli"
 )
 
 // --- Configuration types ---

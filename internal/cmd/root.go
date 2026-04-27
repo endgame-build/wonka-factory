@@ -49,7 +49,7 @@ without touching the ledger contents.`,
 
 	// Persistent flags shared by run, resume, status.
 	root.PersistentFlags().StringVar(&flags.Branch, "branch", "", "lifecycle branch name (required)")
-	root.PersistentFlags().StringVar(&flags.Ledger, "ledger", defaultLedger, "ledger backend: beads or fs")
+	root.PersistentFlags().StringVar(&flags.Ledger, "ledger", defaultLedger, "ledger backend: beads (Go SDK, default), bd-cli (bd CLI shell-out), or fs")
 	root.PersistentFlags().StringVar(&flags.AgentDir, "agent-dir", defaultAgentDir, "directory containing role instruction files (OOMPA.md, LOOMPA.md, CHARLIE.md); relative paths resolve under --repo")
 	root.PersistentFlags().StringVar(&flags.RunDir, "run-dir", "", "orchestrator state directory (default: <repo>/.wonka/<sanitized-branch>)")
 	root.PersistentFlags().StringVar(&flags.RepoPath, "repo", "", "repository path the agents operate against (default: current directory)")

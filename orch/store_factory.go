@@ -17,6 +17,7 @@ type StoreConstructor func(dir string) (Store, error)
 var storeRegistry = map[LedgerKind]StoreConstructor{
 	LedgerFS:    func(dir string) (Store, error) { return NewFSStore(dir) },
 	LedgerBeads: func(dir string) (Store, error) { return NewBeadsStore(dir, defaultActor) },
+	LedgerBDCLI: func(dir string) (Store, error) { return NewBDCLIStore(dir, defaultActor) },
 }
 
 // beadsFallbackOnce ensures the Beads→FS fallback warning prints only once per process.
@@ -31,6 +32,7 @@ var ErrBeadsCLIMissing = errors.New("bd CLI not found on PATH — install bd or 
 // ResolveLedgerDir returns the directory wonka opens for a given ledger kind.
 //
 //	LedgerBeads → <repoPath>/.beads/   (shared with bd; see BVV-DSN-04)
+//	LedgerBDCLI → <repoPath>/.beads/   (same database, accessed via bd CLI)
 //	LedgerFS    → <runDir>/ledger/     (per-run dev convenience)
 //	empty kind  → <runDir>/ledger/     (test/legacy default; CLI sets kind explicitly)
 //
@@ -47,7 +49,7 @@ func ResolveLedgerDir(repoPath, runDir string, kind LedgerKind, override string)
 	if override != "" {
 		return override
 	}
-	if kind == LedgerBeads {
+	if kind == LedgerBeads || kind == LedgerBDCLI {
 		return filepath.Join(repoPath, ".beads")
 	}
 	return filepath.Join(runDir, "ledger")
