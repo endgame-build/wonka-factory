@@ -856,6 +856,36 @@ func TestEngine_RunSeedErrorAborts_BeadsPath(t *testing.T) {
 	assert.False(t, dispatchEntered.Load(), "dispatch must not run when seed fails")
 }
 
+// SetTestLedgerDir must bypass EnsureBeadsInitialised even when
+// LedgerKind == LedgerBeads — otherwise tests pointing beads at a
+// controlled t.TempDir still need `bd` on PATH.
+func TestEngine_SetTestLedgerDirBypassesAutoInit(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	runDir := t.TempDir()
+	repo := t.TempDir()
+	override := filepath.Join(t.TempDir(), ".beads")
+
+	lifecycle := testutil.MockLifecycleConfig("feat-x", "builder")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, repo)
+	cfg.RunID = "bypass-test"
+	cfg.LedgerKind = orch.LedgerBeads // would normally trip auto-init
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestLedgerDir(override)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = e.Run(ctx)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, orch.ErrBeadsCLIMissing)
+}
+
 // TestEngine_FullLifecycle_BeadsBackend is the load-bearing assertion this
 // PR exists for. With the dispatcher reading from <repo>/.beads/ (the same
 // store the planner writes to), a fresh Run with a seed that creates a

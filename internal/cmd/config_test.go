@@ -132,6 +132,33 @@ func TestBuildEngineConfig_InvalidWorkers(t *testing.T) {
 	assert.Contains(t, err.Error(), "workers")
 }
 
+// Structural flag errors (workers, ledger, preset, timeout) must surface
+// before the bd-on-PATH precondition; otherwise --workers=0 --ledger=beads
+// on a host without bd reports a phantom env problem.
+func TestBuildEngineConfig_WorkersErrorPrecedesBdCheck(t *testing.T) {
+	t.Setenv("PATH", "")
+	flags := validFlags(t)
+	flags.Ledger = "beads"
+	flags.Workers = 0
+
+	_, _, err := BuildEngineConfig(flags)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "workers")
+	assert.NotContains(t, err.Error(), "bd CLI")
+}
+
+// With --ledger=beads and bd absent, BuildEngineConfig must surface
+// ErrBeadsCLIMissing before NewEngine.
+func TestBuildEngineConfig_BdCheckFiresWhenStructurallyValid(t *testing.T) {
+	t.Setenv("PATH", "")
+	flags := validFlags(t)
+	flags.Ledger = "beads"
+
+	_, _, err := BuildEngineConfig(flags)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, orch.ErrBeadsCLIMissing)
+}
+
 // TestBuildEngineConfig_InvalidTimeout guards against a zero or negative
 // timeout, which would make ScaledTimeout return an immediately-fired timer.
 // Split into subtests so a zero-duration regression doesn't mask a separate

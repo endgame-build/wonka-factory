@@ -136,6 +136,43 @@ func TestStatusCmd_StatError(t *testing.T) {
 	requireExitCode(t, err, exitRuntimeError)
 }
 
+// `wonka status --ledger beads` must route to <repo>/.beads/, not
+// <runDir>/ledger/. The load-bearing observable is NewBeadsStore's
+// MkdirAll side effect: status with --ledger=beads must create
+// <repo>/.beads/ (proving the resolver returned that path), and
+// <runDir>/ledger/ contents must not leak into output even when
+// pre-seeded (proving status didn't silently fall back to FS).
+func TestStatusCmd_BeadsRoutesToRepoDotBeads(t *testing.T) {
+	runDir := t.TempDir()
+	repo := t.TempDir()
+	seedFSLedger(t, runDir, []*orch.Task{
+		{
+			ID:     "runfeat-decoy",
+			Title:  "DECOY-RUNDIR-LEDGER",
+			Status: orch.StatusOpen,
+			Labels: map[string]string{
+				orch.LabelRole:   "builder",
+				orch.LabelBranch: "feat-x",
+			},
+		},
+	})
+
+	err, stdout, stderr := runStatusCmd(t,
+		"status",
+		"--branch", "feat-x",
+		"--run-dir", runDir,
+		"--repo", repo,
+		"--ledger", "beads",
+	)
+	// Status either succeeds (Dolt reachable) or errors (Dolt unreachable);
+	// either way the path must have been routed to <repo>/.beads/.
+	assert.DirExists(t, filepath.Join(repo, ".beads"),
+		"status --ledger=beads must MkdirAll <repo>/.beads via NewBeadsStore — absence proves the resolver mis-routed")
+	assert.NotContains(t, stdout+stderr, "DECOY-RUNDIR-LEDGER",
+		"<runDir>/ledger contents must not leak — status must not silently fall back to FS for --ledger=beads")
+	_ = err // surface either outcome; the path-routing assertion is what matters
+}
+
 // TestStatusCmd_EmptyLedger runs against a freshly created (empty) store
 // and verifies the header renders and the body is the bare column labels.
 // Exit 0 — empty is a valid state.
