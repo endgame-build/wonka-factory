@@ -191,6 +191,14 @@ func ResolveWorkOrder(repoPath, raw string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("work-order missing %s: %w", name, err)
 		}
+		// Reject non-regular entries (most commonly a directory named like the
+		// spec, e.g. functional-spec.md/). Without this guard, validation passes
+		// — directory FileInfo.Size() is non-zero on most filesystems — and the
+		// failure surfaces later inside hashWorkOrder under the lifecycle lock,
+		// turning a config error into a runtime error after side effects.
+		if !st.Mode().IsRegular() {
+			return "", fmt.Errorf("work-order %s is not a regular file", name)
+		}
 		if st.Size() == 0 {
 			return "", fmt.Errorf("work-order %s is empty", name)
 		}

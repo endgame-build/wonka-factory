@@ -216,6 +216,44 @@ func TestSeedPlannerTask_ReopensWhenFailedHashDiffers(t *testing.T) {
 	assert.Equal(t, orch.StatusOpen, got.Status, "failed planner with new spec must be reopened for retry")
 }
 
+// TestSeedPlannerTask_ReopenClearsAssignee guards a subtle dispatch-blocking
+// bug. terminateAndRelease (orch/dispatch.go) preserves task.Assignee on the
+// completed/failed/blocked transition as a worker-attribution record. When
+// reopenSeed flips a terminal task back to StatusOpen for replan, leaving
+// Assignee set would make ReadyTasks(branch) skip the row (FSStore filter:
+// `Status != Open || Assignee != ""`), silently stranding the lifecycle:
+// dispatch sees no work, no event explains why, the user waits forever.
+// Mirrors the retry path in dispatch.go:309 which already clears Assignee
+// on its own terminal-to-open move.
+func TestSeedPlannerTask_ReopenClearsAssignee(t *testing.T) {
+	store := freshStore(t)
+	wo := seedWorkOrder(t)
+
+	// Seed via the canonical path so the stored hash matches the live work-
+	// order content; we'll force a hash mismatch by mutating the spec below.
+	require.NoError(t, SeedPlannerTask(store, "feat/x", wo))
+	first, err := store.GetTask(plannerTaskID("feat/x"))
+	require.NoError(t, err)
+
+	// Simulate a prior run that completed (or failed) with worker attribution
+	// preserved on the terminal row. This is exactly what terminateAndRelease
+	// leaves behind — the seed path must not trust the row's Assignee.
+	first.Status = orch.StatusFailed
+	first.Assignee = "worker-3"
+	require.NoError(t, store.UpdateTask(first))
+
+	// Force a content mismatch so we hit the reopen branch (not the no-op
+	// fast path).
+	require.NoError(t, os.WriteFile(filepath.Join(wo, "functional-spec.md"),
+		[]byte("# CAP-1\n## UC-1.2 NEW\n"), 0o644))
+
+	require.NoError(t, SeedPlannerTask(store, "feat/x", wo))
+	got, err := store.GetTask(plannerTaskID("feat/x"))
+	require.NoError(t, err)
+	assert.Equal(t, orch.StatusOpen, got.Status, "reopen must flip status")
+	assert.Empty(t, got.Assignee, "reopen must clear stale assignee so ReadyTasks picks the row up")
+}
+
 // TestSeedPlannerTask_RejectsRelativePath defends against a caller bug. The
 // planner task body is consumed by Charlie running from $ORCH_PROJECT, which
 // may differ from the CLI's cwd; a relative path here would silently bind to

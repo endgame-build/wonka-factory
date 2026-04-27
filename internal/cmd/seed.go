@@ -126,9 +126,17 @@ func createSeed(store orch.Store, id, branch, workOrderAbs, hash string) error {
 // reopenSeed flips a terminal planner task back to open with refreshed body
 // and hash. We do NOT reset retry/handoff counters — that's BVV-S-02a (human
 // re-open) territory, not the seed path.
+//
+// Assignee is cleared because terminateAndRelease preserves it as a worker-
+// attribution record on terminal rows. ReadyTasks(branch) filters out
+// open-tasks-with-assignee (ledger_fs.go:171, ledger_beads.go), so leaving
+// the prior worker attached would silently block dispatch — the planner
+// would never run again, and operators would see a quiet hang instead of a
+// replan. Mirrors dispatch.go:309 where the retry path makes the same move.
 func reopenSeed(store orch.Store, t *orch.Task, workOrderAbs, hash string) error {
 	t.Body = workOrderAbs
 	t.Status = orch.StatusOpen
+	t.Assignee = ""
 	t.Labels[orch.LabelWorkOrderHash] = hash
 	t.UpdatedAt = time.Now().UTC()
 	if err := store.UpdateTask(t); err != nil {

@@ -357,6 +357,25 @@ func TestResolveWorkOrder_FailureModes(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "empty")
 	})
+
+	// A directory named exactly like a required spec (e.g. someone ran
+	// `mkdir functional-spec.md` to scaffold a folder of fragments) used to
+	// pass validation: os.Stat returns a FileInfo whose Size() reports
+	// directory-entry bytes, not zero, so the "empty" guard didn't fire. The
+	// failure then surfaced inside hashWorkOrder after the lifecycle lock was
+	// already held — a config error masquerading as a runtime error. Pin the
+	// regular-file check so that mistake fails fast and clearly.
+	t.Run("functional-spec is a directory", func(t *testing.T) {
+		repo := t.TempDir()
+		wo := filepath.Join(repo, "wp")
+		require.NoError(t, os.Mkdir(wo, 0o755))
+		require.NoError(t, os.Mkdir(filepath.Join(wo, "functional-spec.md"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(wo, "vv-spec.md"), []byte("# v\n"), 0o644))
+		_, err := ResolveWorkOrder(repo, "wp")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "regular file")
+		assert.Contains(t, err.Error(), "functional-spec.md")
+	})
 }
 
 // TestBuildEngineConfig_ProductionAgents exercises BuildEngineConfig against
