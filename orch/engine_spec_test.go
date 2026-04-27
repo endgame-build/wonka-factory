@@ -93,18 +93,31 @@ func skipWithoutTmux(t *testing.T) {
 }
 
 // prepopulateLedger creates the ledger and logs directories inside runDir,
-// opens a temporary FS store, creates the given tasks, and closes the store.
+// opens a temporary FS store, creates the given tasks, closes the store, and
+// seeds a parseable lifecycle_started event so Resume tests pass the
+// ErrResumeNoEventLog sentinel check.
 func prepopulateLedger(t *testing.T, runDir string, tasks ...*orch.Task) {
 	t.Helper()
 	ledgerDir := filepath.Join(runDir, "ledger")
 	require.NoError(t, os.MkdirAll(ledgerDir, 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "logs"), 0o755))
+	seedFreshEventLog(t, runDir)
 	fsStore, _, err := orch.NewStore("", ledgerDir)
 	require.NoError(t, err)
 	for _, task := range tasks {
 		require.NoError(t, fsStore.CreateTask(task))
 	}
 	require.NoError(t, fsStore.Close())
+}
+
+// seedFreshEventLog drops a single parseable lifecycle_started record into
+// runDir/events.jsonl. Used by Resume tests to satisfy the event-log
+// sentinel without driving an engine. The file is opened with O_APPEND
+// elsewhere, so this seed is preserved even if engine.init runs after.
+func seedFreshEventLog(t *testing.T, runDir string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, "events.jsonl"),
+		[]byte(`{"kind":"lifecycle_started","summary":"seeded","timestamp":"2026-01-01T00:00:00Z"}`+"\n"), 0o644))
 }
 
 func testTask(id, branch, role string) *orch.Task {
@@ -336,10 +349,11 @@ func TestEngine_ResumeRecoversPreviousRunID(t *testing.T) {
 	staleContent := `{"holder":"previous-run-id","branch":"feat-x","timestamp":"2000-01-01T00:00:00Z"}`
 	require.NoError(t, os.WriteFile(lockPath, []byte(staleContent), 0o644))
 
-	// Pre-create ledger directory so Resume gets past the ledger check
-	// and into initForResume where RunID recovery happens.
+	// Pre-create ledger directory + event log so Resume gets past the
+	// sentinel check and into initForResume where RunID recovery happens.
 	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "ledger"), 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "logs"), 0o755))
+	seedFreshEventLog(t, runDir)
 
 	lifecycle := testutil.MockLifecycleConfig(branch, "builder")
 	lifecycle.Lock.Path = lockPath
@@ -358,8 +372,15 @@ func TestEngine_ResumeRecoversPreviousRunID(t *testing.T) {
 	assert.Equal(t, "previous-run-id", e.RunID())
 }
 
-// TestEngine_ResumeFallbackRunID verifies that when no lock file exists,
-// Resume keeps the configured RunID.
+// TestEngine_ResumeFallbackRunID verifies that a Resume failing in
+// initForResume preserves the configured RunID rather than zeroing or
+// regenerating it. The lock-recovery success path (event log present,
+// lock file present) is covered separately by
+// TestEngine_ResumeStaleLockRecoversRunID; this test pins the
+// failure-mode invariant.
+//
+// With no event log, initForResume short-circuits at ErrResumeNoEventLog
+// before any RunID mutation, so the configured value must survive.
 func TestEngine_ResumeFallbackRunID(t *testing.T) {
 	runDir := t.TempDir()
 	lifecycle := testutil.MockLifecycleConfig("feat-x", "builder")
@@ -370,8 +391,8 @@ func TestEngine_ResumeFallbackRunID(t *testing.T) {
 	e, err := orch.NewEngine(cfg)
 	require.NoError(t, err)
 
-	_ = e.Resume(context.Background()) // will fail — no ledger dir
-
+	err = e.Resume(context.Background())
+	require.Error(t, err) // ErrResumeNoEventLog — no prior wonka run on this branch
 	assert.Equal(t, "my-run-id", e.RunID())
 }
 
@@ -447,9 +468,10 @@ func TestEngine_ResumeLockContention(t *testing.T) {
 	require.NoError(t, first.Acquire("first-run", branch))
 	defer first.Release() //nolint:errcheck // test cleanup
 
-	// Pre-create ledger so initForResume passes the existence check.
+	// Pre-create ledger + event log so initForResume passes the sentinel.
 	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "ledger"), 0o755))
 	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "logs"), 0o755))
+	seedFreshEventLog(t, runDir)
 
 	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
 	cfg.RunID = "second-run"
@@ -564,12 +586,17 @@ func TestEngine_RunSurfacesStoreFallback(t *testing.T) {
 
 	cfg := orch.DefaultEngineConfig(lifecycle, runDir, t.TempDir())
 	cfg.RunID = "test-fallback"
-	cfg.LedgerKind = orch.LedgerBeads
+	// Empty LedgerKind preserves the beads→fs fallback semantics (NewStore
+	// only falls back when the caller did not explicitly request beads).
+	// Explicit LedgerBeads is strict by design — the auto-init path requires
+	// `bd` on PATH and would not fall back. The audit-trail signal we're
+	// pinning here applies to the empty-kind path.
+	cfg.LedgerKind = ""
 	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
 
 	// Skip if Beads is actually reachable — the fallback would not fire
 	// and the assertion would be vacuously wrong.
-	if _, kind, err := orch.NewStore(orch.LedgerBeads, filepath.Join(t.TempDir(), "probe")); err == nil && kind == orch.LedgerBeads {
+	if _, kind, err := orch.NewStore("", filepath.Join(t.TempDir(), "probe")); err == nil && kind == orch.LedgerBeads {
 		t.Skip("Beads backend reachable — fallback path cannot be exercised")
 	}
 
@@ -741,6 +768,216 @@ func TestEngine_RunSeedErrorAborts(t *testing.T) {
 	// Seed failure must still emit the §10.3 terminal anchor.
 	assertEventDetailContains(t, filepath.Join(runDir, "events.jsonl"),
 		orch.EventLifecycleCompleted, "outcome=failed")
+}
+
+// newBeadsPathEngine builds an engine pinned to <repo>/.beads/ via the
+// SetTestLedgerDir seam, with the supplied Seed callback. LedgerKind stays
+// empty: combined with the override, the engine resolves to beadsDir
+// (override wins) without triggering strict beads.Open (which would require
+// a live Dolt server). Tests built on this fixture assert the *routing
+// contract* — wonka and Charlie agree on the path — not the beads transport.
+func newBeadsPathEngine(t *testing.T, runID string, seed func(orch.Store) error) (e *orch.Engine, runDir, beadsDir string) {
+	t.Helper()
+	runDir = t.TempDir()
+	repo := t.TempDir()
+	beadsDir = filepath.Join(repo, ".beads")
+
+	lifecycle := testutil.MockLifecycleConfig("feat/x", "builder")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, repo)
+	cfg.RunID = runID
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+	cfg.Seed = seed
+
+	var err error
+	e, err = orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestLedgerDir(beadsDir)
+	return e, runDir, beadsDir
+}
+
+// TestEngine_RunInvokesSeed_BeadsPath pins that the Seed callback receives
+// the store opened at the beads-resolved location (<repo>/.beads/), not the
+// FS path. Without this, a regression that resolved beads to <runDir>/ledger
+// would silently work in tests (FS still seedable) but break end-to-end
+// because Charlie writes to <repo>/.beads/ — the BVV-DSN-04 contract this
+// PR exists to enforce.
+func TestEngine_RunInvokesSeed_BeadsPath(t *testing.T) {
+	skipWithoutTmux(t)
+
+	var calls atomic.Int32
+	e, runDir, beadsDir := newBeadsPathEngine(t, "seed-beads", func(store orch.Store) error {
+		calls.Add(1)
+		require.NotNil(t, store, "seed must receive the engine's open store")
+		return store.CreateTask(testTask("beads-seed", "feat/x", "builder"))
+	})
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, e.Run(ctx))
+
+	assert.Equal(t, int32(1), calls.Load(), "seed must fire exactly once per Run")
+
+	store, _, err := orch.NewStore("", beadsDir)
+	require.NoError(t, err)
+	defer store.Close()
+	got, err := store.GetTask("beads-seed")
+	require.NoError(t, err, "seeded task must be persisted at <repo>/.beads/")
+	assert.Equal(t, orch.StatusCompleted, got.Status, "seeded task must have been dispatched and completed")
+
+	// Belt-and-braces: the legacy per-run-dir ledger directory must NOT
+	// exist. If it did, a regression silently bypassed the new resolver.
+	assert.NoDirExists(t, filepath.Join(runDir, "ledger"),
+		"legacy <runDir>/ledger must not be created when LedgerBeads is resolved")
+}
+
+// TestEngine_RunSeedErrorAborts_BeadsPath mirrors TestEngine_RunSeedErrorAborts
+// against the beads-resolved path so the failure semantics survive the
+// new resolution logic too. A regression that swallowed seed errors only
+// for one backend would otherwise slip past the FS-only test.
+func TestEngine_RunSeedErrorAborts_BeadsPath(t *testing.T) {
+	skipWithoutTmux(t)
+
+	sentinel := errors.New("synthetic seed failure (beads)")
+	e, _, _ := newBeadsPathEngine(t, "seed-error-beads", func(_ orch.Store) error { return sentinel })
+	var dispatchEntered atomic.Bool
+	e.SetTestSpawnFunc(func(_ context.Context, _ *orch.Task, _ *orch.Worker, _ orch.RoleConfig, _ int, _ chan<- orch.TaskOutcome) {
+		dispatchEntered.Store(true)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := e.Run(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, sentinel, "seed errors must wrap so callers can match their sentinels")
+	assert.False(t, dispatchEntered.Load(), "dispatch must not run when seed fails")
+}
+
+// SetTestLedgerDir must bypass EnsureBeadsInitialised even when
+// LedgerKind == LedgerBeads — otherwise tests pointing beads at a
+// controlled t.TempDir still need `bd` on PATH.
+func TestEngine_SetTestLedgerDirBypassesAutoInit(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	runDir := t.TempDir()
+	repo := t.TempDir()
+	override := filepath.Join(t.TempDir(), ".beads")
+
+	lifecycle := testutil.MockLifecycleConfig("feat-x", "builder")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, repo)
+	cfg.RunID = "bypass-test"
+	cfg.LedgerKind = orch.LedgerBeads // would normally trip auto-init
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestLedgerDir(override)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = e.Run(ctx)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, orch.ErrBeadsCLIMissing)
+}
+
+// TestEngine_FullLifecycle_BeadsBackend is the load-bearing assertion this
+// PR exists for. With the dispatcher reading from <repo>/.beads/ (the same
+// store the planner writes to), a fresh Run with a seed that creates a
+// builder + verifier + gate task must reach lifecycle_completed instead
+// of aborting at BVV-TG-09 ("0 gate tasks expected 1") — the failure
+// observed in PR #20's Level 4 run that motivated this change.
+//
+// Drives a fake planner via SetTestSpawnFunc that creates the full task
+// graph in the same store wonka opens. Uses SetTestLedgerDir to bypass
+// the bd auto-init (covered by gated unit tests) and pin the beads
+// directory to a controlled t.TempDir()/.beads.
+func TestEngine_FullLifecycle_BeadsBackend(t *testing.T) {
+	skipWithoutTmux(t)
+
+	runDir := t.TempDir()
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	branch := "feat/x"
+
+	lifecycle := testutil.MockLifecycleConfig(branch, "builder", "verifier", "gate")
+	lifecycle.Lock.StalenessThreshold = 1 * time.Hour
+	lifecycle.Lock.RetryCount = 0
+	// Disable graph validation so we don't have to spin up the gate role's
+	// PR machinery; the assertion here is "lifecycle reaches completion,"
+	// not "gate task PR-creates."
+	lifecycle.ValidateGraph = false
+
+	cfg := orch.DefaultEngineConfig(lifecycle, runDir, repo)
+	cfg.RunID = "full-beads"
+	// LedgerKind stays empty: combined with SetTestLedgerDir below, the
+	// engine resolves to the injected beadsDir (override wins) without
+	// triggering strict beads.Open (which would require a live Dolt server).
+	// The test asserts the *routing contract* — wonka and Charlie agree on
+	// the path — not the beads transport.
+	cfg.Dispatch = orch.DispatchConfig{Interval: 10 * time.Millisecond, AgentPollInterval: 10 * time.Millisecond}
+
+	// Seed simulates Charlie: write the planner task plus the build/verify/gate
+	// graph into the same store the dispatcher will read from. Before this
+	// PR, the planner wrote to <repo>/.beads/ while the dispatcher read from
+	// <runDir>/ledger/, so this graph would have been invisible.
+	cfg.Seed = func(store orch.Store) error {
+		// Planner task — completed up front (the seed is taking the planner's
+		// place; we're testing dispatch through builder/verifier/gate).
+		planner := testTask("plan-x", branch, "planner")
+		planner.Status = orch.StatusCompleted
+		if err := store.CreateTask(planner); err != nil {
+			return err
+		}
+		build := testTask("build-1", branch, "builder")
+		if err := store.CreateTask(build); err != nil {
+			return err
+		}
+		verify := testTask("verify-1", branch, "verifier")
+		if err := store.CreateTask(verify); err != nil {
+			return err
+		}
+		if err := store.AddDep(verify.ID, build.ID); err != nil {
+			return err
+		}
+		gate := testTask("gate-1", branch, "gate")
+		if err := store.CreateTask(gate); err != nil {
+			return err
+		}
+		return store.AddDep(gate.ID, verify.ID)
+	}
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+	e.SetTestLedgerDir(beadsDir)
+	e.SetTestSpawnFunc(testutil.ImmediateSpawnFunc(0))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	require.NoError(t, e.Run(ctx),
+		"full lifecycle must complete cleanly — pre-fix this aborted at BVV-TG-09 because the planner wrote to <repo>/.beads/ while dispatch read <runDir>/ledger/")
+
+	// Confirm every non-planner task terminated successfully against the
+	// shared store.
+	store, _, err := orch.NewStore("", beadsDir)
+	require.NoError(t, err)
+	defer store.Close()
+	for _, id := range []string{"build-1", "verify-1", "gate-1"} {
+		got, err := store.GetTask(id)
+		require.NoError(t, err, "task %s must be readable from the shared ledger", id)
+		assert.Equal(t, orch.StatusCompleted, got.Status,
+			"task %s must reach completed (single-ledger contract)", id)
+	}
+
+	// Lifecycle-completed event with no abort marker — pre-fix this would
+	// have carried "outcome=aborted".
+	logPath := filepath.Join(runDir, "events.jsonl")
+	assertEventKinds(t, logPath, orch.EventLifecycleStarted, orch.EventLifecycleCompleted)
 }
 
 // --- Helpers ---

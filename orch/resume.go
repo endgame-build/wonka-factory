@@ -233,6 +233,15 @@ type eventLogRecovery struct {
 // the practical ceiling of a single Event after JSON encoding.
 const maxEventLogLine = 16 * 1024 * 1024
 
+// newEventLogScanner constructs a bufio.Scanner sized for event-log lines.
+// Shared by recoverFromEventLog (full scan) and verifyEventLogParseable
+// (first-line check) so the buffer cap stays in sync.
+func newEventLogScanner(f *os.File) *bufio.Scanner {
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), maxEventLogLine)
+	return scanner
+}
+
 // recoverFromEventLog performs a single-pass scan of the event log and
 // extracts gap task IDs, per-task retry counts, per-task handoff counts,
 // and the last terminal status per task. Missing log file → zero values, nil.
@@ -258,8 +267,7 @@ func recoverFromEventLog(logPath string) (*eventLogRecovery, error) {
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), maxEventLogLine)
+	scanner := newEventLogScanner(f)
 	for scanner.Scan() {
 		var e Event
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {

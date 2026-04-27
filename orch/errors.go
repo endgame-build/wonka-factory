@@ -19,7 +19,7 @@ var (
 var (
 	ErrLifecycleAborted    = errors.New("lifecycle aborted: gap tolerance reached") // BVV-ERR-04
 	ErrLockContention      = errors.New("lifecycle lock held by another process")   // BVV-S-01, BVV-ERR-06
-	ErrResumeNoLedger      = errors.New("no ledger found for resume")               // BVV-ERR-07
+	ErrResumeNoEventLog    = errors.New("no event log found for resume")            // BVV-ERR-07
 	ErrHandoffLimitReached = errors.New("handoff limit reached for task")           // BVV-L-04
 
 	// ErrCorruptLock signals a lock file that parses as invalid JSON or
@@ -28,6 +28,21 @@ var (
 	// so a corrupt lock is operator-intervention territory — silently
 	// fabricating a fresh RunID would orphan any live sessions.
 	ErrCorruptLock = errors.New("lifecycle lock file corrupt — operator intervention required")
+
+	// ErrCorruptEventLog signals an event log whose first record fails to
+	// parse as a JSON Event. Distinct from ErrResumeNoEventLog: a missing
+	// log means "no prior wonka run on this branch — use `wonka run`",
+	// while a corrupt first record means a prior run started and crashed
+	// mid-write, which is operator-intervention territory (recovery would
+	// otherwise replay an undefined event stream).
+	ErrCorruptEventLog = errors.New("event log first record unparseable — operator intervention required")
+
+	// ErrResumeLedgerMissing signals that initForResume found a parseable
+	// event log but the ledger directory has been removed. Both store
+	// constructors call os.MkdirAll, so without this guard the dir would
+	// be silently recreated and the log replayed into an empty store —
+	// state loss disguised as resume.
+	ErrResumeLedgerMissing = errors.New("ledger directory missing on resume — operator intervention required")
 )
 
 // Sentinel errors for input validation.

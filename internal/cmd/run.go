@@ -143,8 +143,14 @@ func classifyEngineError(err error, branch string, stderr io.Writer) error {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return &exitError{code: exitSignalInterrupt}
 
-	case errors.Is(err, orch.ErrResumeNoLedger):
-		return die(stderr, exitConfigError, "no ledger for branch %q — run 'wonka run --branch %s' to start a fresh lifecycle (%s)", branch, branch, err)
+	case errors.Is(err, orch.ErrResumeNoEventLog):
+		return die(stderr, exitConfigError, "no event log for branch %q — run 'wonka run --branch %s' to start a fresh lifecycle (%s)", branch, branch, err)
+
+	case errors.Is(err, orch.ErrCorruptEventLog):
+		return die(stderr, exitLockCorrupt, "event log corrupt: %s", err)
+
+	case errors.Is(err, orch.ErrResumeLedgerMissing):
+		return die(stderr, exitLockCorrupt, "ledger directory missing on resume for branch %q — restore from backup or start fresh with 'wonka run --branch %s' (%s)", branch, branch, err)
 
 	case errors.Is(err, orch.ErrLockContention):
 		return die(stderr, exitLockBusy, "branch %q is already being processed by another wonka process — wait for it to finish, or run 'wonka status --branch %s' to inspect (%s)", branch, branch, err)
@@ -153,7 +159,7 @@ func classifyEngineError(err error, branch string, stderr io.Writer) error {
 		return die(stderr, exitLockCorrupt, "lifecycle lock corrupt: %s", err)
 
 	case errors.Is(err, os.ErrPermission):
-		return die(stderr, exitConfigError, "permission denied — check ownership/mode of the run directory and its ledger subdirectory (%s)", err)
+		return die(stderr, exitConfigError, "permission denied — check ownership/mode of the run directory and the ledger location (<run-dir>/ledger for --ledger fs, <repo>/.beads for --ledger beads): %s", err)
 
 	// Validation-family sentinels come from bad input (operator-passed label
 	// filters, env keys, task IDs). Retrying without fixing the data won't

@@ -14,13 +14,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// seedFSLedger creates an FS-backed ledger under runDir/ledger and inserts
-// the provided tasks. Returns the FS store (already closed on test end) —
-// used by status tests to pre-populate state without running the engine.
+// seedFSLedger creates an FS-backed ledger under runDir/ledger, drops a
+// minimal events.jsonl alongside it (so the branch-typo guard passes), and
+// inserts the provided tasks. Used by status tests to pre-populate state
+// without running the engine.
 func seedFSLedger(t *testing.T, runDir string, tasks []*orch.Task) {
 	t.Helper()
-	ledgerDir := filepath.Join(runDir, "ledger")
+	ledgerDir := orch.ResolveLedgerDir("", runDir, orch.LedgerFS, "")
 	require.NoError(t, os.MkdirAll(ledgerDir, 0o755))
+
+	// Drop a parseable lifecycle_started event so status's pre-check passes.
+	// The event log is wonka-owned in production; status tests fake it here
+	// to mimic the post-run state without driving an engine.
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, "events.jsonl"),
+		[]byte(`{"kind":"lifecycle_started","summary":"seeded","timestamp":"2026-01-01T00:00:00Z"}`+"\n"), 0o644))
 
 	store, _, err := orch.NewStore(orch.LedgerFS, ledgerDir)
 	require.NoError(t, err)
@@ -88,10 +95,12 @@ func TestStatusCmd_RejectsLifecycleFlags(t *testing.T) {
 	assert.Contains(t, stderr+err.Error(), "workers")
 }
 
-// TestStatusCmd_NoLedger verifies the "no ledger at <path>" fail-fast path.
-// The die() message must name the missing directory so operators can fix
-// their --run-dir / --branch spelling quickly.
-func TestStatusCmd_NoLedger(t *testing.T) {
+// TestStatusCmd_NoEventLog verifies the "no event log at <path>" fail-fast
+// path. The die() message must name the missing file so operators can fix
+// their --run-dir / --branch spelling quickly. (Switched from ledger-stat
+// to event-log stat because --ledger beads now shares <repo>/.beads/ across
+// branches; ledger-stat would falsely succeed on any bd-installed repo.)
+func TestStatusCmd_NoEventLog(t *testing.T) {
 	missingDir := filepath.Join(t.TempDir(), "nothing-here")
 	err, _, stderr := runStatusCmd(t,
 		"status",
@@ -100,14 +109,14 @@ func TestStatusCmd_NoLedger(t *testing.T) {
 		"--ledger", "fs",
 	)
 	require.Error(t, err)
-	assert.Contains(t, stderr, "no ledger")
+	assert.Contains(t, stderr, "no event log")
 	requireExitCode(t, err, exitConfigError)
 }
 
 // TestStatusCmd_StatError verifies non-ENOENT stat failures surface as a
-// runtime error, not the misleading "no ledger at …" config message. We
-// plant a regular file where runDir should be a directory — stat of
-// <file>/ledger returns ENOTDIR, which os.IsNotExist does not match.
+// runtime error, not the misleading "no event log at …" config message.
+// We plant a regular file where runDir should be a directory — stat of
+// <file>/events.jsonl returns ENOTDIR, which os.IsNotExist does not match.
 // Without the split, operators chasing an EIO / permission / ENOTDIR
 // error would be told to fix their --branch spelling instead.
 func TestStatusCmd_StatError(t *testing.T) {
@@ -122,9 +131,46 @@ func TestStatusCmd_StatError(t *testing.T) {
 		"--ledger", "fs",
 	)
 	require.Error(t, err)
-	assert.Contains(t, stderr, "stat ledger")
-	assert.NotContains(t, stderr, "no ledger at")
+	assert.Contains(t, stderr, "stat event log")
+	assert.NotContains(t, stderr, "no event log at")
 	requireExitCode(t, err, exitRuntimeError)
+}
+
+// `wonka status --ledger beads` must route to <repo>/.beads/, not
+// <runDir>/ledger/. The load-bearing observable is NewBeadsStore's
+// MkdirAll side effect: status with --ledger=beads must create
+// <repo>/.beads/ (proving the resolver returned that path), and
+// <runDir>/ledger/ contents must not leak into output even when
+// pre-seeded (proving status didn't silently fall back to FS).
+func TestStatusCmd_BeadsRoutesToRepoDotBeads(t *testing.T) {
+	runDir := t.TempDir()
+	repo := t.TempDir()
+	seedFSLedger(t, runDir, []*orch.Task{
+		{
+			ID:     "runfeat-decoy",
+			Title:  "DECOY-RUNDIR-LEDGER",
+			Status: orch.StatusOpen,
+			Labels: map[string]string{
+				orch.LabelRole:   "builder",
+				orch.LabelBranch: "feat-x",
+			},
+		},
+	})
+
+	err, stdout, stderr := runStatusCmd(t,
+		"status",
+		"--branch", "feat-x",
+		"--run-dir", runDir,
+		"--repo", repo,
+		"--ledger", "beads",
+	)
+	// Status either succeeds (Dolt reachable) or errors (Dolt unreachable);
+	// either way the path must have been routed to <repo>/.beads/.
+	assert.DirExists(t, filepath.Join(repo, ".beads"),
+		"status --ledger=beads must MkdirAll <repo>/.beads via NewBeadsStore — absence proves the resolver mis-routed")
+	assert.NotContains(t, stdout+stderr, "DECOY-RUNDIR-LEDGER",
+		"<runDir>/ledger contents must not leak — status must not silently fall back to FS for --ledger=beads")
+	_ = err // surface either outcome; the path-routing assertion is what matters
 }
 
 // TestStatusCmd_EmptyLedger runs against a freshly created (empty) store

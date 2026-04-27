@@ -79,6 +79,17 @@ Each task runs in an isolated tmux session (socket `wonka-<runID>`, session name
 | `wonka resume` | Re-enter an interrupted lifecycle (reconciles stale state). Reads the work-package from existing state. |
 | `wonka status` | Print tasks for the branch (table; `--json` for scripts).       |
 
+## Ledger backends
+
+`--ledger beads` (default) opens `<repo>/.beads/` — the same database Charlie writes to with `bd create`. Wonka's dispatcher and the planner share one ledger; this is the BVV-DSN-04 contract that makes end-to-end lifecycles work. Two operator-visible consequences:
+
+- **`bd list` from the target repo shows tasks across all branches.** A single bd database holds every wonka run against this repo, distinguished only by `branch:<name>` labels. For a single-branch view, use `wonka status --branch X` or `bd list --label branch:X`.
+- **Concurrent wonka runs against different branches in the same repo share the bd backend.** Per-branch lifecycle locks at `<run-dir>/.wonka-<branch>.lock` prevent two runs from clobbering the same branch, but cross-branch writes from different Charlies hit the same database. Beads' transaction model handles this; expect bd's storage layer to be the contention point if you run many branches in parallel.
+
+When `<repo>/.beads/` is missing, `wonka run --ledger beads` invokes `bd init --stealth --non-interactive --quiet` to bootstrap it. `--stealth` keeps git hooks out of the operator's repo. A stderr warning naming the path surfaces this so operators notice the mutation before committing. `bd` must be on PATH; `BuildEngineConfig` fail-fasts before any lock acquisition if it is missing.
+
+`--ledger fs` keeps the legacy per-run-dir store at `<run-dir>/ledger/`. It is dev-convenience only — Charlie writes to bd unconditionally, so a full lifecycle requires `--ledger beads`. `--ledger fs` is useful for unit tests and Level 1-3 smoke checks where Charlie is not invoked.
+
 ## Work package
 
 A work package is a directory with two Markdown files:

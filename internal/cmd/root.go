@@ -9,8 +9,9 @@ import (
 
 // Exit codes returned via *exitError and mapped by main.
 // 130 is the conventional SIGINT exit code — distinguishes a Ctrl-C from
-// an operational failure. Lock contention and corruption use distinct codes
-// so scripts can branch on "wait and retry" vs "human intervention".
+// an operational failure. exitLockCorrupt (3) covers any unparseable
+// persistent state (lock file or event log) — semantically "don't retry,
+// human fix".
 const (
 	exitRuntimeError    = 1
 	exitConfigError     = 2

@@ -160,15 +160,21 @@ bd create \
 
 - **build task:** `role:builder`, `critical:true` for migrations/infrastructure, depends at minimum on `$ORCH_TASK_ID`. Description lists target files, success criteria (AC-*), `functional-spec.md` refs, and the `CLAUDE.md` sections that informed any architectural choices.
 - **V&V task:** `role:verifier`, typically non-critical, depends on the build task(s) it verifies. Description lists verification criteria (V-*) and vv-spec refs.
-- **gate task:** `role:gate`, `critical:true`, priority 999, depends on every V&V task (directly or transitively). Exactly one per lifecycle. Description names the PR flow.
+- **gate task:** `role:gate`, `critical:true`, priority 4, depends on every V&V task (directly or transitively). Exactly one per lifecycle. Description names the PR flow.
 
 ### Priority scheme
 
-- Build tasks: priority = dependency depth from the plan task (deeper = higher).
+Priority is 0-4 (lower = dispatched first). The `bd` CLI rejects values outside this range even though the Go SDK accepts any int.
+
+- Build tasks: priority = dependency depth from the plan task (deeper = higher), capped at 3.
 - V&V tasks: inherit the highest priority among their build dependencies.
-- Gate task: 999.
+- Gate task: 4 — the last task scheduled among independents.
 
 Priority controls dispatch order among independent tasks; deeper builds dispatch later so their prerequisites finish first.
+
+### Task IDs from `bd create`
+
+`bd create --json` returns IDs prefixed with the repo's beads database name plus a random suffix (e.g. `myrepo-7ze`). Use the returned IDs verbatim in `--deps` arguments — do not invent ID schemes. Always capture the JSON output and parse `.id` for the next `--deps` reference.
 
 ### Traceability (BVV-TG-04)
 
@@ -237,7 +243,7 @@ Apply in order; first match wins.
 4. **Traceability is mandatory** — every task description references the spec sections it covers.
 5. **Serialize on file overlap** — if two build tasks write to the same files, add a dep edge (D11, Phase 2 Step 4).
 6. **Don't overspecialize** — one build task per cohesive slice, not per function.
-7. **Gate is always last** — exactly one `role:gate` task, depending on all V&V tasks, priority 999.
+7. **Gate is always last** — exactly one `role:gate` task, depending on all V&V tasks, priority 4.
 
 ---
 

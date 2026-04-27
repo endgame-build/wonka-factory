@@ -91,6 +91,19 @@ run_briefly() {
     esac
 }
 
+# run_briefly_beads is the --ledger beads variant. Routes the ledger to
+# <target>/.beads/ (shared with bd) and uses a longer wait because the
+# beads-backed seed write goes through Dolt's SQL layer, which is slower
+# than the FS write.
+run_briefly_beads() {
+    local target="$1"; shift
+    "$WONKA" run --repo "$target" --ledger beads --run-dir "$target/.wonka/run" "$@" >/dev/null 2>&1 &
+    local pid=$!
+    sleep 4
+    kill -INT "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
 # read_seed_field extracts a single field from the seeded planner task JSON.
 # Routed through jq because the labels map order isn't stable across writes,
 # so a grep-based check would be flaky. jq is already a hard dep elsewhere
@@ -201,6 +214,104 @@ level2_seed() {
 }
 
 # ----------------------------------------------------------------------
+# Level 2b — Beads-backed routing contract (single-ledger fix)
+#
+# Pins the *routing* half of the BVV-DSN-04 contract: --ledger beads
+# must NOT create <run-dir>/.wonka/<branch>/ledger/ (the dual-ledger
+# regression). This level deliberately does NOT assert that the seed
+# is fully visible via `bd list` — beads end-to-end depends on a
+# running Dolt SQL server (and on a dot-free repo path because of a
+# known bd database-name bug), both of which are out of this PR's
+# scope per docs/SINGLE_LEDGER_ROUTING_PLAN.md.
+#
+# Skipped when bd is not on PATH so dev machines without bd don't
+# fail the smoke run.
+# ----------------------------------------------------------------------
+level2b_beads_routing() {
+    section "Level 2b: Beads routing contract (--ledger beads)"
+
+    if ! command -v bd >/dev/null 2>&1; then
+        printf "  \033[33m⊘\033[0m bd not on PATH — skipping beads routing smoke (gated dependency)\n"
+        return
+    fi
+
+    # The beads SDK that wonka links against requires a running Dolt SQL
+    # server (the bd CLI alone falls back to embedded mode, but the SDK
+    # does not). Without Dolt, NewBeadsStore fails before wonka writes
+    # any FS state — which would make the routing assertion below pass
+    # vacuously. The header above already documents that beads
+    # end-to-end is out of scope for this PR; this gate enforces it.
+    if ! bd dolt test >/dev/null 2>&1; then
+        printf "  \033[33m⊘\033[0m Dolt SQL server not running — skipping beads routing smoke (run 'bd dolt start' to enable)\n"
+        return
+    fi
+
+    # Use a dot-free target dir to sidestep the known bd database-name
+    # bug (database names containing dots are rejected by Dolt). When
+    # that bug is resolved upstream we can delete this workaround.
+    local target; target="$(mktemp -d "${TMPDIR:-/tmp}/wonka-smoke-XXXXXX")"
+    (
+        cd "$target"
+        git init -q
+        touch CLAUDE.md
+        git add CLAUDE.md
+        git -c user.email=t@t -c user.name=t commit -qm init >/dev/null
+        mkdir agents && cp "$ROOT"/agents/*.md agents/
+        mkdir -p work-packages/demo
+        printf '# CAP-1: Demo\n## UC-1.1\nAC-1.1.1: ok.\n' > work-packages/demo/functional-spec.md
+        printf '# V-1: Demo\n- V-1.1: AC-1.1.1 covered.\n' > work-packages/demo/vv-spec.md
+    )
+
+    # Pre-init beads so the routing assertion does not depend on
+    # wonka's auto-init path (that path has its own gated unit test).
+    (cd "$target" && bd init --stealth --non-interactive --quiet)
+
+    run_briefly_beads "$target" --branch feat/demo work-packages/demo/
+
+    # Positive signal: wonka must have actually started. Without this the
+    # absence-of-stray-ledger assertion below would pass vacuously when
+    # `wonka run` exits immediately (e.g., on a config error or missing
+    # dep). events.jsonl is wonka's own resume-detection sentinel — its
+    # presence + parseable first record is the canonical "wonka has
+    # touched this branch" signal (mirrors orch.verifyEventLogParseable).
+    local elog="$target/.wonka/run/events.jsonl"
+    if [ ! -s "$elog" ]; then
+        fail "wonka did not produce an event log" "expected non-empty $elog (wonka likely failed to start)"
+        rm -rf "$target"
+        return
+    fi
+    if ! head -n1 "$elog" | jq -e '.kind != null and .kind != ""' >/dev/null 2>&1; then
+        fail "event log first record unparseable" "$(head -n1 "$elog")"
+        rm -rf "$target"
+        return
+    fi
+    pass "wonka started and wrote a parseable event log (positive run signal)"
+
+    # The load-bearing assertion: the old per-run-dir ledger directory
+    # must NOT exist. If it did, we regressed to the dual-ledger split
+    # that this fix removes (planner writes to bd, dispatcher reads from
+    # the FS — lifecycle stalls at BVV-TG-09).
+    local old_path="$target/.wonka/run/ledger"
+    if [ ! -d "$old_path" ]; then
+        pass "no stray ledger at $old_path (single-ledger contract held)"
+    else
+        fail "stray per-run ledger present" "expected absent at $old_path"
+    fi
+
+    # Confirm wonka actually targeted <repo>/.beads/. The dir was
+    # pre-created by `bd init`; if wonka somehow created its own
+    # parallel store, the old_path check above would already have
+    # caught it. We assert .beads/ still exists as a sanity belt.
+    if [ -d "$target/.beads" ]; then
+        pass "shared ledger at $target/.beads/ intact"
+    else
+        fail ".beads/ missing after wonka run" "expected $target/.beads"
+    fi
+
+    rm -rf "$target"
+}
+
+# ----------------------------------------------------------------------
 # Level 3 — Replan: no-op vs reopen
 # ----------------------------------------------------------------------
 level3_replan() {
@@ -262,6 +373,7 @@ require_tool go
 build_wonka
 level1_cli_surface
 level2_seed
+level2b_beads_routing
 level3_replan
 
 section "Summary"
