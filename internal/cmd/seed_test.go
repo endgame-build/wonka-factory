@@ -223,8 +223,9 @@ func TestSeedPlannerTask_ReopensWhenFailedHashDiffers(t *testing.T) {
 // Assignee set would make ReadyTasks(branch) skip the row (FSStore filter:
 // `Status != Open || Assignee != ""`), silently stranding the lifecycle:
 // dispatch sees no work, no event explains why, the user waits forever.
-// Mirrors the retry path in dispatch.go:309 which already clears Assignee
-// on its own terminal-to-open move.
+// The shared invariant: any transition into StatusOpen must clear Assignee.
+// dispatch.go:309 enforces it for the retry path (in_progress → open); this
+// test pins the same invariant for the seed replan path (terminal → open).
 func TestSeedPlannerTask_ReopenClearsAssignee(t *testing.T) {
 	store := freshStore(t)
 	wo := seedWorkOrder(t)
