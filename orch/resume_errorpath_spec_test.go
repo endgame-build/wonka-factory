@@ -3,6 +3,7 @@
 package orch_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -236,6 +237,51 @@ func TestEngine_ResumeCorruptEventLogReturnsCorruptSentinel(t *testing.T) {
 	assert.ErrorIs(t, err, orch.ErrCorruptEventLog)
 	assert.NotErrorIs(t, err, orch.ErrResumeNoEventLog,
 		"corrupt-log must not be squashed into the missing sentinel — different recovery action")
+}
+
+// `{}` parses cleanly but has no Kind — must surface as ErrCorruptEventLog,
+// not pass the sentinel check.
+func TestEngine_ResumeEmptyObjectFirstRecordCorrupt(t *testing.T) {
+	runDir := t.TempDir()
+	logPath := filepath.Join(runDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(logPath, []byte("{}\n"), 0o644))
+
+	cfg := orch.DefaultEngineConfig(
+		testutil.MockLifecycleConfig("feat-x", "builder"),
+		runDir, "/repo")
+	cfg.RunID = "run-1"
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+
+	err = e.Resume(context.Background())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, orch.ErrCorruptEventLog)
+	assert.Contains(t, err.Error(), "no event kind")
+}
+
+// First record exceeding maxEventLogLine (16 MiB) must surface as
+// ErrCorruptEventLog, not the generic runtime-error path.
+func TestEngine_ResumeOversizeFirstRecordCorrupt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes >16 MiB; skipped under -short")
+	}
+	runDir := t.TempDir()
+	logPath := filepath.Join(runDir, "events.jsonl")
+	require.NoError(t, os.WriteFile(logPath, bytes.Repeat([]byte("x"), 17*1024*1024), 0o644))
+
+	cfg := orch.DefaultEngineConfig(
+		testutil.MockLifecycleConfig("feat-x", "builder"),
+		runDir, "/repo")
+	cfg.RunID = "run-1"
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+
+	err = e.Resume(context.Background())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, orch.ErrCorruptEventLog)
+	assert.NotErrorIs(t, err, orch.ErrResumeNoEventLog)
 }
 
 // TestEngine_ResumeNonNotExistEventLogStatErrorDoesNotMapToSentinel covers I4

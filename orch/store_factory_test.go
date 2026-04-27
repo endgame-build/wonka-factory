@@ -66,6 +66,19 @@ func TestEnsureBeadsInitialised_AlreadyExists(t *testing.T) {
 	assert.False(t, created, "must return created=false when .beads/ already exists")
 }
 
+// A regular file at <repo>/.beads must be rejected, not silently treated
+// as initialised.
+func TestEnsureBeadsInitialised_RegularFileRejected(t *testing.T) {
+	repo := t.TempDir()
+	beadsPath := filepath.Join(repo, ".beads")
+	require.NoError(t, os.WriteFile(beadsPath, []byte("not a dir"), 0o644))
+
+	created, err := orch.EnsureBeadsInitialised(repo)
+	assert.False(t, created)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a directory")
+}
+
 // TestEnsureBeadsInitialised_NoBdReturnsCLIMissing pins the fail-fast
 // behavior when bd is not on PATH: a clear sentinel rather than a confusing
 // downstream error from beads.Open. PATH is cleared for the test so the

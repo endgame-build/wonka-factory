@@ -156,7 +156,7 @@ func classifyEngineError(err error, branch string, stderr io.Writer) error {
 		return die(stderr, exitLockCorrupt, "lifecycle lock corrupt: %s", err)
 
 	case errors.Is(err, os.ErrPermission):
-		return die(stderr, exitConfigError, "permission denied — check ownership/mode of the run directory and its ledger subdirectory (%s)", err)
+		return die(stderr, exitConfigError, "permission denied — check ownership/mode of the run directory and the ledger location (<run-dir>/ledger for --ledger fs, <repo>/.beads for --ledger beads): %s", err)
 
 	// Validation-family sentinels come from bad input (operator-passed label
 	// filters, env keys, task IDs). Retrying without fixing the data won't

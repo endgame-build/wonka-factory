@@ -109,7 +109,12 @@ func EnsureBeadsInitialised(repoPath string) (bool, error) {
 		return false, fmt.Errorf("ensure beads: empty repo path")
 	}
 	beadsDir := filepath.Join(repoPath, ".beads")
-	if _, err := os.Stat(beadsDir); err == nil {
+	// Stat returns nil for both files and directories; reject non-directories
+	// so a stray file at .beads doesn't masquerade as an initialised store.
+	if info, err := os.Stat(beadsDir); err == nil {
+		if !info.IsDir() {
+			return false, fmt.Errorf("ensure beads: %s exists but is not a directory", beadsDir)
+		}
 		return false, nil
 	} else if !os.IsNotExist(err) {
 		return false, fmt.Errorf("stat beads dir %s: %w", beadsDir, err)

@@ -387,7 +387,10 @@ func verifyEventLogParseable(logPath string) error {
 	scanner := newEventLogScanner(f)
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {
-			return fmt.Errorf("engine: read event log: %w", err)
+			// First-record scan errors (bufio.ErrTooLong, I/O) mean the log
+			// is unreadable; route through the corrupt sentinel so callers
+			// can distinguish "missing" from "broken".
+			return fmt.Errorf("engine: %w: %s: %v", ErrCorruptEventLog, logPath, err)
 		}
 		// Zero-byte file or no lines — treat as missing so the operator
 		// gets a "use `wonka run`" hint rather than the corrupt sentinel.
