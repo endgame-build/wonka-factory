@@ -235,6 +235,17 @@ level2b_beads_routing() {
         return
     fi
 
+    # The beads SDK that wonka links against requires a running Dolt SQL
+    # server (the bd CLI alone falls back to embedded mode, but the SDK
+    # does not). Without Dolt, NewBeadsStore fails before wonka writes
+    # any FS state — which would make the routing assertion below pass
+    # vacuously. The header above already documents that beads
+    # end-to-end is out of scope for this PR; this gate enforces it.
+    if ! bd dolt test >/dev/null 2>&1; then
+        printf "  \033[33m⊘\033[0m Dolt SQL server not running — skipping beads routing smoke (run 'bd dolt start' to enable)\n"
+        return
+    fi
+
     # Use a dot-free target dir to sidestep the known bd database-name
     # bug (database names containing dots are rejected by Dolt). When
     # that bug is resolved upstream we can delete this workaround.
@@ -256,6 +267,25 @@ level2b_beads_routing() {
     (cd "$target" && bd init --stealth --non-interactive --quiet)
 
     run_briefly_beads "$target" --branch feat/demo work-packages/demo/
+
+    # Positive signal: wonka must have actually started. Without this the
+    # absence-of-stray-ledger assertion below would pass vacuously when
+    # `wonka run` exits immediately (e.g., on a config error or missing
+    # dep). events.jsonl is wonka's own resume-detection sentinel — its
+    # presence + parseable first record is the canonical "wonka has
+    # touched this branch" signal (mirrors orch.verifyEventLogParseable).
+    local elog="$target/.wonka/run/events.jsonl"
+    if [ ! -s "$elog" ]; then
+        fail "wonka did not produce an event log" "expected non-empty $elog (wonka likely failed to start)"
+        rm -rf "$target"
+        return
+    fi
+    if ! head -n1 "$elog" | jq -e '.kind != null and .kind != ""' >/dev/null 2>&1; then
+        fail "event log first record unparseable" "$(head -n1 "$elog")"
+        rm -rf "$target"
+        return
+    fi
+    pass "wonka started and wrote a parseable event log (positive run signal)"
 
     # The load-bearing assertion: the old per-run-dir ledger directory
     # must NOT exist. If it did, we regressed to the dual-ledger split

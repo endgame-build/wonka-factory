@@ -321,6 +321,54 @@ func TestEngine_ResumeNonNotExistEventLogStatErrorDoesNotMapToSentinel(t *testin
 	assert.Contains(t, err.Error(), "stat event log")
 }
 
+// TestEngine_ResumeLedgerMissingReturnsSentinel pins the ErrResumeLedgerMissing
+// wrap. If events.jsonl is parseable but the ledger directory has been removed
+// (e.g., operator deleted <runDir>/ledger/ between runs while leaving the event
+// log), Resume must fail-fast rather than letting NewFSStore silently re-create
+// an empty store via os.MkdirAll. Recovering against an empty ledger would
+// replay events into a void and report a clean resume despite total state loss.
+func TestEngine_ResumeLedgerMissingReturnsSentinel(t *testing.T) {
+	runDir := t.TempDir()
+	seedFreshEventLog(t, runDir)
+	// Ledger dir intentionally absent.
+
+	cfg := orch.DefaultEngineConfig(
+		testutil.MockLifecycleConfig("feat-x", "builder"),
+		runDir, "/repo")
+	cfg.RunID = "run-1"
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+
+	err = e.Resume(context.Background())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, orch.ErrResumeLedgerMissing)
+	assert.NotErrorIs(t, err, orch.ErrResumeNoEventLog,
+		"missing ledger must not be squashed into ErrResumeNoEventLog — different recovery semantics")
+}
+
+// TestEngine_ResumeLedgerNotADirectoryReturnsSentinel pins the non-dir branch
+// of the ledger-existence check. A regular file at the ledger path is
+// suspicious enough to halt rather than blunder through NewFSStore.
+func TestEngine_ResumeLedgerNotADirectoryReturnsSentinel(t *testing.T) {
+	runDir := t.TempDir()
+	seedFreshEventLog(t, runDir)
+	// Place a regular file where the ledger directory should be.
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, "ledger"), []byte("not a dir"), 0o644))
+
+	cfg := orch.DefaultEngineConfig(
+		testutil.MockLifecycleConfig("feat-x", "builder"),
+		runDir, "/repo")
+	cfg.RunID = "run-1"
+
+	e, err := orch.NewEngine(cfg)
+	require.NoError(t, err)
+
+	err = e.Resume(context.Background())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, orch.ErrResumeLedgerMissing)
+}
+
 // TestEngine_ResumeCorruptLockAborts verifies C3: a lock file that cannot be
 // parsed aborts Resume with ErrCorruptLock rather than silently fabricating
 // a fresh RunID and orphaning the surviving tmux socket (BVV-ERR-08 hazard).
@@ -328,9 +376,12 @@ func TestEngine_ResumeCorruptLockAborts(t *testing.T) {
 	runDir := t.TempDir()
 	branch := "feat-x"
 
-	// Pre-create event log so initForResume passes the existence check.
+	// Pre-create event log + ledger dir so initForResume passes both
+	// sentinel checks (event log parseable, ledger present) and reaches
+	// the lock-recovery step under test.
 	require.NoError(t, os.WriteFile(filepath.Join(runDir, "events.jsonl"),
 		[]byte(`{"kind":"lifecycle_started","summary":"prior","timestamp":"2026-01-01T00:00:00Z"}`+"\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(runDir, "ledger"), 0o755))
 
 	// Write a corrupt lock file.
 	lockPath := filepath.Join(runDir, ".wonka-"+branch+".lock")

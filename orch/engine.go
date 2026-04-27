@@ -343,6 +343,11 @@ func (e *Engine) init() error {
 //   - event log first record unparseable: wraps ErrCorruptEventLog. A prior
 //     run started and crashed mid-write; recovery would replay an undefined
 //     stream, so this is operator-intervention territory.
+//   - ledger directory missing: wraps ErrResumeLedgerMissing. The event
+//     log lives in RunDir but the ledger may live elsewhere (<repo>/.beads/
+//     for beads), so they can drift apart. Both store constructors call
+//     os.MkdirAll, so without this guard a deleted ledger would be
+//     silently recreated.
 //   - lock corrupt: returns ErrCorruptLock. Silently fabricating a fresh
 //     RunID would orphan any live tmux socket (BVV-ERR-08 violation) and
 //     race the live orchestrator against the ledger (BVV-S-03 hazard).
@@ -353,6 +358,18 @@ func (e *Engine) initForResume() error {
 	}
 
 	ledgerDir := ResolveLedgerDir(e.cfg.RepoPath, e.cfg.RunDir, e.cfg.LedgerKind, e.testLedgerDir)
+	// Permission-denied / EIO must NOT collapse into ErrResumeLedgerMissing
+	// — that would mask filesystem failures as "delete and re-run".
+	info, err := os.Stat(ledgerDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("engine: %w: %s", ErrResumeLedgerMissing, ledgerDir)
+		}
+		return fmt.Errorf("engine: stat ledger dir %s: %w", ledgerDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("engine: %w: %s exists but is not a directory", ErrResumeLedgerMissing, ledgerDir)
+	}
 
 	// Recover previous RunID from stale lock file so we can reconnect to
 	// the surviving tmux socket and detect live sessions (BVV-ERR-08).

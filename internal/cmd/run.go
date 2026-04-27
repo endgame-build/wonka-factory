@@ -149,6 +149,9 @@ func classifyEngineError(err error, branch string, stderr io.Writer) error {
 	case errors.Is(err, orch.ErrCorruptEventLog):
 		return die(stderr, exitLockCorrupt, "event log corrupt: %s", err)
 
+	case errors.Is(err, orch.ErrResumeLedgerMissing):
+		return die(stderr, exitLockCorrupt, "ledger directory missing on resume for branch %q — restore from backup or start fresh with 'wonka run --branch %s' (%s)", branch, branch, err)
+
 	case errors.Is(err, orch.ErrLockContention):
 		return die(stderr, exitLockBusy, "branch %q is already being processed by another wonka process — wait for it to finish, or run 'wonka status --branch %s' to inspect (%s)", branch, branch, err)
 

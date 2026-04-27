@@ -27,6 +27,7 @@ func TestErrorSentinels_DistinctAndWrappable(t *testing.T) {
 		ErrLockContention,
 		ErrResumeNoEventLog,
 		ErrCorruptEventLog,
+		ErrResumeLedgerMissing,
 		ErrHandoffLimitReached,
 		ErrInvalidLabelFilter,
 		ErrInvalidID,

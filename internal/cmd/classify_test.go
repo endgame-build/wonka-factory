@@ -24,6 +24,7 @@ import (
 //   - context.DeadlineExceeded → exit 130 (same path as signal)
 //   - ErrResumeNoEventLog → exit 2   (BVV-ERR-07: config error, not failure)
 //   - ErrCorruptEventLog  → exit 3   (operator intervention)
+//   - ErrResumeLedgerMissing → exit 3 (operator intervention; defends against silent re-create)
 //   - ErrLockContention   → exit 4   (BVV-ERR-06: retryable)
 //   - ErrCorruptLock      → exit 3   (BVV-ERR-08: human intervention)
 //   - os.ErrPermission    → exit 2   (operator fixable — chmod/chown)
@@ -70,6 +71,12 @@ func TestClassifyEngineError(t *testing.T) {
 			err:        orch.ErrCorruptEventLog,
 			wantCode:   exitLockCorrupt,
 			wantStderr: "event log corrupt",
+		},
+		{
+			name:       "resume_ledger_missing_exit_3",
+			err:        orch.ErrResumeLedgerMissing,
+			wantCode:   exitLockCorrupt,
+			wantStderr: "ledger directory missing",
 		},
 		{
 			name:       "lock_contention_exit_4",

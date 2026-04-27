@@ -36,6 +36,13 @@ var (
 	// mid-write, which is operator-intervention territory (recovery would
 	// otherwise replay an undefined event stream).
 	ErrCorruptEventLog = errors.New("event log first record unparseable — operator intervention required")
+
+	// ErrResumeLedgerMissing signals that initForResume found a parseable
+	// event log but the ledger directory has been removed. Both store
+	// constructors call os.MkdirAll, so without this guard the dir would
+	// be silently recreated and the log replayed into an empty store —
+	// state loss disguised as resume.
+	ErrResumeLedgerMissing = errors.New("ledger directory missing on resume — operator intervention required")
 )
 
 // Sentinel errors for input validation.
