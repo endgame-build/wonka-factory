@@ -106,6 +106,36 @@ func TestSeedPlannerTask_NoOpWhenInProgress(t *testing.T) {
 	assert.Equal(t, orch.StatusInProgress, got.Status)
 	assert.Equal(t, "worker-1", got.Assignee, "assignee must survive — touching this would orphan the worker's session")
 	assert.Equal(t, "/old/path", got.Body)
+	assert.Equal(t, "stale", got.Labels[orch.LabelWorkOrderHash], "in-progress task hash must not be touched")
+}
+
+// TestSeedPlannerTask_NoOpWhenAssigned closes the gap between Open and
+// InProgress in the no-op matrix. SeedPlannerTask keys on
+// !Status.Terminal(), which covers all three mid-flight states; without
+// this test, a regression flipping the predicate to
+// `== StatusOpen || == StatusInProgress` would silently corrupt assigned
+// tasks (orphaning the worker that's about to start on respawn).
+func TestSeedPlannerTask_NoOpWhenAssigned(t *testing.T) {
+	store := freshStore(t)
+	wo := seedWorkOrder(t)
+
+	now := time.Now().UTC()
+	require.NoError(t, store.CreateTask(&orch.Task{
+		ID: plannerTaskID("feat/x"), Title: "plan-feat-x",
+		Body: "/old/path", Status: orch.StatusAssigned,
+		Assignee:  "worker-1",
+		Labels:    map[string]string{orch.LabelRole: orch.RolePlanner, orch.LabelBranch: "feat/x", orch.LabelCriticality: string(orch.Critical), orch.LabelWorkOrderHash: "stale"},
+		CreatedAt: now, UpdatedAt: now,
+	}))
+
+	require.NoError(t, SeedPlannerTask(store, "feat/x", wo))
+
+	got, err := store.GetTask(plannerTaskID("feat/x"))
+	require.NoError(t, err)
+	assert.Equal(t, orch.StatusAssigned, got.Status)
+	assert.Equal(t, "worker-1", got.Assignee, "assignee must survive — touching this would orphan the worker's session")
+	assert.Equal(t, "/old/path", got.Body)
+	assert.Equal(t, "stale", got.Labels[orch.LabelWorkOrderHash], "assigned-task hash must not be touched")
 }
 
 // TestSeedPlannerTask_NoOpWhenCompletedHashMatches is the steady-state

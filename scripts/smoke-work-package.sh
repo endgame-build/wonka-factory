@@ -73,13 +73,22 @@ seed_target() {
 # acquired and the seed has run. The seed fires synchronously between
 # lifecycle_started and the first dispatch tick, so 2s is generous; the
 # kill -INT lets the engine shut down cleanly without leaving a stale lock.
+#
+# Accept exit codes {0, 130}: clean lifecycle exit or SIGINT-cancel. Anything
+# else (panic, config error, runtime crash, lock-busy) means the run didn't
+# play out as expected and downstream assertions would read junk ledger state.
 run_briefly() {
     local target="$1"; shift
     "$WONKA" run --repo "$target" --ledger fs --run-dir "$target/.wonka/run" "$@" >/dev/null 2>&1 &
     local pid=$!
     sleep 2
     kill -INT "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    local rc=0
+    wait "$pid" 2>/dev/null || rc=$?
+    case "$rc" in
+        0|130) ;;
+        *) fail "wonka exited unexpectedly" "rc=$rc (expected 0 or 130)" ;;
+    esac
 }
 
 # read_seed_field extracts a single field from the seeded planner task JSON.

@@ -737,6 +737,10 @@ func TestEngine_RunSeedErrorAborts(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, sentinel, "seed errors must wrap so callers can match their sentinels")
 	assert.False(t, dispatchEntered.Load(), "dispatch must not run when seed fails")
+
+	// Seed failure must still emit the §10.3 terminal anchor.
+	assertEventDetailContains(t, filepath.Join(runDir, "events.jsonl"),
+		orch.EventLifecycleCompleted, "outcome=failed")
 }
 
 // --- Helpers ---

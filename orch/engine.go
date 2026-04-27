@@ -173,13 +173,14 @@ func (e *Engine) Run(ctx context.Context) error {
 	// 6. Optional pre-dispatch seed hook. The CLI uses this to inject a
 	// deterministic planner task from the work-package positional before the
 	// dispatch loop queries ReadyTasks for the first time. orch is
-	// intentionally opaque to what's being seeded (BVV-DSN-04). A Seed error
-	// unwinds the lifecycle — the run never started, so abort cleanly without
-	// emitting a completion event.
+	// intentionally opaque to what's being seeded (BVV-DSN-04). On error,
+	// emitLifecycleFailed must run before Cleanup closes the event log.
 	if e.cfg.Seed != nil {
 		if err := e.cfg.Seed(e.store); err != nil {
+			wrapped := fmt.Errorf("engine: seed: %w", err)
+			e.emitLifecycleFailed(wrapped)
 			Cleanup(e.tmux, e.lock, e.log, e.store)
-			return fmt.Errorf("engine: seed: %w", err)
+			return wrapped
 		}
 	}
 
