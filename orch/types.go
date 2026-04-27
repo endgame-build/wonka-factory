@@ -90,6 +90,12 @@ const (
 	LabelRole        = "role"
 	LabelBranch      = "branch"
 	LabelCriticality = "criticality"
+	// LabelWorkOrderHash carries a SHA-256 over the work-package spec files
+	// on the seeded planner task. The CLI's seed pass compares the current
+	// hash against this label to decide whether a re-run is a no-op or a
+	// replan trigger. Prefixed with "wonka:" so consumers can distinguish
+	// internal accounting from human-meaningful classification labels.
+	LabelWorkOrderHash = "wonka:work-order-hash"
 )
 
 // Role is the typed label value carried in Task.Labels[LabelRole]. A typed
@@ -213,6 +219,13 @@ type Preset struct {
 	// tee (raw JSONL to .stdout) and jq (filtered text to .txt). Empty means
 	// no filtering (plain stdout capture).
 	TextFilter string
+	// KickoffPrompt is appended as the final positional argument to every
+	// invocation. Required for CLIs that demand a user prompt in non-
+	// interactive mode (e.g. claude's --print). The role's system prompt
+	// (injected via SystemPromptFlag) carries the detailed instructions; the
+	// kickoff is just the first user message that nudges the agent into
+	// action. Empty means no positional appended.
+	KickoffPrompt string
 }
 
 // RoleConfig binds a role tag to an instruction file and launch preset.

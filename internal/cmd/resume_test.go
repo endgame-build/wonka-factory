@@ -17,6 +17,22 @@ func TestResumeCmd_RequiresBranch(t *testing.T) {
 	assert.Contains(t, stderr+err.Error(), "branch")
 }
 
+// TestResumeCmd_RejectsPositional pins the run-vs-resume contract: a user
+// who types `wonka resume --branch X work-packages/y` (the run-flow muscle
+// memory) must get a clear hint pointing at `wonka run`, not a cobra default
+// "unknown command" message that loses the work-package value.
+func TestResumeCmd_RejectsPositional(t *testing.T) {
+	err, stderr := runCobra(t,
+		"resume",
+		"--branch", "feat/x",
+		"work-packages/demo",
+	)
+	require.Error(t, err)
+	combined := stderr + err.Error()
+	assert.Contains(t, combined, "wonka run", "must point at the right verb")
+	assert.Contains(t, combined, "work-packages/demo", "must echo the user's argument so they recognize it")
+}
+
 // TestResumeCmd_NoLedger drives through real orch.Engine.Resume with no
 // prior state. orch/resume_errorpath_spec_test.go:170-187 pins the
 // ErrResumeNoLedger wrap — this test pins the *CLI-facing* error wording

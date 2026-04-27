@@ -90,6 +90,47 @@ func TestBVV_DSP04_BuildCommandAssembly(t *testing.T) {
 	}, cmd)
 }
 
+// TestBuildCommand_KickoffPromptLast verifies the KickoffPrompt is appended
+// after every flag. claude's --print mode interprets the trailing positional
+// as the user prompt; if a flag like --max-turns leaks past it, claude either
+// errors or treats the flag-value as the prompt. Pin the order explicitly.
+func TestBuildCommand_KickoffPromptLast(t *testing.T) {
+	preset := &orch.Preset{
+		Name:             "claude",
+		Command:          "claude",
+		Args:             []string{"--print", "--verbose"},
+		SystemPromptFlag: "--append-system-prompt",
+		ModelFlag:        "--model",
+		KickoffPrompt:    "Begin.",
+	}
+	cmd := orch.BuildCommand(preset, "you are a builder", "opus", 20)
+	assert.Equal(t, "Begin.", cmd[len(cmd)-1], "kickoff must be the last positional")
+	assert.Equal(t, []string{
+		"claude",
+		"--print", "--verbose",
+		"--append-system-prompt", "you are a builder",
+		"--model", "opus",
+		"--max-turns", "20",
+		"Begin.",
+	}, cmd)
+}
+
+// TestBuildCommand_KickoffPromptOmittedWhenEmpty verifies the kickoff is
+// skipped when empty — required so presets that don't need a positional
+// (future codex/goose if they support stdin-based agentic mode) don't end up
+// with a stray empty positional that some CLIs would interpret as an
+// empty prompt.
+func TestBuildCommand_KickoffPromptOmittedWhenEmpty(t *testing.T) {
+	preset := &orch.Preset{
+		Command:          "agent",
+		SystemPromptFlag: "--system",
+		// KickoffPrompt deliberately empty.
+	}
+	cmd := orch.BuildCommand(preset, "body", "", 0)
+	assert.Equal(t, []string{"agent", "--system", "body"}, cmd,
+		"empty KickoffPrompt must produce no trailing positional")
+}
+
 // TestBVV_DSP04_BuildCommandOmitsEmptyFlags verifies that empty optionals are
 // skipped. A preset without a ModelFlag should not have "--model" in its cmd;
 // MaxTurns=0 should not append "--max-turns".

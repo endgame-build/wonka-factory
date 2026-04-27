@@ -13,6 +13,9 @@ import (
 //   - SystemPromptFlag drives --append-system-prompt injection (orch/agent.go:32)
 //   - --dangerously-skip-permissions prevents tmux sessions from hanging on
 //     permission prompts (see preset doc comment)
+//   - --print + KickoffPrompt are required for non-interactive operation;
+//     dropping either makes claude exit immediately with "Input must be
+//     provided either through stdin or as a prompt argument"
 //   - TextFilter enables the stream-json → .txt log split used for debugging
 func TestLookupPreset_Claude(t *testing.T) {
 	p, err := LookupPreset("claude")
@@ -26,8 +29,12 @@ func TestLookupPreset_Claude(t *testing.T) {
 	assert.Equal(t, "--model", p.ModelFlag)
 	assert.Contains(t, p.Args, "--dangerously-skip-permissions",
 		"without this, claude blocks on tool-use permission prompts")
+	assert.Contains(t, p.Args, "--print",
+		"without --print, claude rejects --output-format stream-json with 'Input must be provided'")
 	assert.Contains(t, p.Args, "--output-format")
 	assert.Contains(t, p.Args, "stream-json")
+	assert.NotEmpty(t, p.KickoffPrompt,
+		"--print mode requires a positional prompt; empty kickoff means claude exits 1 at startup")
 	assert.NotEmpty(t, p.TextFilter, "stream-json output needs a jq filter for human-readable logs")
 }
 

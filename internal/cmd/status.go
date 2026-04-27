@@ -49,6 +49,7 @@ func newStatusCmd(flags *CLIFlags) *cobra.Command {
 		Long: `Queries the ledger for all tasks labeled branch:<name> and prints them
 as an aligned table (default) or JSON array (--json). Does not acquire
 the lifecycle lock — safe to run while a lifecycle is active.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			format := statusFormatTable
 			if asJSON {

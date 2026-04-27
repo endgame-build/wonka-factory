@@ -34,6 +34,15 @@ type CLIFlags struct {
 	BaseTimeout     time.Duration
 	NoValidateGraph bool // when true, disables BVV-TG-07..10 post-planner validation
 
+	// Run-only positional argument. Path to a work-package directory containing
+	// functional-spec.md and vv-spec.md. When set, the CLI seeds a deterministic
+	// plan-<branch> planner task (encapsulating the prior `bd create` step) and
+	// hashes the spec files into a work-order-hash label so re-runs detect
+	// content changes and reopen the planner for idempotent reconciliation.
+	// Empty for resume/status; resume reads the work-order from the existing
+	// task body, status doesn't need it.
+	WorkOrder string
+
 	// Observability — OBS-04. Empty OTelEndpoint means no-op telemetry; no
 	// network connection is attempted and no data leaves the process.
 	OTelEndpoint string // host:port of OTLP receiver (e.g. "localhost:14317")
@@ -121,13 +130,7 @@ func BuildEngineConfig(flags CLIFlags) (orch.EngineConfig, []string, error) {
 	if agentDir == "" {
 		agentDir = defaultAgentDir
 	}
-	// Relative --agent-dir resolves under --repo, matching --run-dir's
-	// default (<repo>/.wonka/…). Otherwise `wonka run --repo /elsewhere`
-	// with the default "agents" would stat ./agents under the CLI's cwd
-	// instead of under the target repo.
-	if !filepath.IsAbs(agentDir) {
-		agentDir = filepath.Join(repoPath, agentDir)
-	}
+	agentDir = resolveUnderRepo(repoPath, agentDir)
 	if info, err := os.Stat(agentDir); err != nil {
 		return orch.EngineConfig{}, nil, fmt.Errorf("agent directory %q not found: %w", agentDir, err)
 	} else if !info.IsDir() {
@@ -161,6 +164,67 @@ func BuildEngineConfig(flags CLIFlags) (orch.EngineConfig, []string, error) {
 	cfg.MaxWorkers = flags.Workers
 	cfg.LedgerKind = ledger
 	return cfg, warnings, nil
+}
+
+// ResolveWorkOrder converts a CLI-supplied work-order path to an absolute path
+// under repoPath, then verifies the directory and the two required spec files
+// (functional-spec.md, vv-spec.md) exist and are non-empty. Per the design,
+// technical specs live in the target repo's CLAUDE.md — only the WHAT
+// (functional) and PROOF (vv) belong in a per-feature work order.
+//
+// Kept separate from BuildEngineConfig so BuildEngineConfig's signature stays
+// orch-agnostic — orch must not learn what a "work order" is.
+func ResolveWorkOrder(repoPath, raw string) (string, error) {
+	abs, err := filepath.Abs(resolveUnderRepo(repoPath, raw))
+	if err != nil {
+		return "", fmt.Errorf("resolve work-order path %q: %w", raw, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("work-order %q: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("work-order %q is not a directory", abs)
+	}
+	for _, name := range WorkOrderRequiredFiles {
+		st, err := os.Stat(filepath.Join(abs, name))
+		if err != nil {
+			return "", fmt.Errorf("work-order missing %s: %w", name, err)
+		}
+		// Reject non-regular entries (most commonly a directory named like the
+		// spec, e.g. functional-spec.md/). Without this guard, validation passes
+		// — directory FileInfo.Size() is non-zero on most filesystems — and the
+		// failure surfaces later inside hashWorkOrder under the lifecycle lock,
+		// turning a config error into a runtime error after side effects.
+		if !st.Mode().IsRegular() {
+			return "", fmt.Errorf("work-order %s is not a regular file", name)
+		}
+		if st.Size() == 0 {
+			return "", fmt.Errorf("work-order %s is empty", name)
+		}
+	}
+	return abs, nil
+}
+
+// resolveUnderRepo joins a relative path against repoPath, matching the
+// project convention that operator-supplied paths (--agent-dir, work-order
+// positional) resolve under --repo so `wonka run --repo /elsewhere foo`
+// reads /elsewhere/foo, not <cwd>/foo. Absolute paths pass through unchanged.
+func resolveUnderRepo(repoPath, raw string) string {
+	if filepath.IsAbs(raw) {
+		return raw
+	}
+	return filepath.Join(repoPath, raw)
+}
+
+// WorkOrderRequiredFiles are the two spec files Charlie reads during ORIENT.
+// Order matters for hashing in seed.go: changing this order invalidates every
+// previously-stored work-order-hash label, forcing spurious replan on the next
+// `wonka run`. Treat as append-only — and document any addition as a hash
+// scheme bump in the changelog.
+var WorkOrderRequiredFiles = []string{
+	"functional-spec.md",
+	"vv-spec.md",
 }
 
 // parseLedgerKind validates --ledger input and returns the orch LedgerKind
