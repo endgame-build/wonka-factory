@@ -13,12 +13,14 @@ import (
 // these static inputs — no content-derived or content-predicated arguments
 // (BVV-DSN-04 phase-agnostic, BVV-DSP-04 exit-code-only outcome).
 //
-// systemPromptValue is what gets passed verbatim to preset.SystemPromptFlag —
-// for the claude preset that's a path to a sidecar prompt file written by
-// SpawnSession (see PromptPath), keeping large instruction bodies out of the
-// tmux command buffer. Other presets that prefer the body-form flag can pass
-// the body directly. model overrides the preset default via preset.ModelFlag.
-// maxTurns appends --max-turns when > 0; zero means "preset default".
+// systemPromptValue is what gets passed verbatim to preset.SystemPromptFlag.
+// SpawnSession decides body-or-path based on preset.SystemPromptIsFile:
+// for file-form presets (e.g. claude with --append-system-prompt-file), it's
+// a path to a sidecar written by SpawnSession (see PromptPath), keeping
+// large instruction bodies out of the tmux command buffer; for body-form
+// presets it's the literal body. BuildCommand itself is content-agnostic.
+// model overrides the preset default via preset.ModelFlag. maxTurns appends
+// --max-turns when > 0; zero means "preset default".
 //
 // Per the BVV plan, agent identity no longer flows through a dedicated CLI
 // flag — the task's role label is resolved to a RoleConfig by the dispatcher,
@@ -54,8 +56,9 @@ func BuildCommand(preset *Preset, systemPromptValue, model string, maxTurns int)
 // `bd show $ORCH_TASK_ID`.
 //
 // BVV drops the fork's ORCH_ROLE and ORCH_WORKSPACE: roles are encoded in
-// the instruction file (injected via --append-system-prompt), and BVV agents
-// commit to the branch instead of writing to a workspace directory.
+// the instruction file (injected via the preset's SystemPromptFlag, body-
+// or file-form per SystemPromptIsFile), and BVV agents commit to the
+// branch instead of writing to a workspace directory.
 func BuildEnv(workerName, runID, repoPath, taskID, branch string, presetEnv map[string]string) map[string]string {
 	env := make(map[string]string, len(presetEnv)+5)
 	for k, v := range presetEnv {
@@ -77,19 +80,23 @@ func LogPath(runDir, taskID string) string {
 }
 
 // PromptPath returns the canonical sidecar file path for an agent's system
-// prompt. SpawnSession writes the role instruction body here and passes the
-// path to claude via --append-system-prompt-file rather than inlining the
-// content into the tmux command — large prompts (CHARLIE.md is ~16 KB)
-// overflow tmux's command-parsing buffer on macOS otherwise (`tmux: command
-// too long`). The threshold depends on tmux build options and platform
-// ARG_MAX, so we side-step it entirely by always using a file.
+// prompt. For file-form presets (Preset.SystemPromptIsFile == true),
+// SpawnSession writes the role instruction body here and passes the path
+// via the preset's SystemPromptFlag (e.g. --append-system-prompt-file)
+// rather than inlining the content into the tmux command — large prompts
+// (CHARLIE.md is ~16 KB) overflow tmux's command-parsing buffer on macOS
+// otherwise (`tmux: command too long`). The threshold depends on tmux
+// build options and platform ARG_MAX, so we side-step it entirely by
+// always using a file when the preset declares file-form.
 func PromptPath(runDir, taskID string) string {
 	return filepath.Join(runDir, "logs", taskID+".prompt.md")
 }
 
 // ReadAgentPrompt reads a role instruction file, strips YAML frontmatter,
-// and returns the body (suitable for --append-system-prompt injection) plus
-// the model name from the frontmatter (suitable for --model).
+// and returns the body (passed inline for body-form presets, or written to
+// PromptPath() and passed by reference for file-form presets — see
+// SpawnSession) plus the model name from the frontmatter (suitable for
+// --model).
 //
 // An empty instructionFile short-circuits with ("", "", nil) — the caller
 // explicitly opted out of custom instructions, and generic presets that

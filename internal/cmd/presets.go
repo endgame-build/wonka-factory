@@ -15,12 +15,13 @@ import (
 const jqExtractText = `select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text // empty`
 
 // SystemPromptFlag uses --append-system-prompt-file (path), not
-// --append-system-prompt (body value), because the role instruction body
-// is large enough to overflow tmux's command-parsing buffer on macOS —
+// --append-system-prompt (body value), with SystemPromptIsFile=true to
+// declare file-form to orch.SpawnSession. The role instruction body is
+// large enough to overflow tmux's command-parsing buffer on macOS —
 // `tmux new-session bash -c "<long string>"` rejects with "command too
 // long" once the bash -c argument crosses ~8 KB, and CHARLIE.md alone is
-// ~16 KB. orch.SpawnSession writes the body to a sidecar file at
-// orch.PromptPath(runDir, taskID) before launching the session and
+// ~16 KB. With the file-form bit set, orch.SpawnSession writes the body
+// to orch.PromptPath(runDir, taskID) before launching the session and
 // passes the path to claude here. --dangerously-skip-permissions is
 // required: without it claude blocks on tool-use prompts and
 // orchestrated sessions hang. --print is required for non-interactive
@@ -31,15 +32,16 @@ const jqExtractText = `select(.type == "assistant") | .message.content[]? | sele
 // is sufficient.
 var presets = map[string]*orch.Preset{
 	"claude": {
-		Name:             "claude",
-		Command:          "claude",
-		Args:             []string{"--dangerously-skip-permissions", "--print", "--output-format", "stream-json", "--verbose"},
-		SystemPromptFlag: "--append-system-prompt-file",
-		ModelFlag:        "--model",
-		ProcessNames:     []string{"node", "claude"},
-		Env:              map[string]string{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "99"},
-		TextFilter:       jqExtractText,
-		KickoffPrompt:    "Begin.",
+		Name:               "claude",
+		Command:            "claude",
+		Args:               []string{"--dangerously-skip-permissions", "--print", "--output-format", "stream-json", "--verbose"},
+		SystemPromptFlag:   "--append-system-prompt-file",
+		SystemPromptIsFile: true,
+		ModelFlag:          "--model",
+		ProcessNames:       []string{"node", "claude"},
+		Env:                map[string]string{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "99"},
+		TextFilter:         jqExtractText,
+		KickoffPrompt:      "Begin.",
 	},
 }
 
