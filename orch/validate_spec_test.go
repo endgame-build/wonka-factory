@@ -129,6 +129,39 @@ func TestBVV_TG07_MissingRole(t *testing.T) {
 	assert.Contains(t, ve.TaskIDs, "roleless-1")
 }
 
+// TestBVV_TG07_KnownButUnconfiguredRole verifies that any role accepted
+// by Role.Valid() (orch/types.go) passes TG-07 even when the CLI's
+// lifecycle.Roles map omits its handler. The dispatcher routes such
+// tasks via BVV-DSP-03a escalation at runtime; rejecting them at the
+// validator stage would block any planner emitting a role wonka doesn't
+// ship a handler for — the motivating case being role:gate, which
+// CHARLIE.md mandates but the default CLI doesn't register.
+//
+// Table-driven across all four dispatchable closed-set roles so a
+// regression that narrows Role.Valid() (e.g. "only gate is exempt")
+// fails here rather than passing because gate happens to be the case
+// the test fixture exercises.
+func TestBVV_TG07_KnownButUnconfiguredRole(t *testing.T) {
+	cases := []struct {
+		name        string
+		omittedRole string // role to remove from the configured map
+	}{
+		{"gate_unconfigured", "gate"},
+		{"builder_unconfigured", "builder"},
+		{"verifier_unconfigured", "verifier"},
+		{"planner_unconfigured", "planner"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store := testutil.NewMockStore()
+			buildWellFormedGraph(t, store, "feat/x")
+			roles := standardRoles()
+			delete(roles, c.omittedRole)
+			assert.NoError(t, orch.ValidateLifecycleGraph(store, "feat/x", roles))
+		})
+	}
+}
+
 // TestBVV_TG07_EscalationExempt verifies that role:escalation tasks do
 // not trigger TG-07 failures even though "escalation" is never in the
 // configured role set. Escalations are orchestrator-created human inboxes,
@@ -345,6 +378,23 @@ func TestBVV_TG07to10_AssertPostPlannerWellFormed_NoOpOnValid(t *testing.T) {
 	buildWellFormedGraph(t, store, "feat/x")
 	assert.NotPanics(t, func() {
 		orch.AssertPostPlannerWellFormed(store, "feat/x", standardRoles())
+	})
+}
+
+// TestBVV_TG07_AssertPostPlannerWellFormed_NoOpOnKnownButUnconfigured
+// pins the new TG-07 narrowing through the assertion seam — closed-set
+// roles missing from lifecycle.Roles must not panic. Mirrors
+// TestBVV_TG07_KnownButUnconfiguredRole one layer up, so a future
+// rewrite of AssertPostPlannerWellFormed that adds a stricter
+// "every role configured" precheck (bypassing ValidateLifecycleGraph)
+// fails here instead of silently regressing the gate path at runtime.
+func TestBVV_TG07_AssertPostPlannerWellFormed_NoOpOnKnownButUnconfigured(t *testing.T) {
+	store := testutil.NewMockStore()
+	buildWellFormedGraph(t, store, "feat/x")
+	rolesWithoutGate := standardRoles()
+	delete(rolesWithoutGate, "gate")
+	assert.NotPanics(t, func() {
+		orch.AssertPostPlannerWellFormed(store, "feat/x", rolesWithoutGate)
 	})
 }
 

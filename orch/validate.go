@@ -119,7 +119,21 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 	}
 	planID := planners[0]
 
-	// --- BVV-TG-07: every non-escalation task's role must be configured. ---
+	// --- BVV-TG-07: every non-escalation task's role must be recognized. ---
+	// A "recognized" role is either configured in lifecycle.Roles (handler
+	// wired up, dispatchable normally) or any closed-set Role.Valid() value
+	// — the full set planner/builder/verifier/gate/escalation, not just
+	// gate. Known-but-unconfigured roles flow through the dispatcher's
+	// BVV-DSP-03a escalation path at runtime, so the validator agrees with
+	// the dispatcher: anything DSP-03a would escalate, TG-07 must accept.
+	//
+	// The motivating case is RoleGate (CHARLIE.md mandates exactly one
+	// role:gate task; internal/cmd/config.go ships without a gate handler),
+	// but the same exemption covers any operator-trimmed role config — a
+	// CLI built with only role:planner registered will still validate a
+	// graph containing role:builder and role:verifier tasks, which then
+	// escalate at dispatch. Truly unknown roles (typos, deprecated values,
+	// empty role label) still fail TG-07 here rather than reaching DSP-03a.
 	var badRoles []string
 	for _, t := range tasks {
 		role := t.Role()
@@ -130,16 +144,17 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 			badRoles = append(badRoles, t.ID)
 			continue
 		}
-		// Role map is keyed by string (CLI-configured). Convert at the
-		// lookup boundary — Role and string share underlying type.
-		if _, ok := roles[string(role)]; !ok {
+		if _, ok := roles[string(role)]; ok {
+			continue
+		}
+		if !role.Valid() {
 			badRoles = append(badRoles, t.ID)
 		}
 	}
 	if len(badRoles) > 0 {
 		return &GraphValidationError{
 			Requirement: ReqTG07,
-			Reason:      "tasks carry role labels not configured in lifecycle.Roles",
+			Reason:      "tasks carry unrecognized role labels (not in lifecycle.Roles and not a closed-set Role value)",
 			TaskIDs:     badRoles,
 		}
 	}
