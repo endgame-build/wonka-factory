@@ -130,25 +130,36 @@ func TestBVV_TG07_MissingRole(t *testing.T) {
 }
 
 // TestBVV_TG07_KnownButUnconfiguredRole verifies that closed-set Role
-// values (role:gate at the time of writing) pass TG-07 even when the
-// CLI's lifecycle.Roles map doesn't have a handler wired. The dispatcher
-// will route them via BVV-DSP-03a escalation at runtime; rejecting them
-// at the validator stage would block any Charlie planner that emits a
-// gate task while wonka still ships without a default GATE.md, which is
-// the documented out-of-the-box state (see internal/cmd/config.go's
-// roleInstructionFiles comment).
+// values pass TG-07 even when the CLI's lifecycle.Roles map omits their
+// handler. The dispatcher routes them via BVV-DSP-03a escalation at
+// runtime; rejecting them at the validator stage would block any planner
+// that emits a role wonka doesn't ship a handler for — the motivating
+// case being role:gate, which CHARLIE.md mandates but the default CLI
+// (internal/cmd/config.go) doesn't register.
+//
+// Table-driven across all four dispatchable closed-set roles so a
+// regression that narrows Role.Valid() (e.g. "only gate is exempt")
+// fails here rather than passing because gate happens to be the case
+// the test fixture exercises.
 func TestBVV_TG07_KnownButUnconfiguredRole(t *testing.T) {
-	store := testutil.NewMockStore()
-	buildWellFormedGraph(t, store, "feat/x") // includes a role:gate task
-	// Configure only planner/builder/verifier — gate is intentionally
-	// unregistered. The graph still contains a gate task; TG-07 must
-	// accept it because RoleGate is a closed-set Role.Valid() value.
-	rolesWithoutGate := map[string]orch.RoleConfig{
-		"planner":  testutil.MockRoleConfig(),
-		"builder":  testutil.MockRoleConfig(),
-		"verifier": testutil.MockRoleConfig(),
+	cases := []struct {
+		name        string
+		omittedRole string // role to remove from the configured map
+	}{
+		{"gate_unconfigured", "gate"},
+		{"builder_unconfigured", "builder"},
+		{"verifier_unconfigured", "verifier"},
+		{"planner_unconfigured", "planner"},
 	}
-	assert.NoError(t, orch.ValidateLifecycleGraph(store, "feat/x", rolesWithoutGate))
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store := testutil.NewMockStore()
+			buildWellFormedGraph(t, store, "feat/x")
+			roles := standardRoles()
+			delete(roles, c.omittedRole)
+			assert.NoError(t, orch.ValidateLifecycleGraph(store, "feat/x", roles))
+		})
+	}
 }
 
 // TestBVV_TG07_EscalationExempt verifies that role:escalation tasks do

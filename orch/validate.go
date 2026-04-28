@@ -121,13 +121,19 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 
 	// --- BVV-TG-07: every non-escalation task's role must be recognized. ---
 	// A "recognized" role is either configured in lifecycle.Roles (handler
-	// wired up, dispatchable normally) or a known closed-set value (e.g.
-	// RoleGate before its handler ships). Known-but-unconfigured roles
-	// flow through the dispatcher's BVV-DSP-03a escalation path at runtime
-	// rather than failing the graph here — the alternative would block any
-	// planner that emits a role:gate task while wonka still ships without
-	// a default GATE.md, which is the documented out-of-the-box state.
-	// Truly unknown roles (typos, deprecated values) still fail TG-07.
+	// wired up, dispatchable normally) or any closed-set Role.Valid() value
+	// — the full set planner/builder/verifier/gate/escalation, not just
+	// gate. Known-but-unconfigured roles flow through the dispatcher's
+	// BVV-DSP-03a escalation path at runtime, so the validator agrees with
+	// the dispatcher: anything DSP-03a would escalate, TG-07 must accept.
+	//
+	// The motivating case is RoleGate (CHARLIE.md mandates exactly one
+	// role:gate task; internal/cmd/config.go ships without a gate handler),
+	// but the same exemption covers any operator-trimmed role config — a
+	// CLI built with only role:planner registered will still validate a
+	// graph containing role:builder and role:verifier tasks, which then
+	// escalate at dispatch. Truly unknown roles (typos, deprecated values,
+	// empty role label) still fail TG-07 here rather than reaching DSP-03a.
 	var badRoles []string
 	for _, t := range tasks {
 		role := t.Role()
