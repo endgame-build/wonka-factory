@@ -129,13 +129,13 @@ func TestBVV_TG07_MissingRole(t *testing.T) {
 	assert.Contains(t, ve.TaskIDs, "roleless-1")
 }
 
-// TestBVV_TG07_KnownButUnconfiguredRole verifies that closed-set Role
-// values pass TG-07 even when the CLI's lifecycle.Roles map omits their
-// handler. The dispatcher routes them via BVV-DSP-03a escalation at
-// runtime; rejecting them at the validator stage would block any planner
-// that emits a role wonka doesn't ship a handler for — the motivating
-// case being role:gate, which CHARLIE.md mandates but the default CLI
-// (internal/cmd/config.go) doesn't register.
+// TestBVV_TG07_KnownButUnconfiguredRole verifies that any role accepted
+// by Role.Valid() (orch/types.go) passes TG-07 even when the CLI's
+// lifecycle.Roles map omits its handler. The dispatcher routes such
+// tasks via BVV-DSP-03a escalation at runtime; rejecting them at the
+// validator stage would block any planner emitting a role wonka doesn't
+// ship a handler for — the motivating case being role:gate, which
+// CHARLIE.md mandates but the default CLI doesn't register.
 //
 // Table-driven across all four dispatchable closed-set roles so a
 // regression that narrows Role.Valid() (e.g. "only gate is exempt")
@@ -378,6 +378,23 @@ func TestBVV_TG07to10_AssertPostPlannerWellFormed_NoOpOnValid(t *testing.T) {
 	buildWellFormedGraph(t, store, "feat/x")
 	assert.NotPanics(t, func() {
 		orch.AssertPostPlannerWellFormed(store, "feat/x", standardRoles())
+	})
+}
+
+// TestBVV_TG07_AssertPostPlannerWellFormed_NoOpOnKnownButUnconfigured
+// pins the new TG-07 narrowing through the assertion seam — closed-set
+// roles missing from lifecycle.Roles must not panic. Mirrors
+// TestBVV_TG07_KnownButUnconfiguredRole one layer up, so a future
+// rewrite of AssertPostPlannerWellFormed that adds a stricter
+// "every role configured" precheck (bypassing ValidateLifecycleGraph)
+// fails here instead of silently regressing the gate path at runtime.
+func TestBVV_TG07_AssertPostPlannerWellFormed_NoOpOnKnownButUnconfigured(t *testing.T) {
+	store := testutil.NewMockStore()
+	buildWellFormedGraph(t, store, "feat/x")
+	rolesWithoutGate := standardRoles()
+	delete(rolesWithoutGate, "gate")
+	assert.NotPanics(t, func() {
+		orch.AssertPostPlannerWellFormed(store, "feat/x", rolesWithoutGate)
 	})
 }
 

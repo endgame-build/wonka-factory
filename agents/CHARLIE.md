@@ -156,7 +156,7 @@ bd create \
   --json
 ```
 
-`--labels` takes one comma-separated string (repeating the flag is not supported on `bd create`). `--deps` takes one or more predecessor IDs (repeat the flag or comma-separate). The `criticality` label key (with values `critical` or `non_critical`) is what wonka's `IsCritical()` reads — `critical:true`/`critical:false` is silently ignored and treats the task as non-critical. Capture each returned task ID — later `--deps` arguments reference them. Per-role specifics:
+`--labels` takes one comma-separated string (repeating the flag is not supported on `bd create`). `--deps` takes one or more predecessor IDs (repeat the flag or comma-separate). Wonka reads `Labels["criticality"]` and treats a task as critical only when the value is exactly `critical`; any other label key (including a literal `critical:true`) is ignored and the task stays non-critical. Capture each returned task ID — later `--deps` arguments reference them. Per-role specifics:
 
 - **build task:** `role:builder`, `criticality:critical` for migrations/infrastructure (`criticality:non_critical` otherwise), depends at minimum on `$ORCH_TASK_ID`. Description lists target files, success criteria (AC-*), `functional-spec.md` refs, and the `CLAUDE.md` sections that informed any architectural choices.
 - **V&V task:** `role:verifier`, typically `criticality:non_critical`, depends on the build task(s) it verifies. Description lists verification criteria (V-*) and vv-spec refs.
