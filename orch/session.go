@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -115,27 +116,42 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 		return fmt.Errorf("spawn: read instruction: %w", err)
 	}
 
-	// 2. Build env — BVV-ITF-01 env-only identity, BVV-DSP-06 ORCH_TASK_ID.
+	// 2. For file-form system-prompt flags, write the instruction body to a
+	// sidecar file and pass the path; for body-form flags, pass the body
+	// inline. Inlining a 16 KB CHARLIE.md into the tmux command argv
+	// overflows tmux's command-parsing buffer on macOS ("command too long"),
+	// so file-form is required for any preset whose role bodies push past
+	// that buffer. The "-file" suffix convention is shared by claude/codex/
+	// goose CLIs, so we detect file-form without a separate Preset field.
+	systemPromptValue := body
+	if body != "" && strings.HasSuffix(roleCfg.Preset.SystemPromptFlag, "-file") {
+		promptPath := PromptPath(wp.outputDir, task.ID)
+		if err := os.WriteFile(promptPath, []byte(body), 0o600); err != nil {
+			_ = os.Remove(promptPath) //nolint:errcheck // best-effort; idempotent if nothing was written
+			return fmt.Errorf("spawn: write prompt sidecar: %w", err)
+		}
+		systemPromptValue = promptPath
+	}
+
+	// 3. Build env — BVV-ITF-01 env-only identity, BVV-DSP-06 ORCH_TASK_ID.
 	env := BuildEnv(workerName, wp.runID, wp.repoPath, task.ID, branch, roleCfg.Preset.Env)
 
-	// 3. Build command — preset + instruction body + model override + maxTurns.
-	// The body is passed as the literal --append-system-prompt argument so the
-	// CLI uses it as the prompt string (not as a file path).
-	cmd := BuildCommand(roleCfg.Preset, body, model, roleCfg.MaxTurns)
+	// 4. Build command — preset + system-prompt value + model override + maxTurns.
+	cmd := BuildCommand(roleCfg.Preset, systemPromptValue, model, roleCfg.MaxTurns)
 
-	// 4. Wrap with sidecar exit-code capture (BVV Appendix A).
+	// 5. Wrap with sidecar exit-code capture (BVV Appendix A).
 	shellCmd, err := BuildShellCommand(cmd, env, LogPath(wp.outputDir, task.ID), roleCfg.Preset.TextFilter)
 	if err != nil {
 		return fmt.Errorf("spawn: %w", err)
 	}
 
-	// 5. Start the tmux session in the target repo directory so the agent
+	// 6. Start the tmux session in the target repo directory so the agent
 	// analyses the correct codebase and picks up its CLAUDE.md.
 	if err := wp.tmux.CreateSession(sessionName, shellCmd, wp.repoPath); err != nil {
 		return fmt.Errorf("spawn: tmux: %w", err)
 	}
 
-	var priorWorker *Worker // set after step 6 lands; drives the rollback
+	var priorWorker *Worker // set after step 7 lands; drives the rollback
 	success := false
 	defer func() {
 		if success {
@@ -158,7 +174,7 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 		}
 	}()
 
-	// 6. WKR-05: worker → active.
+	// 7. WKR-05: worker → active.
 	worker, err := wp.store.GetWorker(workerName)
 	if err != nil {
 		return fmt.Errorf("spawn: get worker: %w", err)
@@ -172,7 +188,7 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 	}
 	priorWorker = &snap
 
-	// 7. LDG-14a: task → in_progress. Stage the transition on a copy so
+	// 8. LDG-14a: task → in_progress. Stage the transition on a copy so
 	// the caller's *task stays consistent with the store if UpdateTask
 	// fails and the deferred rollback fires.
 	//

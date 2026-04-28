@@ -13,24 +13,24 @@ import (
 // these static inputs — no content-derived or content-predicated arguments
 // (BVV-DSN-04 phase-agnostic, BVV-DSP-04 exit-code-only outcome).
 //
-// instructionBody is the frontmatter-stripped content of the role's .md file
-// (returned by ReadAgentPrompt). It is passed as the literal argument to
-// preset.SystemPromptFlag — matching the Claude/codex/goose CLI contract
-// where --append-system-prompt takes a prompt string, not a file path.
-// model overrides the preset default via preset.ModelFlag. maxTurns appends
-// --max-turns when > 0; zero means "preset default".
+// systemPromptValue is what gets passed verbatim to preset.SystemPromptFlag —
+// for the claude preset that's a path to a sidecar prompt file written by
+// SpawnSession (see PromptPath), keeping large instruction bodies out of the
+// tmux command buffer. Other presets that prefer the body-form flag can pass
+// the body directly. model overrides the preset default via preset.ModelFlag.
+// maxTurns appends --max-turns when > 0; zero means "preset default".
 //
 // Per the BVV plan, agent identity no longer flows through a dedicated CLI
 // flag — the task's role label is resolved to a RoleConfig by the dispatcher,
-// and the instruction body for that role is injected directly via the
-// system-prompt flag. Agents discover their task via the ORCH_TASK_ID env
-// var (see BuildEnv) and read the task body from the ledger.
-func BuildCommand(preset *Preset, instructionBody, model string, maxTurns int) []string {
+// and the instruction body for that role is injected via the system-prompt
+// flag. Agents discover their task via the ORCH_TASK_ID env var (see
+// BuildEnv) and read the task body from the ledger.
+func BuildCommand(preset *Preset, systemPromptValue, model string, maxTurns int) []string {
 	cmd := []string{preset.Command}
 	cmd = append(cmd, preset.Args...)
 
-	if preset.SystemPromptFlag != "" && instructionBody != "" {
-		cmd = append(cmd, preset.SystemPromptFlag, instructionBody)
+	if preset.SystemPromptFlag != "" && systemPromptValue != "" {
+		cmd = append(cmd, preset.SystemPromptFlag, systemPromptValue)
 	}
 	if preset.ModelFlag != "" && model != "" {
 		cmd = append(cmd, preset.ModelFlag, model)
@@ -74,6 +74,17 @@ func BuildEnv(workerName, runID, repoPath, taskID, branch string, presetEnv map[
 // is read by ReadExitCode (see tmux.go).
 func LogPath(runDir, taskID string) string {
 	return filepath.Join(runDir, "logs", taskID+".stdout")
+}
+
+// PromptPath returns the canonical sidecar file path for an agent's system
+// prompt. SpawnSession writes the role instruction body here and passes the
+// path to claude via --append-system-prompt-file rather than inlining the
+// content into the tmux command — large prompts (CHARLIE.md is ~16 KB)
+// overflow tmux's command-parsing buffer on macOS otherwise (`tmux: command
+// too long`). The threshold depends on tmux build options and platform
+// ARG_MAX, so we side-step it entirely by always using a file.
+func PromptPath(runDir, taskID string) string {
+	return filepath.Join(runDir, "logs", taskID+".prompt.md")
 }
 
 // ReadAgentPrompt reads a role instruction file, strips YAML frontmatter,
