@@ -14,27 +14,34 @@ import (
 // the .txt sidecar log.
 const jqExtractText = `select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text // empty`
 
-// SystemPromptFlag must be --append-system-prompt (body value), not
-// --append-system-prompt-file (path) — orch.BuildCommand passes the
-// instruction body literally to this flag (see its doc-comment for the
-// contract). --dangerously-skip-permissions is required: without it
-// claude blocks on tool-use prompts and orchestrated sessions hang.
-// --print is required for non-interactive operation: claude refuses
-// --output-format stream-json without it. The KickoffPrompt is the
-// trailing user message --print mode demands; agents read their actual
-// task from $ORCH_TASK_ID per the role instruction file injected as
-// the system prompt, so a one-word nudge is sufficient.
+// SystemPromptFlag uses --append-system-prompt-file (path), not
+// --append-system-prompt (body value), with SystemPromptIsFile=true to
+// declare file-form to orch.SpawnSession. The role instruction body is
+// large enough to overflow tmux's command-parsing buffer on macOS —
+// `tmux new-session bash -c "<long string>"` rejects with "command too
+// long" once the bash -c argument crosses ~8 KB, and CHARLIE.md alone is
+// ~16 KB. With the file-form bit set, orch.SpawnSession writes the body
+// to orch.PromptPath(runDir, taskID) before launching the session and
+// passes the path to claude here. --dangerously-skip-permissions is
+// required: without it claude blocks on tool-use prompts and
+// orchestrated sessions hang. --print is required for non-interactive
+// operation: claude refuses --output-format stream-json without it. The
+// KickoffPrompt is the trailing user message --print mode demands;
+// agents read their actual task from $ORCH_TASK_ID per the role
+// instruction file injected as the system prompt, so a one-word nudge
+// is sufficient.
 var presets = map[string]*orch.Preset{
 	"claude": {
-		Name:             "claude",
-		Command:          "claude",
-		Args:             []string{"--dangerously-skip-permissions", "--print", "--output-format", "stream-json", "--verbose"},
-		SystemPromptFlag: "--append-system-prompt",
-		ModelFlag:        "--model",
-		ProcessNames:     []string{"node", "claude"},
-		Env:              map[string]string{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "99"},
-		TextFilter:       jqExtractText,
-		KickoffPrompt:    "Begin.",
+		Name:               "claude",
+		Command:            "claude",
+		Args:               []string{"--dangerously-skip-permissions", "--print", "--output-format", "stream-json", "--verbose"},
+		SystemPromptFlag:   "--append-system-prompt-file",
+		SystemPromptIsFile: true,
+		ModelFlag:          "--model",
+		ProcessNames:       []string{"node", "claude"},
+		Env:                map[string]string{"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "99"},
+		TextFilter:         jqExtractText,
+		KickoffPrompt:      "Begin.",
 	},
 }
 

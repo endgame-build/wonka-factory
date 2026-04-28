@@ -291,7 +291,7 @@ func TestBVV_DSP05_SpawnSessionNilPresetError(t *testing.T) {
 // Scenario modelled: the watchdog reads task.Status as in_progress at
 // watchdog.go:280, then the dispatcher transitions the task to completed
 // before the watchdog's pool.RestartSession → pool.SpawnSession reaches
-// step 7. Without the backstop, SpawnSession would silently reverse the
+// step 8. Without the backstop, SpawnSession would silently reverse the
 // terminal status with StatusInProgress (BVV-S-02 violation). With the
 // backstop, the panic surfaces the race instead. This is the production
 // enforcement that replaced the racy entry/exit snapshot in
@@ -412,7 +412,7 @@ func waitForSidecar(t *testing.T, logPath string, timeout time.Duration) {
 
 var errInjectedUpdateTask = errors.New("injected UpdateTask failure")
 
-// TestSpawnSessionRevertsWorkerOnTaskUpdateFailure drives a step-7 failure
+// TestSpawnSessionRevertsWorkerOnTaskUpdateFailure drives a step-8 failure
 // (UpdateTask after UpdateWorker landed) and asserts the worker snapshot
 // is restored. The load-bearing field is SessionStartedAt: Assign already
 // set Status=Active and CurrentTaskID, so only SessionStartedAt is
@@ -455,4 +455,129 @@ func TestSpawnSessionRevertsWorkerOnTaskUpdateFailure(t *testing.T) {
 	assert.Equal(t, orch.WorkerActive, got.Status)
 	assert.Equal(t, "task-revert", got.CurrentTaskID)
 	assert.Zero(t, got.SessionStartedAt, "SessionStartedAt must be reverted")
+}
+
+// fileFormMockRoleConfig returns a RoleConfig whose preset declares
+// SystemPromptIsFile so SpawnSession exercises the sidecar-write path. The
+// mock script ignores CLI arguments, so the bogus flag value is safe.
+func fileFormMockRoleConfig(t *testing.T, scriptName string) orch.RoleConfig {
+	t.Helper()
+	cfg := mockRoleConfig(t, scriptName)
+	cfg.Preset.SystemPromptFlag = "--append-system-prompt-file"
+	cfg.Preset.SystemPromptIsFile = true
+	return cfg
+}
+
+// TestSpawnSession_FileFormWritesPromptSidecar asserts SpawnSession writes
+// the role instruction body to PromptPath() with mode 0o600 when the preset
+// declares file-form. Regression guard for the macOS argv overflow fix —
+// without this test, a refactor that drops the sidecar write silently
+// re-introduces the original "command too long" failure (Linux CI does not
+// catch it because Linux tmux's buffer is much larger).
+func TestSpawnSession_FileFormWritesPromptSidecar(t *testing.T) {
+	pool, store, outDir := newTestSessionPool(t)
+	task, _ := createAssignedTask(t, store, "task-fileform", "w-01")
+
+	roleCfg := fileFormMockRoleConfig(t, "ok.sh")
+	require.NoError(t, pool.SpawnSession("w-01", task, roleCfg, "feature-x"))
+
+	promptPath := orch.PromptPath(outDir, "task-fileform")
+	info, err := os.Stat(promptPath)
+	require.NoError(t, err, "sidecar file must exist for file-form preset")
+
+	// Mode 0o600 — readable only by the invoking user. The orchestrator
+	// otherwise never writes 0o644 under .wonka/, and a permissions
+	// regression here changes the runtime-state security posture.
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(),
+		"prompt sidecar must be 0o600; got %v", info.Mode().Perm())
+
+	// Content matches the frontmatter-stripped body of the role instruction
+	// file. ReadAgentPrompt is the canonical reader; if its return shape ever
+	// drifts, this test is the one that surfaces the desync.
+	wantBody, _, err := orch.ReadAgentPrompt(roleCfg.InstructionFile)
+	require.NoError(t, err)
+	got, err := os.ReadFile(promptPath)
+	require.NoError(t, err)
+	assert.Equal(t, wantBody, string(got),
+		"sidecar contents must equal frontmatter-stripped instruction body")
+}
+
+// TestSpawnSession_BodyFormSkipsSidecar asserts SpawnSession does NOT write
+// a sidecar when the preset declares body-form. Protects future presets
+// (codex, goose) that pass the body inline — a refactor promoting file-form
+// to the unconditional default would silently change their CLI surface.
+func TestSpawnSession_BodyFormSkipsSidecar(t *testing.T) {
+	pool, store, outDir := newTestSessionPool(t)
+	task, _ := createAssignedTask(t, store, "task-bodyform", "w-01")
+
+	roleCfg := mockRoleConfig(t, "ok.sh")
+	// Explicit body-form: a non-empty flag, IsFile=false.
+	roleCfg.Preset.SystemPromptFlag = "--append-system-prompt"
+	roleCfg.Preset.SystemPromptIsFile = false
+	require.NoError(t, pool.SpawnSession("w-01", task, roleCfg, "feature-x"))
+
+	_, err := os.Stat(orch.PromptPath(outDir, "task-bodyform"))
+	assert.True(t, os.IsNotExist(err),
+		"body-form preset must not write a sidecar; got stat err=%v", err)
+}
+
+// TestSpawnSession_RemovesSidecarOnEarlyFailure asserts the deferred rollback
+// removes the prompt sidecar when SpawnSession fails BEFORE the tmux session
+// is created — specifically, when step 5's BuildShellCommand rejects an
+// invalid env key. Earlier revisions registered the rollback only after step
+// 6 (CreateSession), which leaked the sidecar on every step-3-to-step-6
+// failure path. This test pins the early-defer registration.
+func TestSpawnSession_RemovesSidecarOnEarlyFailure(t *testing.T) {
+	pool, store, outDir := newTestSessionPool(t)
+	task, _ := createAssignedTask(t, store, "task-early-fail", "w-01")
+
+	roleCfg := fileFormMockRoleConfig(t, "ok.sh")
+	// Inject an invalid env key — BuildShellCommand (step 5) rejects keys
+	// that do not match POSIX [A-Za-z_][A-Za-z0-9_]*. This forces a return
+	// between step 2 (sidecar written) and step 6 (CreateSession).
+	roleCfg.Preset.Env["BAD KEY"] = "value"
+
+	err := pool.SpawnSession("w-01", task, roleCfg, "feature-x")
+	require.Error(t, err, "BuildShellCommand must reject the invalid env key")
+
+	_, statErr := os.Stat(orch.PromptPath(outDir, "task-early-fail"))
+	assert.True(t, os.IsNotExist(statErr),
+		"sidecar must be removed by rollback when step 5 fails before CreateSession; got stat err=%v", statErr)
+}
+
+// TestSpawnSession_RemovesSidecarOnUpdateTaskFailure asserts the deferred
+// rollback removes the prompt sidecar when a step after CreateSession fails.
+// Pairs with TestSpawnSessionRevertsWorkerOnTaskUpdateFailure — same fault
+// injection (UpdateTask error), additional assertion that the sidecar
+// written at step 2 is cleaned up rather than orphaned in <runDir>/logs/.
+func TestSpawnSession_RemovesSidecarOnUpdateTaskFailure(t *testing.T) {
+	skipIfNoTmux(t)
+
+	dir := t.TempDir()
+	outDir := filepath.Join(dir, "out")
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+
+	inner, err := orch.NewFSStore(filepath.Join(dir, "ledger"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = inner.Close() })
+
+	store := &recordingStore{inner: inner, t: t}
+
+	runID := "test-sidecar-rollback"
+	tmuxClient := newTestTmux(t, runID)
+	pool := orch.NewWorkerPool(store, tmuxClient, 4, runID, "/repo", outDir)
+
+	task, _ := createAssignedTask(t, store, "task-sidecar-rollback", "w-01")
+
+	store.mu.Lock()
+	store.failUpdateTask = errInjectedUpdateTask
+	store.mu.Unlock()
+
+	err = pool.SpawnSession("w-01", task, fileFormMockRoleConfig(t, "ok.sh"), "feature-x")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errInjectedUpdateTask)
+
+	_, statErr := os.Stat(orch.PromptPath(outDir, "task-sidecar-rollback"))
+	assert.True(t, os.IsNotExist(statErr),
+		"sidecar must be removed by rollback when a post-CreateSession step fails; got stat err=%v", statErr)
 }

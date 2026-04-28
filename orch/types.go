@@ -207,9 +207,24 @@ type Preset struct {
 	AgentFlag    string
 	PluginFlag   string
 	// SystemPromptFlag names the CLI flag that injects the role instruction
-	// body as a system prompt (e.g. "--append-system-prompt"). Empty means
-	// no injection. BuildCommand passes the body string as the flag value.
+	// as a system prompt (e.g. "--append-system-prompt" or
+	// "--append-system-prompt-file"). Empty means no injection.
+	// BuildCommand passes the value verbatim — whether that value is a body
+	// or a path is governed by SystemPromptIsFile.
 	SystemPromptFlag string
+	// SystemPromptIsFile selects how SpawnSession prepares the value passed
+	// to SystemPromptFlag:
+	//   - true:  SpawnSession writes the role instruction body to
+	//            PromptPath(runDir, taskID) and passes that path. Required
+	//            for prompts large enough to overflow tmux's command-parsing
+	//            buffer (~16 KB CHARLIE.md trips it on macOS).
+	//   - false: SpawnSession passes the body inline. Used by CLIs that
+	//            lack a file-form flag.
+	// The contract is explicit on purpose — earlier revisions inferred it
+	// from a "-file" suffix on SystemPromptFlag, which silently fell through
+	// to body-form on a typo (e.g. "--prompt-files") and re-introduced the
+	// macOS argv overflow under a misleading "command too long" tmux error.
+	SystemPromptIsFile bool
 	// ModelFlag overrides the model selection (e.g. "--model"). The model name
 	// comes from the agent definition frontmatter. Empty means no override.
 	ModelFlag string

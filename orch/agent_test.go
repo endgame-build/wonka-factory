@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -225,6 +226,34 @@ func TestLogPath_Canonical(t *testing.T) {
 	got := orch.LogPath("/run/abc", "task-001")
 	want := filepath.Join("/run/abc", "logs", "task-001.stdout")
 	assert.Equal(t, want, got)
+}
+
+// TestPromptPath_Canonical verifies the canonical prompt sidecar layout:
+// {runDir}/logs/{taskID}.prompt.md. SpawnSession writes here for file-form
+// presets; a refactor that moves the path silently desyncs SpawnSession's
+// write from anything else (cleanup, log inspection) reading it.
+func TestPromptPath_Canonical(t *testing.T) {
+	got := orch.PromptPath("/run/abc", "task-001")
+	want := filepath.Join("/run/abc", "logs", "task-001.prompt.md")
+	assert.Equal(t, want, got)
+}
+
+// TestBuildCommand_FilePathPassedVerbatim pins the BuildCommand contract:
+// the function is value-agnostic — it does not read, transform, or expand
+// the systemPromptValue, even when the value looks like a path. SpawnSession
+// owns the body-vs-path decision; BuildCommand just appends the value.
+func TestBuildCommand_FilePathPassedVerbatim(t *testing.T) {
+	preset := &orch.Preset{
+		Command:          "claude",
+		SystemPromptFlag: "--append-system-prompt-file",
+	}
+	path := "/run/abc/logs/task-001.prompt.md"
+	cmd := orch.BuildCommand(preset, path, "", 0)
+
+	idx := slices.Index(cmd, "--append-system-prompt-file")
+	require.NotEqual(t, -1, idx, "flag missing from command: %v", cmd)
+	require.Less(t, idx, len(cmd)-1, "flag must have a value following it")
+	assert.Equal(t, path, cmd[idx+1], "BuildCommand must pass the path verbatim, no read/expand")
 }
 
 // TestBVV_AI01_InstructionFileInjection verifies BVV-AI-01: a role's

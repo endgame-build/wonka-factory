@@ -1,6 +1,7 @@
 package orch
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -88,17 +89,20 @@ func (wp *WorkerPool) Allocate() (*Worker, error) {
 //
 // Steps:
 //  1. Resolve instruction + model from roleCfg.InstructionFile.
-//  2. Build env with ORCH_TASK_ID / ORCH_BRANCH (BVV-ITF-01, BVV-DSP-06).
-//  3. Build command from preset + instruction + model + maxTurns.
-//  4. Wrap with sidecar exit-code capture (BVV Appendix A).
-//  5. Create tmux session in repoPath (so CLAUDE.md auto-discovers).
-//  6. Transition worker → active (WKR-05).
-//  7. Transition task → in_progress (LDG-14a).
+//  2. For file-form presets, write the body to PromptPath() and pass the
+//     path; for body-form presets, pass the body inline.
+//  3. Build env with ORCH_TASK_ID / ORCH_BRANCH (BVV-ITF-01, BVV-DSP-06).
+//  4. Build command from preset + system-prompt value + model + maxTurns.
+//  5. Wrap with sidecar exit-code capture (BVV Appendix A).
+//  6. Create tmux session in repoPath (so CLAUDE.md auto-discovers).
+//  7. Transition worker → active (WKR-05).
+//  8. Transition task → in_progress (LDG-14a).
 //
-// On any failure after step 5, a deferred rollback kills the tmux session
-// and (if step 6 landed) restores the worker's prior store record. The
-// task ID comes from the passed *Task (task.ID) — no separate taskID
-// parameter.
+// On any failure after step 2, a deferred rollback fires. It removes the
+// prompt sidecar (if step 2 wrote one), kills the tmux session (no-op if
+// step 6 hasn't run yet), and restores the worker's prior store record
+// (no-op if step 7 hasn't fully landed). The task ID comes from the
+// passed *Task (task.ID) — no separate taskID parameter.
 func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleConfig, branch string) error {
 	if roleCfg.Preset == nil {
 		return fmt.Errorf("spawn: role %q has nil preset", task.Role())
@@ -115,27 +119,35 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 		return fmt.Errorf("spawn: read instruction: %w", err)
 	}
 
-	// 2. Build env — BVV-ITF-01 env-only identity, BVV-DSP-06 ORCH_TASK_ID.
-	env := BuildEnv(workerName, wp.runID, wp.repoPath, task.ID, branch, roleCfg.Preset.Env)
-
-	// 3. Build command — preset + instruction body + model override + maxTurns.
-	// The body is passed as the literal --append-system-prompt argument so the
-	// CLI uses it as the prompt string (not as a file path).
-	cmd := BuildCommand(roleCfg.Preset, body, model, roleCfg.MaxTurns)
-
-	// 4. Wrap with sidecar exit-code capture (BVV Appendix A).
-	shellCmd, err := BuildShellCommand(cmd, env, LogPath(wp.outputDir, task.ID), roleCfg.Preset.TextFilter)
-	if err != nil {
-		return fmt.Errorf("spawn: %w", err)
+	// 2. For file-form presets, write the instruction body to a sidecar file
+	// and pass the path; for body-form presets, pass the body inline.
+	// Inlining a 16 KB CHARLIE.md into the tmux command argv overflows
+	// tmux's command-parsing buffer on macOS ("command too long"), so
+	// file-form is required for any preset whose role bodies push past
+	// that buffer. Mode 0o600 keeps the sidecar readable only by the
+	// invoking user; role bodies are non-secret but the orchestrator
+	// otherwise never writes 0o644 under .wonka/.
+	systemPromptValue := body
+	promptPath := "" // set below when a sidecar is written; drives rollback cleanup
+	if body != "" && roleCfg.Preset.SystemPromptIsFile {
+		promptPath = PromptPath(wp.outputDir, task.ID)
+		if err := os.WriteFile(promptPath, []byte(body), 0o600); err != nil {
+			// A partial write may have left an inode behind on EACCES /
+			// EROFS / EBUSY mid-operation; remove best-effort and warn if
+			// the remove itself fails so a leak doesn't hide behind the
+			// WriteFile error.
+			removePromptSidecarBestEffort(promptPath, "spawn: remove partial prompt sidecar")
+			return fmt.Errorf("spawn: write prompt sidecar: %w", err)
+		}
+		systemPromptValue = promptPath
 	}
 
-	// 5. Start the tmux session in the target repo directory so the agent
-	// analyses the correct codebase and picks up its CLAUDE.md.
-	if err := wp.tmux.CreateSession(sessionName, shellCmd, wp.repoPath); err != nil {
-		return fmt.Errorf("spawn: tmux: %w", err)
-	}
-
-	var priorWorker *Worker // set after step 6 lands; drives the rollback
+	// Register the rollback now so any failure in steps 3-8 cleans up the
+	// sidecar (if step 2 wrote one), the tmux session (if step 6 created
+	// one), and the worker record (if step 7 landed). Each cleanup is
+	// conditional and idempotent — KillSessionIfExists tolerates
+	// "session not found" so it's a no-op for failures before step 6.
+	var priorWorker *Worker // set after step 7's UpdateWorker lands
 	success := false
 	defer func() {
 		if success {
@@ -144,12 +156,12 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 		// Rollback is best-effort; we're already returning the step error.
 		// Surface rollback failures to stderr so operators can see what
 		// leaked — a silent UpdateWorker failure strands the worker record
-		// as Active until Resume reconciles it. KillSessionIfExists
-		// swallows "session already gone" so a fast-exiting mock agent
-		// doesn't spam warnings; a genuine tmux infra failure still
-		// surfaces here.
+		// as Active until Resume reconciles it.
 		if err := wp.tmux.KillSessionIfExists(sessionName); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: spawn rollback: kill session %s failed: %v\n", sessionName, err)
+		}
+		if promptPath != "" {
+			removePromptSidecarBestEffort(promptPath, "spawn rollback: remove prompt sidecar")
 		}
 		if priorWorker != nil {
 			if err := wp.store.UpdateWorker(priorWorker); err != nil {
@@ -158,7 +170,25 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 		}
 	}()
 
-	// 6. WKR-05: worker → active.
+	// 3. Build env — BVV-ITF-01 env-only identity, BVV-DSP-06 ORCH_TASK_ID.
+	env := BuildEnv(workerName, wp.runID, wp.repoPath, task.ID, branch, roleCfg.Preset.Env)
+
+	// 4. Build command — preset + system-prompt value + model override + maxTurns.
+	cmd := BuildCommand(roleCfg.Preset, systemPromptValue, model, roleCfg.MaxTurns)
+
+	// 5. Wrap with sidecar exit-code capture (BVV Appendix A).
+	shellCmd, err := BuildShellCommand(cmd, env, LogPath(wp.outputDir, task.ID), roleCfg.Preset.TextFilter)
+	if err != nil {
+		return fmt.Errorf("spawn: %w", err)
+	}
+
+	// 6. Start the tmux session in the target repo directory so the agent
+	// analyses the correct codebase and picks up its CLAUDE.md.
+	if err := wp.tmux.CreateSession(sessionName, shellCmd, wp.repoPath); err != nil {
+		return fmt.Errorf("spawn: tmux: %w", err)
+	}
+
+	// 7. WKR-05: worker → active.
 	worker, err := wp.store.GetWorker(workerName)
 	if err != nil {
 		return fmt.Errorf("spawn: get worker: %w", err)
@@ -172,7 +202,7 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 	}
 	priorWorker = &snap
 
-	// 7. LDG-14a: task → in_progress. Stage the transition on a copy so
+	// 8. LDG-14a: task → in_progress. Stage the transition on a copy so
 	// the caller's *task stays consistent with the store if UpdateTask
 	// fails and the deferred rollback fires.
 	//
@@ -195,6 +225,18 @@ func (wp *WorkerPool) SpawnSession(workerName string, task *Task, roleCfg RoleCo
 
 	success = true
 	return nil
+}
+
+// removePromptSidecarBestEffort deletes a file written by SpawnSession,
+// tolerating ENOENT (a parallel cleanup got there first) and surfacing real
+// failures (EACCES/EROFS/EBUSY) to stderr. The contextLabel is the diagnostic
+// prefix shown to the operator — "spawn: remove partial prompt sidecar" for
+// the WriteFile-failed path and "spawn rollback: remove prompt sidecar" for
+// the deferred rollback.
+func removePromptSidecarBestEffort(path, contextLabel string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(os.Stderr, "warning: %s %s failed: %v\n", contextLabel, path, err)
+	}
 }
 
 // IsAlive reports whether the worker's tmux session is running (BVV-ERR-11
