@@ -59,6 +59,28 @@ type bdExecFunc func(ctx context.Context, env []string, args ...string) (stdout,
 // than blocking the dispatcher loop.
 const bdInvocationTimeout = 5 * time.Second
 
+// bdLockRetryBudget caps the total wall time spent retrying a single bd
+// invocation after an embedded-Dolt exclusive-lock collision. bd 1.0's
+// embedded backend allows only one writer at a time, and Charlie agents
+// hold the lock briefly during their own `bd create`/`bd dep add` calls.
+// Wonka's reads and writes have to wait those out — typical hold times
+// are <500 ms, so a 2 s budget covers the long tail without dragging the
+// dispatch loop.
+const bdLockRetryBudget = 2 * time.Second
+
+// bdLockRetryInitialDelay is the first sleep after a lock collision; we
+// double on each retry up to half the budget. Tuned so a single fast
+// Charlie write (~100 ms) is unblocked on the second attempt.
+const bdLockRetryInitialDelay = 75 * time.Millisecond
+
+// isExclusiveLockError reports whether bd's stderr names an embedded-Dolt
+// exclusive-lock collision — the only retryable transient bd produces in
+// the wonka↔Charlie shared-database setup.
+func isExclusiveLockError(stderr string) bool {
+	return strings.Contains(stderr, "exclusive lock") &&
+		strings.Contains(stderr, "embedded")
+}
+
 // NewBDCLIStore constructs a BDCLIStore rooted at the bd database directory.
 // Resolves the bd binary at construction time so a missing CLI surfaces
 // before any operation — operators see ErrBeadsCLIMissing rather than a
@@ -116,7 +138,38 @@ func (s *BDCLIStore) defaultExec(ctx context.Context, env []string, args ...stri
 // for mapBdError. A context-deadline kill or missing-binary error
 // short-circuits to ErrStoreUnavailable since both indicate an infra
 // problem rather than a domain rejection.
+//
+// On embedded-Dolt exclusive-lock collisions (Charlie holding the database
+// during its own `bd create`/`bd dep add` writes), retries with exponential
+// backoff up to bdLockRetryBudget before giving up. Other failure classes
+// short-circuit on the first attempt — there's no point retrying a
+// not-found or a cycle rejection.
 func (s *BDCLIStore) runBd(ctx context.Context, args ...string) (stdout []byte, stderr string, err error) {
+	deadline := time.Now().Add(bdLockRetryBudget)
+	delay := bdLockRetryInitialDelay
+	for {
+		stdout, stderr, err = s.runBdOnce(ctx, args...)
+		if err == nil || !isExclusiveLockError(stderr) {
+			return stdout, stderr, err
+		}
+		if time.Now().Add(delay).After(deadline) {
+			return stdout, stderr, err
+		}
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return stdout, stderr, ctx.Err()
+		}
+		delay *= 2
+		if delay > bdLockRetryBudget/2 {
+			delay = bdLockRetryBudget / 2
+		}
+	}
+}
+
+// runBdOnce is a single bd invocation without retry. Pulled out so runBd's
+// retry loop has a clean unit to reissue on lock collisions.
+func (s *BDCLIStore) runBdOnce(ctx context.Context, args ...string) (stdout []byte, stderr string, err error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, bdInvocationTimeout)
 	defer cancel()
 

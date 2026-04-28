@@ -303,6 +303,48 @@ func TestBDCLIStore_RunBd_SetsBeadsActor(t *testing.T) {
 	assert.True(t, found, "BEADS_ACTOR must be set on every bd invocation; env=%v", stub.returnedEnv)
 }
 
+// TestBDCLIStore_RunBd_RetriesOnExclusiveLock pins the lock-conflict retry
+// behavior: when bd's stderr names an embedded-Dolt exclusive-lock
+// collision, runBd reissues the call after a backoff. Without retry,
+// every concurrent Charlie write would race wonka's read-side and surface
+// as a fatal lifecycle error — the very mode that broke the BDCLI
+// end-to-end smoke before this fix.
+func TestBDCLIStore_RunBd_RetriesOnExclusiveLock(t *testing.T) {
+	stub := &stubExec{}
+	store := newStubStore(t, stub)
+
+	// Return the lock-collision stderr on the first two attempts, then
+	// succeed. runBd should swallow the transients and surface the success.
+	calls := 0
+	store.execCmd = func(_ context.Context, _ []string, args ...string) ([]byte, []byte, error) {
+		calls++
+		if calls < 3 {
+			return nil, []byte("Error: failed to open database: embeddeddolt: another process holds the exclusive lock on /x; the embedded backend supports only one writer at a time"), errors.New("exit status 1")
+		}
+		return []byte("[]"), nil, nil
+	}
+
+	out, _, err := store.runBd(context.Background(), "list", "--json")
+	require.NoError(t, err, "transient lock collision must be retried")
+	assert.Equal(t, []byte("[]"), out)
+	assert.Equal(t, 3, calls, "expected 2 retries before success")
+}
+
+// TestBDCLIStore_RunBd_NonLockErrorsDoNotRetry guards the retry guard:
+// errors that don't match the exclusive-lock predicate must NOT trigger
+// retries, so a fast-failing not-found doesn't waste seconds spinning.
+func TestBDCLIStore_RunBd_NonLockErrorsDoNotRetry(t *testing.T) {
+	stub := &stubExec{
+		stderr: []byte("Error: no issue found matching \"foo\""),
+		err:    errors.New("exit status 1"),
+	}
+	store := newStubStore(t, stub)
+
+	_, _, err := store.runBd(context.Background(), "show", "foo", "--json")
+	require.Error(t, err)
+	require.Len(t, stub.calls, 1, "non-lock errors must not be retried")
+}
+
 // TestBDCLIStore_RunBd_TimeoutReturnsStoreUnavailable verifies the wall
 // clock wins: a context-deadline cancellation surfaces as
 // ErrStoreUnavailable rather than as a generic exec error, so the
