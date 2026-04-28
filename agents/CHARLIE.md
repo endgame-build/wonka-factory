@@ -150,17 +150,17 @@ Create (or reconcile) the tasks. Template:
 bd create \
   --title "<title>" \
   --description "<body with target files, criteria, spec refs>" \
-  --labels "role:<builder|verifier|gate>,branch:$ORCH_BRANCH,critical:<true|false>" \
+  --labels "role:<builder|verifier|gate>,branch:$ORCH_BRANCH,criticality:<critical|non_critical>" \
   --deps "<predecessor-id>" \
   --priority <int> \
   --json
 ```
 
-`--labels` takes one comma-separated string (repeating the flag is not supported on `bd create`). `--deps` takes one or more predecessor IDs (repeat the flag or comma-separate). Capture each returned task ID — later `--deps` arguments reference them. Per-role specifics:
+`--labels` takes one comma-separated string (repeating the flag is not supported on `bd create`). `--deps` takes one or more predecessor IDs (repeat the flag or comma-separate). The `criticality` label key (with values `critical` or `non_critical`) is what wonka's `IsCritical()` reads — `critical:true`/`critical:false` is silently ignored and treats the task as non-critical. Capture each returned task ID — later `--deps` arguments reference them. Per-role specifics:
 
-- **build task:** `role:builder`, `critical:true` for migrations/infrastructure, depends at minimum on `$ORCH_TASK_ID`. Description lists target files, success criteria (AC-*), `functional-spec.md` refs, and the `CLAUDE.md` sections that informed any architectural choices.
-- **V&V task:** `role:verifier`, typically non-critical, depends on the build task(s) it verifies. Description lists verification criteria (V-*) and vv-spec refs.
-- **gate task:** `role:gate`, `critical:true`, priority 4, depends on every V&V task (directly or transitively). Exactly one per lifecycle. Description names the PR flow.
+- **build task:** `role:builder`, `criticality:critical` for migrations/infrastructure (`criticality:non_critical` otherwise), depends at minimum on `$ORCH_TASK_ID`. Description lists target files, success criteria (AC-*), `functional-spec.md` refs, and the `CLAUDE.md` sections that informed any architectural choices.
+- **V&V task:** `role:verifier`, typically `criticality:non_critical`, depends on the build task(s) it verifies. Description lists verification criteria (V-*) and vv-spec refs.
+- **gate task:** `role:gate`, `criticality:critical`, priority 4, depends on every V&V task (directly or transitively). Exactly one per lifecycle. Description names the PR flow.
 
 ### Priority scheme
 

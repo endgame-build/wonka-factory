@@ -129,6 +129,28 @@ func TestBVV_TG07_MissingRole(t *testing.T) {
 	assert.Contains(t, ve.TaskIDs, "roleless-1")
 }
 
+// TestBVV_TG07_KnownButUnconfiguredRole verifies that closed-set Role
+// values (role:gate at the time of writing) pass TG-07 even when the
+// CLI's lifecycle.Roles map doesn't have a handler wired. The dispatcher
+// will route them via BVV-DSP-03a escalation at runtime; rejecting them
+// at the validator stage would block any Charlie planner that emits a
+// gate task while wonka still ships without a default GATE.md, which is
+// the documented out-of-the-box state (see internal/cmd/config.go's
+// roleInstructionFiles comment).
+func TestBVV_TG07_KnownButUnconfiguredRole(t *testing.T) {
+	store := testutil.NewMockStore()
+	buildWellFormedGraph(t, store, "feat/x") // includes a role:gate task
+	// Configure only planner/builder/verifier — gate is intentionally
+	// unregistered. The graph still contains a gate task; TG-07 must
+	// accept it because RoleGate is a closed-set Role.Valid() value.
+	rolesWithoutGate := map[string]orch.RoleConfig{
+		"planner":  testutil.MockRoleConfig(),
+		"builder":  testutil.MockRoleConfig(),
+		"verifier": testutil.MockRoleConfig(),
+	}
+	assert.NoError(t, orch.ValidateLifecycleGraph(store, "feat/x", rolesWithoutGate))
+}
+
 // TestBVV_TG07_EscalationExempt verifies that role:escalation tasks do
 // not trigger TG-07 failures even though "escalation" is never in the
 // configured role set. Escalations are orchestrator-created human inboxes,

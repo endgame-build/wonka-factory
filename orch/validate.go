@@ -119,7 +119,15 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 	}
 	planID := planners[0]
 
-	// --- BVV-TG-07: every non-escalation task's role must be configured. ---
+	// --- BVV-TG-07: every non-escalation task's role must be recognized. ---
+	// A "recognized" role is either configured in lifecycle.Roles (handler
+	// wired up, dispatchable normally) or a known closed-set value (e.g.
+	// RoleGate before its handler ships). Known-but-unconfigured roles
+	// flow through the dispatcher's BVV-DSP-03a escalation path at runtime
+	// rather than failing the graph here — the alternative would block any
+	// planner that emits a role:gate task while wonka still ships without
+	// a default GATE.md, which is the documented out-of-the-box state.
+	// Truly unknown roles (typos, deprecated values) still fail TG-07.
 	var badRoles []string
 	for _, t := range tasks {
 		role := t.Role()
@@ -130,16 +138,17 @@ func ValidateLifecycleGraph(store Store, branch string, roles map[string]RoleCon
 			badRoles = append(badRoles, t.ID)
 			continue
 		}
-		// Role map is keyed by string (CLI-configured). Convert at the
-		// lookup boundary — Role and string share underlying type.
-		if _, ok := roles[string(role)]; !ok {
+		if _, ok := roles[string(role)]; ok {
+			continue
+		}
+		if !role.Valid() {
 			badRoles = append(badRoles, t.ID)
 		}
 	}
 	if len(badRoles) > 0 {
 		return &GraphValidationError{
 			Requirement: ReqTG07,
-			Reason:      "tasks carry role labels not configured in lifecycle.Roles",
+			Reason:      "tasks carry unrecognized role labels (not in lifecycle.Roles and not a closed-set Role value)",
 			TaskIDs:     badRoles,
 		}
 	}
