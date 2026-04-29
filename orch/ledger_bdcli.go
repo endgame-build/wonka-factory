@@ -48,9 +48,11 @@ type BDCLIStore struct {
 	mu        sync.Mutex // serialises mutations within this process
 }
 
-// bdExecFunc is the test seam for replacing exec.CommandContext. The store
-// closes over the working directory and binary path itself, so the seam only
-// needs the inputs that vary per call: context, env, and argv.
+// bdExecFunc is the test seam for replacing exec.CommandContext. The default
+// implementation (defaultExec) is a method that reads working directory and
+// binary path off the BDCLIStore receiver, so the seam signature only carries
+// per-call inputs (context, env, argv). Test stubs construct the function
+// value directly and don't need the working directory / binary path at all.
 type bdExecFunc func(ctx context.Context, env []string, args ...string) (stdout, stderr []byte, err error)
 
 // bdInvocationTimeout caps every bd subprocess. The plan's p99 budget for
@@ -59,13 +61,23 @@ type bdExecFunc func(ctx context.Context, env []string, args ...string) (stdout,
 // than blocking the dispatcher loop.
 const bdInvocationTimeout = 5 * time.Second
 
-// bdLockRetryBudget caps the total wall time spent retrying a single bd
-// invocation after an embedded-Dolt exclusive-lock collision. bd 1.0's
-// embedded backend allows only one writer at a time, and Charlie agents
-// hold the lock briefly during their own `bd create`/`bd dep add` calls.
-// Wonka's reads and writes have to wait those out — typical hold times
-// are <500 ms, so a 2 s budget covers the long tail without dragging the
-// dispatch loop.
+// bdMaxOutputBytes caps stdout buffering per bd invocation. `bd list --all
+// -n 0` returns every issue in <repo>/.beads/, which is shared across
+// branches and writers (Charlie's session shares the same database). A
+// malicious or runaway Charlie could `bd create` thousands of times,
+// causing wonka's next ReadyTasks/listIDs to materialise the whole result
+// in one buffer. 64 MiB ≈ 64K issues at ~1 KB/issue — generous for any
+// realistic work-package, hard cap for the adversarial case.
+const bdMaxOutputBytes = 64 << 20
+
+// bdLockRetryBudget caps the cumulative *sleep* time across retries after an
+// embedded-Dolt exclusive-lock collision — not the total invocation wall time
+// (each runBdOnce can run for up to bdInvocationTimeout, so worst-case wall
+// time is N × bdInvocationTimeout + sleeps; in practice lock holds are
+// <500 ms so retries succeed quickly). bd 1.0's embedded backend allows only
+// one writer at a time, and Charlie agents hold the lock briefly during their
+// own `bd create`/`bd dep add` calls. The 2 s sleep budget covers the long
+// tail without dragging the dispatch loop.
 const bdLockRetryBudget = 2 * time.Second
 
 // bdLockRetryInitialDelay is the first sleep after a lock collision; we
@@ -89,6 +101,18 @@ func NewBDCLIStore(dir, actor string) (*BDCLIStore, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("bd-cli store: empty directory")
 	}
+	if actor == "" {
+		actor = defaultActor
+	}
+	// Reject actor strings containing characters that would break out of the
+	// `BEADS_ACTOR=<value>` env var. defaultActor is "orch" today and is safe;
+	// the constructor comment below signals intent to widen to "orch:<runID>"
+	// in future. Validating here means a future caller passing a runID with
+	// a stray newline (or a poisoned actor from any wider source) fails fast
+	// at construction rather than corrupting bd's audit-trail downstream.
+	if strings.ContainsAny(actor, "\x00\n=") {
+		return nil, fmt.Errorf("bd-cli store: invalid actor %q (must not contain NUL, newline, or =)", actor)
+	}
 	bdPath, err := exec.LookPath("bd")
 	if err != nil {
 		return nil, fmt.Errorf("bd-cli store: %w", ErrBeadsCLIMissing)
@@ -96,9 +120,6 @@ func NewBDCLIStore(dir, actor string) (*BDCLIStore, error) {
 	workerDir := filepath.Join(dir, "workers")
 	if err := os.MkdirAll(workerDir, 0o755); err != nil {
 		return nil, fmt.Errorf("bd-cli store: create worker dir: %w", err)
-	}
-	if actor == "" {
-		actor = defaultActor
 	}
 	s := &BDCLIStore{
 		repoPath:  dir,
@@ -122,16 +143,58 @@ func (s *BDCLIStore) Close() error { return nil }
 // working directory. The context timeout from runBd controls cancellation;
 // on context cancel exec.Cmd SIGKILLs the child, surfaces the kill as err,
 // and lets runBd map it to ErrStoreUnavailable.
+//
+// stdout is bounded by bdMaxOutputBytes via a cappedBuffer wrapper. An
+// adversarial Charlie filling the shared <repo>/.beads/ database with
+// millions of issues would otherwise drive `bd list --all` into multi-GB
+// resident buffers; cappedBuffer truncates after bdMaxOutputBytes and
+// returns ErrStoreUnavailable from the call. Using cmd.Run + a Writer (not
+// StdoutPipe + io.LimitReader) avoids the deadlock-on-overflow case where
+// bd would block writing to a full pipe while we waited for it to exit —
+// cappedBuffer just drops bytes past the limit so bd can complete cleanly.
+// Stderr is unbounded (bd's error messages are bounded in practice and we
+// use them for sentinel matching).
 func (s *BDCLIStore) defaultExec(ctx context.Context, env []string, args ...string) ([]byte, []byte, error) {
 	cmd := exec.CommandContext(ctx, s.bdPath, args...) //nolint:gosec // bdPath resolved via exec.LookPath, args programmer-controlled
 	cmd.Dir = s.repoPath
 	cmd.Env = env
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	stdout := &cappedBuffer{limit: bdMaxOutputBytes}
+	var stderr bytes.Buffer
+	cmd.Stdout = stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	if stdout.overflowed {
+		return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("bd output exceeded %d bytes: %w", bdMaxOutputBytes, ErrStoreUnavailable)
+	}
 	return stdout.Bytes(), stderr.Bytes(), err
 }
+
+// cappedBuffer is a bytes.Buffer wrapper that drops bytes past `limit` and
+// records that the limit was hit. Unlike io.LimitReader, this satisfies
+// io.Writer (which is what cmd.Stdout requires) and never returns an error
+// from Write — bd keeps producing output and exits naturally; we just
+// silently truncate. The caller checks `overflowed` after cmd.Wait completes.
+type cappedBuffer struct {
+	buf        bytes.Buffer
+	limit      int
+	overflowed bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	remaining := c.limit - c.buf.Len()
+	if remaining <= 0 {
+		c.overflowed = true
+		return len(p), nil // pretend we consumed it; cmd.Run sees no error
+	}
+	if len(p) > remaining {
+		c.overflowed = true
+		c.buf.Write(p[:remaining])
+		return len(p), nil
+	}
+	return c.buf.Write(p)
+}
+
+func (c *cappedBuffer) Bytes() []byte { return c.buf.Bytes() }
 
 // runBd invokes bd with bdInvocationTimeout and the cached BEADS_ACTOR env.
 // Returns stdout, the trimmed stderr message, and a wrapped error suitable
@@ -158,7 +221,10 @@ func (s *BDCLIStore) runBd(ctx context.Context, args ...string) (stdout []byte, 
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
-			return stdout, stderr, ctx.Err()
+			// Wrap as ErrStoreUnavailable while preserving the underlying
+			// context.Canceled / DeadlineExceeded in the chain — see runBdOnce
+			// for the multi-%w rationale.
+			return stdout, stderr, fmt.Errorf("bd retry cancelled: %w: %w", ErrStoreUnavailable, ctx.Err())
 		}
 		delay *= 2
 		if delay > bdLockRetryBudget/2 {
@@ -183,11 +249,26 @@ func (s *BDCLIStore) runBdOnce(ctx context.Context, args ...string) (stdout []by
 	// Distinguish infra failures (timeout, killed, exec error) from a clean
 	// bd exit-code-N — the former returns ErrStoreUnavailable, the latter
 	// flows through mapBdError so the caller can see ErrNotFound / ErrCycle.
+	//
+	// Asymmetric wrap by design:
+	//
+	//   - bd's INTERNAL timeout (timeoutCtx hit DeadlineExceeded) wraps ONLY
+	//     ErrStoreUnavailable. We deliberately do NOT preserve
+	//     DeadlineExceeded in the chain: classifyEngineError would otherwise
+	//     route a hung bd through its signal-interrupt clause, treating a
+	//     runtime fault as if the operator had Ctrl-C'd.
+	//
+	//   - PARENT context cancellation (ctx.Canceled, propagated by operator
+	//     shutdown) wraps both via multi-%w. errors.Is(err, context.Canceled)
+	//     stays true so classifyEngineError's signal-interrupt clause fires
+	//     first (correct shutdown routing); errors.Is(err, ErrStoreUnavailable)
+	//     also stays true so the dispatcher's gap tracker doesn't log a
+	//     transient kill as a per-task gap.
 	if errors.Is(timeoutCtx.Err(), context.DeadlineExceeded) {
 		return out, stderr, fmt.Errorf("bd timed out after %s: %w", bdInvocationTimeout, ErrStoreUnavailable)
 	}
 	if errors.Is(ctx.Err(), context.Canceled) {
-		return out, stderr, ctx.Err()
+		return out, stderr, fmt.Errorf("bd cancelled by parent context: %w: %w", ErrStoreUnavailable, ctx.Err())
 	}
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) {
@@ -200,13 +281,19 @@ func (s *BDCLIStore) runBdOnce(ctx context.Context, args ...string) (stdout []by
 // runBdMapped is the common shape for "run bd, classify failures, wrap with
 // op context". Without this helper every call site reimplemented the
 // (mapBdError → fmt.Errorf) cascade and quietly drifted in wrap format.
+//
+// On a sentinel match, the underlying err (which may itself wrap
+// ErrStoreUnavailable for transient infra failures) is preserved alongside
+// the sentinel via multi-%w. Without this, a "bd timed out" wrapped as
+// ErrStoreUnavailable would lose its transport-class signal the moment
+// mapBdError happened to find a sentinel match in the partial stderr.
 func (s *BDCLIStore) runBdMapped(ctx context.Context, op string, args ...string) ([]byte, error) {
 	out, stderr, err := s.runBd(ctx, args...)
 	if err == nil {
 		return out, nil
 	}
 	if mapped := mapBdError(stderr); mapped != nil {
-		return out, fmt.Errorf("%s: %w", op, mapped)
+		return out, fmt.Errorf("%s: %w: %w (stderr: %s)", op, mapped, err, stderr)
 	}
 	return out, fmt.Errorf("%s: %w (%s)", op, err, stderr)
 }
@@ -215,13 +302,22 @@ func (s *BDCLIStore) runBdMapped(ctx context.Context, op string, args ...string)
 // function so unit tests can assert every message pairing without spawning
 // bd. Returns nil if no known sentinel matches; the caller wraps with
 // operation context for diagnostic clarity.
+//
+// Patterns are anchored to bd 1.0.x's documented error prefixes ("Error: no
+// issue found", "Error: issue already exists", "would create a cycle") rather
+// than loose substrings. A loose substring like "not found" would match
+// unrelated infra phrases (e.g. "config file not found", "exec: bd: not
+// found"), coercing transient failures into ErrNotFound and letting the
+// CreateTask pre-check + --force partial-overwrite quirk fire on what was
+// really a flake. If bd 1.0.4+ rephrases an error, the real-bd regression
+// test in ledger_bdcli_test.go (TestMapBdError_AgainstRealBd) catches the
+// drift.
 func mapBdError(stderr string) error {
 	switch {
 	case strings.Contains(stderr, "no issue found"),
-		strings.Contains(stderr, "no issues found"),
-		strings.Contains(stderr, "not found"):
+		strings.Contains(stderr, "no issues found"):
 		return ErrNotFound
-	case strings.Contains(stderr, "already exists"),
+	case strings.Contains(stderr, "issue already exists"),
 		strings.Contains(stderr, "UNIQUE constraint"):
 		return ErrTaskExists
 	case strings.Contains(stderr, "would create a cycle"),
@@ -415,7 +511,18 @@ func (s *BDCLIStore) CreateTask(t *Task) error {
 	args := []string{
 		"create",
 		"--id", t.ID,
-		"--force", // unconditional: orch IDs (e.g. plan-<branch>) never share bd's repo prefix
+		"--force", // bd may reject explicit --id values whose prefix differs from the
+		//             repo's auto-generated one; --force overrides that. Phase 0
+		//             finding #2 (bd 1.0.0 silently partial-overwrites duplicate IDs
+		//             under --force) makes the fetchIssue pre-check above mandatory:
+		//             the pre-check catches the common case (duplicate already in bd
+		//             before we look). It does NOT close the cross-process TOCTOU
+		//             window — `mu` is process-local, so a Charlie write landing
+		//             between fetchIssue and bd create would still be silently
+		//             overwritten here. Closing that window requires bd's `--claim`
+		//             flag (true CAS), deferred per the migration plan; until then,
+		//             the per-branch lifecycle lock + Charlie's planner-then-builder
+		//             ordering keep the window vanishingly narrow in practice.
 		"--title", title,
 		"--description", t.Body,
 		"--priority", strconv.Itoa(t.Priority),
@@ -471,11 +578,16 @@ func (s *BDCLIStore) fetchIssue(ctx context.Context, id string) (*bdIssue, error
 
 // fetchIssues batch-reads multiple IDs in one `bd show` invocation. Empty
 // input short-circuits to an empty slice so callers don't need a guard.
-// If bd cannot find any of the IDs it returns a JSON error envelope rather
-// than the array; mapBdError translates that into ErrNotFound, which the
-// caller treats as "all consumed IDs vanished concurrently" — surfacing it
-// as an empty result keeps List/Ready behavior consistent with the snapshot
-// the operator expects.
+//
+// Concurrent-deletion handling: bd does not document whether `bd show <ids…>`
+// returns partial results when one of the IDs has been deleted, or hard-errors
+// the whole batch. The previous implementation treated ErrNotFound as "every
+// consumed ID vanished" and returned an empty slice, but if the actual
+// behavior is "any-missing → error" then 1-of-N concurrent deletions during a
+// Charlie replan would silently drop the other N-1 valid issues — and
+// ReadyTasks would then report "no tasks ready", potentially tripping the
+// gap tracker into a false abort. We surface the error instead so the
+// dispatcher's tick retries on the next iteration with a fresh snapshot.
 func (s *BDCLIStore) fetchIssues(ctx context.Context, ids []string) ([]bdIssue, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -485,12 +597,6 @@ func (s *BDCLIStore) fetchIssues(ctx context.Context, ids []string) ([]bdIssue, 
 
 	out, err := s.runBdMapped(ctx, "show batch", args...)
 	if err != nil {
-		// Concurrent deletion of every requested ID surfaces as ErrNotFound
-		// from mapBdError; degrade to an empty result so List/Ready behave
-		// like a snapshot.
-		if errors.Is(err, ErrNotFound) {
-			return nil, nil
-		}
 		return nil, err
 	}
 	var issues []bdIssue
@@ -606,8 +712,10 @@ func (s *BDCLIStore) ReadyTasks(labels ...string) ([]*Task, error) {
 	}
 	ctx := context.Background()
 
-	// `--all` (rather than `bd ready`) is essential — readiness is a function
-	// of the entire graph including terminal nodes (which bd ready hides).
+	// listIDs uses `bd list --all`; the function-level comment above explains
+	// why we don't delegate to `bd ready` (BVV-ERR-04a vs bd's blocked-is-blocking
+	// semantics). The local readiness predicate runs after fetchIssues populates
+	// labels and deps.
 	ids, err := s.listIDs(ctx, labels)
 	if err != nil {
 		return nil, err
@@ -708,8 +816,12 @@ func (s *BDCLIStore) Assign(taskID, workerName string) error {
 		// Rollback the assignment so the task does not stay claimed by a
 		// worker we never persisted as active. A failed rollback is rarer
 		// than a failed forward write but worth surfacing to the operator.
+		// Multi-%w lets callers detect both halves of a split-state failure
+		// (e.g. errors.Is(err, ErrStoreUnavailable) when the rollback itself
+		// hits a transient bd outage) so BVV-S-03 invariant panics carry
+		// diagnosable context rather than just the forward-write error.
 		if _, _, rbErr := s.runBd(ctx, "update", taskID, "--assignee", ""); rbErr != nil {
-			return fmt.Errorf("assign update worker: %w (rollback failed: %v)", err, rbErr)
+			return fmt.Errorf("assign update worker: %w (rollback failed: %w)", err, rbErr)
 		}
 		return fmt.Errorf("assign update worker: %w", err)
 	}

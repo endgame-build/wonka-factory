@@ -29,13 +29,22 @@ func TestMapBdError_Table(t *testing.T) {
 	}{
 		{"not_found_singular", "Error: no issue found matching \"foo\"", ErrNotFound},
 		{"not_found_plural", "Error: no issues found matching the provided IDs", ErrNotFound},
-		{"not_found_legacy_phrasing", "task xyz: not found", ErrNotFound},
 		{"already_exists", "Error: issue already exists", ErrTaskExists},
 		{"unique_constraint", "UNIQUE constraint failed: issues.id", ErrTaskExists},
 		{"cycle_modern", "Error: adding dependency would create a cycle", ErrCycle},
 		{"cycle_legacy", "circular dependency detected", ErrCycle},
 		{"unknown_returns_nil", "something went sideways", nil},
 		{"empty_stderr_returns_nil", "", nil},
+		// The matcher must NOT collapse loose substrings into sentinels —
+		// "config file not found" is bd's own infrastructure error and an
+		// unrelated "exec: bd: not found" from a missing binary similarly
+		// shouldn't trip ErrNotFound. Pre-tightening matchers turned both
+		// into ErrNotFound, opening the CreateTask --force partial-overwrite
+		// vector under Charlie contention. These cases pin the new anchored
+		// matchers against regression.
+		{"loose_not_found_does_not_match", "Error: config file not found at /etc/bd/bd.toml", nil},
+		{"loose_already_exists_does_not_match", "Error: lockfile already exists at /var/lib/bd.lock", nil},
+		{"exec_not_found_does_not_match", "exec: \"bd\": executable file not found in $PATH", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -157,6 +166,56 @@ func TestBdDep_Target(t *testing.T) {
 	assert.Equal(t, "from-export", bdDep{DependsOnID: "from-export"}.target())
 	// depends_on_id wins when both are set (export-flavored input).
 	assert.Equal(t, "from-export", bdDep{ID: "from-show", DependsOnID: "from-export"}.target())
+}
+
+// TestCappedBuffer pins the cmd.Stdout overflow protection. defaultExec
+// substitutes a cappedBuffer so an adversarial bd can't drive multi-GB
+// resident buffers; the writer must never return an error (or bd would
+// block writing and we'd deadlock waiting for it to exit) but must record
+// overflow so defaultExec surfaces ErrStoreUnavailable.
+func TestCappedBuffer(t *testing.T) {
+	t.Run("under_limit_no_overflow", func(t *testing.T) {
+		c := &cappedBuffer{limit: 100}
+		n, err := c.Write([]byte("hello"))
+		require.NoError(t, err)
+		assert.Equal(t, 5, n)
+		assert.Equal(t, []byte("hello"), c.Bytes())
+		assert.False(t, c.overflowed)
+	})
+
+	t.Run("exact_limit_no_overflow", func(t *testing.T) {
+		c := &cappedBuffer{limit: 5}
+		n, err := c.Write([]byte("hello"))
+		require.NoError(t, err)
+		assert.Equal(t, 5, n)
+		assert.Equal(t, []byte("hello"), c.Bytes())
+		assert.False(t, c.overflowed)
+	})
+
+	t.Run("single_write_overflows_truncates", func(t *testing.T) {
+		c := &cappedBuffer{limit: 5}
+		// bd sees this as a successful write of 10 bytes so it keeps going
+		// and exits cleanly. Buffer truncates at 5; overflow flag set.
+		n, err := c.Write([]byte("0123456789"))
+		require.NoError(t, err)
+		assert.Equal(t, 10, n, "must report full write so bd doesn't block")
+		assert.Equal(t, []byte("01234"), c.Bytes())
+		assert.True(t, c.overflowed)
+	})
+
+	t.Run("multiple_writes_eventually_overflow", func(t *testing.T) {
+		c := &cappedBuffer{limit: 8}
+		_, _ = c.Write([]byte("aaaa"))
+		assert.False(t, c.overflowed)
+		_, _ = c.Write([]byte("bbbb"))
+		assert.False(t, c.overflowed)
+		// Third write spills past the limit.
+		n, err := c.Write([]byte("cccc"))
+		require.NoError(t, err)
+		assert.Equal(t, 4, n, "must report full write so bd doesn't block")
+		assert.True(t, c.overflowed)
+		assert.Equal(t, []byte("aaaabbbb"), c.Bytes(), "buffer caps at limit")
+	})
 }
 
 // stubExec captures the most recent argv and returns canned output. Used by
@@ -370,6 +429,75 @@ func TestBDCLIStore_RunBd_TimeoutReturnsStoreUnavailable(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrStoreUnavailable),
 		"timeout must surface as ErrStoreUnavailable; got: %v", err)
+}
+
+// TestBDCLIStore_RunBd_CancellationPreservesBothSentinels pins the multi-%w
+// invariant for parent-context cancellation: errors.Is must return true for
+// BOTH ErrStoreUnavailable AND context.Canceled. The dispatcher's gap tracker
+// keys off ErrStoreUnavailable to avoid logging a transient kill as a per-task
+// gap; classifyEngineError keys off context.Canceled (in a clause that fires
+// BEFORE the ErrStoreUnavailable clause) to route signal-driven shutdown to
+// exitSignalInterrupt rather than exitRuntimeError. A maintainer who
+// "simplifies" runBdOnce's wrap from multi-%w back to single-%w would silently
+// regress one of those two invariants — this test breaks first.
+func TestBDCLIStore_RunBd_CancellationPreservesBothSentinels(t *testing.T) {
+	stub := &stubExec{}
+	store := newStubStore(t, stub)
+	store.execCmd = func(ctx context.Context, _ []string, _ ...string) ([]byte, []byte, error) {
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	}
+
+	parent, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before runBd to drive the parent-cancellation branch
+
+	_, _, err := store.runBd(parent, "list", "--json")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrStoreUnavailable),
+		"cancellation must wrap as ErrStoreUnavailable so the gap tracker stays clean; got: %v", err)
+	assert.True(t, errors.Is(err, context.Canceled),
+		"cancellation must preserve context.Canceled in the chain so classifyEngineError still fires the signal-interrupt clause first; got: %v", err)
+}
+
+// TestBDCLIStore_FetchIssues_PartialVanishSurfacesError pins the Critical 4
+// behavior change: when bd show returns ErrNotFound during a batched fetch
+// (any of the requested IDs concurrently deleted), fetchIssues must propagate
+// the error rather than degrading to an empty slice. The previous behavior
+// masked partial-vanish as "all gone", which during a Charlie replan could
+// silently drop N-1 valid issues and trip the gap tracker into a false abort.
+func TestBDCLIStore_FetchIssues_PartialVanishSurfacesError(t *testing.T) {
+	stub := &stubExec{
+		stderr: []byte("Error: no issue found matching \"vanished\""),
+		err:    errors.New("exit status 1"),
+	}
+	store := newStubStore(t, stub)
+
+	issues, err := store.fetchIssues(context.Background(), []string{"a-1", "vanished", "b-1"})
+	require.Error(t, err, "partial-vanish must surface as an error, not an empty result")
+	assert.ErrorIs(t, err, ErrNotFound, "underlying sentinel must remain reachable for diagnostic clarity")
+	assert.Empty(t, issues, "no partial result on error")
+}
+
+// TestNewBDCLIStore_RejectsInjectableActor pins the BEADS_ACTOR validator.
+// defaultActor "orch" is safe today, but the constructor comment signals
+// intent to widen to "orch:<runID>" — a future runID with a stray newline,
+// equals sign, or NUL would break out of the BEADS_ACTOR env var and let bd's
+// audit trail be polluted. Validating in the constructor blocks that footgun
+// at the source.
+func TestNewBDCLIStore_RejectsInjectableActor(t *testing.T) {
+	cases := map[string]string{
+		"newline":     "orch\nhostile=1",
+		"nul":         "orch\x00",
+		"equals_sign": "orch=hostile",
+	}
+	for name, badActor := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := NewBDCLIStore(t.TempDir(), badActor)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid actor",
+				"must reject injectable actor %q with a clear error", badActor)
+		})
+	}
 }
 
 // --- helpers ---

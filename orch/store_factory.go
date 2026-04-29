@@ -1,6 +1,7 @@
 package orch
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // StoreConstructor creates a Store backed by the given directory.
@@ -124,10 +126,24 @@ func EnsureBeadsInitialised(repoPath string) (bool, error) {
 	if !BeadsCLIAvailable() {
 		return false, ErrBeadsCLIMissing
 	}
-	cmd := exec.Command("bd", "init", "--stealth", "--non-interactive", "--quiet") //nolint:gosec // args are programmer-controlled
+	// 30s is generous: a fresh `bd init --stealth` is sub-second on dev
+	// hardware. The cap is here to make a hung init (e.g. waiting on a
+	// network FS lock) surface as an error instead of blocking `wonka run`
+	// indefinitely before the lifecycle lock is acquired.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bd", "init", "--stealth", "--non-interactive", "--quiet") //nolint:gosec // args are programmer-controlled
 	cmd.Dir = repoPath
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		// Concurrent multi-branch init race: two `wonka run --branch …`
+		// invocations from the same repo can both stat-miss above and race
+		// to bd init. The loser sees bd's "Aborting" exit-1; re-stat after
+		// the failure — if .beads/ now exists as a directory, the winner
+		// already created it and our work is done.
+		if info, statErr := os.Stat(beadsDir); statErr == nil && info.IsDir() {
+			return false, nil
+		}
 		return false, fmt.Errorf("bd init: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return true, nil

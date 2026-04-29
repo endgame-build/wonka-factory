@@ -377,47 +377,63 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		assert.Empty(t, workers)
 	})
 
-	// validateID path-traversal rejection: every Store method that accepts
-	// an external task ID or worker name must reject traversal attempts
-	// with ErrInvalidID rather than leaking ENOENT or writing outside the
-	// ledger directory. Contract-level so both FSStore and BeadsStore stay
-	// consistent (BeadsStore still resolves workers on the filesystem).
-	t.Run("ValidateID_RejectsPathTraversal", func(t *testing.T) {
+	// validateID rejection: every Store method that accepts an external task
+	// ID or worker name must reject malformed identifiers with ErrInvalidID
+	// rather than (a) leaking ENOENT, (b) writing outside the ledger directory,
+	// or (c) being misinterpreted as a flag by `bd <subcommand> <ID> --flag`-
+	// shaped argv. Contract-level so all backends (FSStore, BeadsStore,
+	// BDCLIStore) stay consistent on the rejection set.
+	t.Run("ValidateID_RejectsMalformedInputs", func(t *testing.T) {
 		store, _ := factory(t)
-		const bad = "../escape"
+		// Each pattern probes a different failure mode the regex must catch.
+		badIDs := []struct {
+			id   string
+			vuln string
+		}{
+			{"../escape", "path traversal"},
+			{"--status", "argv flag injection"},
+			{"-status", "leading-hyphen flag-shape"},
+			{"foo bar", "embedded space"},
+			{"foo\nbar", "embedded newline"},
+			{"foo\x00bar", "embedded NUL"},
+			{"", "empty"},
+		}
+		for _, bad := range badIDs {
+			t.Run(bad.vuln, func(t *testing.T) {
+				err := store.CreateTask(&orch.Task{ID: bad.id, Status: orch.StatusOpen})
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "CreateTask must reject: %s", bad.vuln)
 
-		err := store.CreateTask(&orch.Task{ID: bad, Status: orch.StatusOpen})
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "CreateTask should reject traversal")
+				_, err = store.GetTask(bad.id)
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "GetTask must reject: %s", bad.vuln)
 
-		_, err = store.GetTask(bad)
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "GetTask should reject traversal")
+				err = store.UpdateTask(&orch.Task{ID: bad.id, Status: orch.StatusOpen})
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "UpdateTask must reject: %s", bad.vuln)
 
-		err = store.UpdateTask(&orch.Task{ID: bad, Status: orch.StatusOpen})
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "UpdateTask should reject traversal")
+				err = store.CreateWorker(&orch.Worker{Name: bad.id, Status: orch.WorkerIdle})
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "CreateWorker must reject: %s", bad.vuln)
 
-		err = store.CreateWorker(&orch.Worker{Name: bad, Status: orch.WorkerIdle})
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "CreateWorker should reject traversal")
+				_, err = store.GetWorker(bad.id)
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "GetWorker must reject: %s", bad.vuln)
 
-		_, err = store.GetWorker(bad)
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "GetWorker should reject traversal")
+				err = store.UpdateWorker(&orch.Worker{Name: bad.id, Status: orch.WorkerIdle})
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "UpdateWorker must reject: %s", bad.vuln)
 
-		err = store.UpdateWorker(&orch.Worker{Name: bad, Status: orch.WorkerIdle})
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "UpdateWorker should reject traversal")
+				err = store.Assign(bad.id, "whatever")
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "Assign taskID must reject: %s", bad.vuln)
 
-		err = store.Assign(bad, "whatever")
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "Assign should reject traversal taskID")
+				err = store.Assign("whatever", bad.id)
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "Assign workerName must reject: %s", bad.vuln)
 
-		err = store.Assign("whatever", bad)
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "Assign should reject traversal workerName")
+				err = store.AddDep(bad.id, "whatever")
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "AddDep taskID must reject: %s", bad.vuln)
 
-		err = store.AddDep(bad, "whatever")
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "AddDep should reject traversal taskID")
+				err = store.AddDep("whatever", bad.id)
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "AddDep dependsOn must reject: %s", bad.vuln)
 
-		err = store.AddDep("whatever", bad)
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "AddDep should reject traversal dependsOn")
-
-		_, err = store.GetDeps(bad)
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "GetDeps should reject traversal")
+				_, err = store.GetDeps(bad.id)
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "GetDeps must reject: %s", bad.vuln)
+			})
+		}
 	})
 
 	// Title/Body round-trip: both fields must survive create + update cycles
@@ -663,7 +679,7 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		require.NoError(t, err)
 
 		ids := readyIDs(ready)
-		assert.True(t, ids["ready-1"], "ready1 should be in ready set")
+		assert.True(t, ids["ready-1"], "ready-1 should be in ready set")
 		assert.True(t, ids["blocker-1"], "blocker should be ready (no deps)")
 		assert.False(t, ids["blocked-1"], "blocked should not be ready (dep not terminal)")
 		assert.False(t, ids["assigned-1"], "assigned should not be ready (has assignee)")

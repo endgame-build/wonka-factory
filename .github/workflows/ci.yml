@@ -95,7 +95,7 @@ jobs:
           BD_SHA256: "1ef5dca818d7e81574df9e9f9fc2a16ab711da09b0fa7b822ae162d9a81c8912"
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_linux_amd64.tar.gz" -o /tmp/bd.tar.gz
+          curl -fsSL "https://github.com/steveyegge/beads/releases/download/v${BD_VERSION}/beads_${BD_VERSION}_linux_amd64.tar.gz" -o /tmp/bd.tar.gz
           echo "${BD_SHA256}  /tmp/bd.tar.gz" | sha256sum -c -
           tar -xzf /tmp/bd.tar.gz -C /tmp
           sudo install -m 0755 /tmp/bd /usr/local/bin/bd

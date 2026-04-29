@@ -3,15 +3,32 @@ package orch
 import (
 	"cmp"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 )
 
-// validateID rejects identifiers that could escape filesystem directories via
-// path traversal. Task IDs come from the planning agent (Charlie) and worker
-// names from CLI configuration — both are external inputs.
+// idPattern accepts alphanumeric IDs with internal hyphens and underscores,
+// up to 128 chars. The first character must be alphanumeric — leading hyphens
+// would be parsed as flags by `bd update <ID> --flag`-shape argv (BDCLIStore
+// has several such call sites), turning a poisoned ID into argv injection
+// against bd. The character class also rejects path separators, NULs,
+// newlines, spaces, and Unicode, all of which had latent attack potential
+// against the FSStore worker file path.
+//
+// Production IDs all conform: planner seeds use "plan-<sanitised-branch>",
+// Charlie uses "<repo>-<hash>", workers use "w-<n>". Branch names with
+// slashes (e.g. "feat/login") are sanitised before reaching this check.
+var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
+// validateID rejects identifiers that could (a) escape filesystem directories
+// via path traversal, or (b) be misinterpreted as flags by bd subcommands
+// when used positionally. Task IDs come from the planning agent (Charlie)
+// and worker names from CLI configuration — both are external inputs to
+// the wonka boundary, and Charlie's input is a prompt-injectable agent
+// session, so the regex must be the primary defense rather than a hint.
 func validateID(id string) error {
-	if id == "" || strings.ContainsAny(id, "/\\") || id == "." || strings.Contains(id, "..") {
+	if !idPattern.MatchString(id) {
 		return fmt.Errorf("id %q: %w", id, ErrInvalidID)
 	}
 	return nil

@@ -1,5 +1,28 @@
 # Plan — Replace BeadsStore (Go SDK) with BDCLIStore (bd CLI shell-out)
 
+> **PR-A Implementation Deltas** (read first — the rest of this document is the
+> forward plan as written, not the as-shipped state):
+>
+> 1. **Layer 3 differential bridge test (`orch/ledger_differential_test.go`)
+>    was dropped during PR-A**, not deferred to PR-B. It always skipped because
+>    `newBeadsForDiff` couldn't open bd 1.0.0 — exactly the SDK ↔ embedded-bd
+>    incompatibility this whole migration solves. Parity was instead validated
+>    manually via `scripts/level4-redux.sh --ledger-kind bd-cli`. References to
+>    Layer 3, the `differential` build tag, `TestStoresAgree`, and the
+>    "Differential test: 12/12 scenarios" gate below are obsolete; treat them
+>    as historical. Risk #5's mitigation now relies on the contract suite
+>    parametrically running against both backends, not on differential parity.
+>
+> 2. **bd version pinned to `1.0.3` (not `1.0.2`), and the canonical release
+>    artifact is `beads_${BD_VERSION}_linux_amd64.tar.gz`** (with `bd` at the
+>    archive root), not `bd-linux-amd64.tar.gz` as the example below shows.
+>    The actual `.github/workflows/ci.yml` is the source of truth.
+>
+> 3. **`WONKA_REQUIRE_BD=1`** is now wired into `requireBd(t)` in
+>    `orch/store_factory_test.go` — the CI env var converts skips into hard
+>    failures so a regression in the "Install bd" workflow step can no longer
+>    silently skip the 38-subtest contract suite.
+
 ## Context
 
 Wonka's current `BeadsStore` (`orch/ledger_beads.go`) imports `github.com/steveyegge/beads` and calls `beads.Open` — which in beads 1.0.0 expects a Dolt SQL server on TCP. bd 1.0.0 ships in **embedded mode** (cgo Dolt linked into the bd CLI; no SQL server). Since wonka builds `CGO_ENABLED=0`, the two cannot talk on a fresh dev box: every `wonka run --ledger beads` aborts with `Dolt server unreachable at 127.0.0.1:0`. The PR `fix/single-ledger-routing` (#21) verified the routing contract via `scripts/level4-redux.sh` but explicitly cannot run a full Charlie/Oompa/Loompa lifecycle for this reason.
