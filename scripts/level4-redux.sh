@@ -13,11 +13,16 @@
 # merging changes that touch ledger routing, dispatch, or the planner contract.
 #
 # Usage:
-#   scripts/level4-redux.sh [--keep]
+#   scripts/level4-redux.sh [--keep] [--ledger-kind <beads|bd-cli>]
 #
 # Flags:
-#   --keep   Leave the temp dir on disk after the run for inspection.
-#            Default: temp dir cleaned up on success, kept on failure.
+#   --keep              Leave the temp dir on disk after the run for inspection.
+#                       Default: temp dir cleaned up on success, kept on failure.
+#   --ledger-kind KIND  Override --ledger passed to wonka. Default: beads.
+#                       Use bd-cli to dogfood the BDCLIStore migration backend
+#                       against the same end-to-end Charlie/Oompa/Loompa flow.
+#                       (fs is unsupported here — the routing-contract checks
+#                       below only fit the bd-shared <repo>/.beads/ layout.)
 #
 # Cost: roughly $3-8 of Anthropic API credits per run (4 Claude sessions at
 # Opus pricing). Duration: 5-15 minutes for the small "greet" work package.
@@ -28,21 +33,51 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WONKA="$ROOT/bin/wonka"
 
 KEEP=0
-for arg in "$@"; do
-    case "$arg" in
+LEDGER_KIND="beads"
+while [ $# -gt 0 ]; do
+    case "$1" in
         --keep)
             KEEP=1
+            shift
+            ;;
+        --ledger-kind)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "--ledger-kind requires a value (beads or bd-cli)" >&2
+                exit 2
+            fi
+            LEDGER_KIND="$1"
+            shift
+            ;;
+        --ledger-kind=*)
+            LEDGER_KIND="${1#--ledger-kind=}"
+            shift
             ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
-            echo "unknown flag: $arg" >&2
+            echo "unknown flag: $1" >&2
             exit 2
             ;;
     esac
 done
+
+case "$LEDGER_KIND" in
+    beads|bd-cli) ;;
+    fs)
+        # The routing-contract checks below assume <repo>/.beads/ — only
+        # beads and bd-cli share that path. fs would route to <run-dir>/ledger/
+        # and the routing test would falsely fail. Keep the script bd-focused.
+        echo "--ledger-kind=fs is unsupported by level4-redux (bd-shared routing only)" >&2
+        exit 2
+        ;;
+    *)
+        echo "--ledger-kind must be beads or bd-cli (got: $LEDGER_KIND)" >&2
+        exit 2
+        ;;
+esac
 
 PASS=0
 FAIL=0
@@ -134,7 +169,7 @@ run_lifecycle() {
     local capture="$3"
     "$WONKA" run \
         --branch feat/greet \
-        --ledger beads \
+        --ledger "$LEDGER_KIND" \
         --workers 2 \
         --timeout "$timeout" \
         --repo "$target" \
@@ -288,7 +323,7 @@ TARGET="$(seed_target)"
 pass "target repo created at $TARGET"
 
 section "Run wonka (real Claude agents — this may take 5-15 minutes)"
-echo "  branch: feat/greet | ledger: beads | workers: 2 | timeout: 15m"
+echo "  branch: feat/greet | ledger: $LEDGER_KIND | workers: 2 | timeout: 15m"
 echo "  watch tmux sessions via:  tmux -L wonka-<runID> ls"
 echo ""
 LIFECYCLE_RC=0

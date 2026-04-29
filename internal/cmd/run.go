@@ -180,6 +180,12 @@ func classifyEngineError(err error, branch string, stderr io.Writer) error {
 	case errors.Is(err, orch.ErrHandoffLimitReached):
 		return die(stderr, exitConfigError, "task exceeded handoff limit — inspect with 'wonka status --branch %s' and reopen after investigating (%s)", branch, err)
 
+	// Ledger backend unreachable (e.g. bd CLI timeout / killed / missing).
+	// Treated as a transient runtime failure — the operator's wrapper script
+	// can retry once the infra recovers.
+	case errors.Is(err, orch.ErrStoreUnavailable):
+		return die(stderr, exitRuntimeError, "ledger backend unavailable — verify `bd` is on PATH and responsive, then retry (%s)", err)
+
 	default:
 		return die(stderr, exitRuntimeError, "lifecycle failed: %s", err)
 	}

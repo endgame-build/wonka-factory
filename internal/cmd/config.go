@@ -143,15 +143,13 @@ func BuildEngineConfig(flags CLIFlags) (orch.EngineConfig, []string, error) {
 	}
 	warnings = append(warnings, roleWarnings...)
 
-	// Environment precondition: when the resolved ledger kind is beads (either
-	// explicit --ledger=beads or the empty default), require `bd` on PATH.
-	// The engine auto-inits <repo>/.beads/ via `bd init` if missing, and the
-	// beads SDK has no programmatic Init — without `bd` there is no way to
-	// make the lifecycle work. Checked after structural flag validation so a
-	// user passing --workers=0 sees the workers error first; environment
-	// errors come last.
-	if ledger == orch.LedgerBeads && !orch.BeadsCLIAvailable() {
-		return orch.EngineConfig{}, nil, fmt.Errorf("--ledger=beads requires the bd CLI on PATH: %w", orch.ErrBeadsCLIMissing)
+	// Environment precondition: any beads-shared kind (LedgerBeads or
+	// LedgerBDCLI) needs `bd` on PATH — both auto-init <repo>/.beads/ via
+	// `bd init`, and BDCLIStore additionally shells out for every operation.
+	// Checked after structural flag validation so a user passing --workers=0
+	// sees the workers error first; environment errors come last.
+	if (ledger == orch.LedgerBeads || ledger == orch.LedgerBDCLI) && !orch.BeadsCLIAvailable() {
+		return orch.EngineConfig{}, nil, fmt.Errorf("--ledger=%s requires the bd CLI on PATH: %w", ledger, orch.ErrBeadsCLIMissing)
 	}
 
 	lifecycle := &orch.LifecycleConfig{
@@ -246,8 +244,10 @@ func parseLedgerKind(raw string) (orch.LedgerKind, error) {
 		return orch.LedgerBeads, nil
 	case string(orch.LedgerFS):
 		return orch.LedgerFS, nil
+	case string(orch.LedgerBDCLI):
+		return orch.LedgerBDCLI, nil
 	default:
-		return "", fmt.Errorf("unknown ledger %q (available: beads, fs)", raw)
+		return "", fmt.Errorf("unknown ledger %q (available: beads, bd-cli, fs)", raw)
 	}
 }
 

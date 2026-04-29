@@ -304,9 +304,13 @@ func (e *Engine) Resume(ctx context.Context) error {
 // as before — no auto-init required because NewFSStore creates the dir.
 func (e *Engine) init() error {
 	ledgerDir := ResolveLedgerDir(e.cfg.RepoPath, e.cfg.RunDir, e.cfg.LedgerKind, e.testLedgerDir)
-	// Auto-init only fires for explicit LedgerBeads. Empty kind (test/legacy)
-	// routes to the FS path and bypasses bd entirely; tests don't need `bd` on PATH.
-	if e.testLedgerDir == "" && e.cfg.LedgerKind == LedgerBeads {
+	// Auto-init fires for both LedgerBeads (Go SDK) and LedgerBDCLI (CLI
+	// shell-out) — they share <repo>/.beads/, and bd init is not idempotent
+	// (errors if .beads/ already exists), so the EnsureBeadsInitialised
+	// helper stats the directory first and returns (false, nil) when
+	// already present. Empty kind (test/legacy) routes to the FS path and
+	// bypasses bd entirely; tests don't need `bd` on PATH.
+	if e.testLedgerDir == "" && (e.cfg.LedgerKind == LedgerBeads || e.cfg.LedgerKind == LedgerBDCLI) {
 		created, err := EnsureBeadsInitialised(e.cfg.RepoPath)
 		if err != nil {
 			return fmt.Errorf("engine: ensure beads initialised: %w", err)

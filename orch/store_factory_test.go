@@ -17,11 +17,38 @@ import (
 // requireBd skips the test when the bd CLI is not on PATH. The auto-init
 // path requires `bd init`; we don't want CI runners without bd to fail
 // the suite, but we do want the tests to run wherever bd is present.
+//
+// CI sets WONKA_REQUIRE_BD=1 to flip the skip into a hard failure — without
+// this guard, a regression in the "Install bd" workflow step (e.g. renamed
+// release URL, checksum drift, supply-chain swap) would silently skip the
+// 38-subtest BDCLIStore contract suite while keeping CI green. The env-var
+// gate is the canary.
 func requireBd(t *testing.T) {
 	t.Helper()
 	if !orch.BeadsCLIAvailable() {
+		if os.Getenv("WONKA_REQUIRE_BD") != "" {
+			t.Fatalf("bd CLI not on PATH but WONKA_REQUIRE_BD is set — CI must always exercise the bd-cli contract suite; check the Install bd workflow step")
+		}
 		t.Skip("bd CLI not on PATH")
 	}
+}
+
+// initBdRepo creates a fresh bd-initialised .beads/ directory under a temp
+// directory and returns its path. Encapsulates the git-init + bd-init
+// dance every BDCLIStore test needs (bd init's --stealth setup expects to
+// run inside a git repo even when no hooks are installed). Takes
+// testing.TB so contract tests and benchmarks can both reuse it.
+func initBdRepo(tb testing.TB) string {
+	tb.Helper()
+	dir := tb.TempDir()
+	gitInit := exec.Command("git", "init", "-q")
+	gitInit.Dir = dir
+	require.NoError(tb, gitInit.Run())
+	bdInit := exec.Command("bd", "init", "--stealth", "--non-interactive", "--quiet")
+	bdInit.Dir = dir
+	out, err := bdInit.CombinedOutput()
+	require.NoError(tb, err, "bd init: %s", out)
+	return filepath.Join(dir, ".beads")
 }
 
 // TestResolveLedgerDir pins the path-resolution contract. Three input

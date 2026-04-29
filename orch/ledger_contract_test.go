@@ -28,34 +28,34 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 
 	t.Run("LDG01_Durability", func(t *testing.T) {
 		store, dir := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "persist", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "persist-1", Status: orch.StatusOpen}))
 
 		store2 := reopen(t, dir)
 		t.Cleanup(func() { store2.Close() })
-		got, err := store2.GetTask("persist")
+		got, err := store2.GetTask("persist-1")
 		require.NoError(t, err)
-		assert.Equal(t, "persist", got.ID)
+		assert.Equal(t, "persist-1", got.ID)
 		assert.Equal(t, orch.StatusOpen, got.Status)
 	})
 
 	t.Run("LDG02_SingleSourceOfTruth", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "t1", Status: orch.StatusOpen}))
-		got, err := store.GetTask("t1")
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "t-1", Status: orch.StatusOpen}))
+		got, err := store.GetTask("t-1")
 		require.NoError(t, err)
-		assert.Equal(t, "t1", got.ID)
+		assert.Equal(t, "t-1", got.ID)
 	})
 
 	t.Run("LDG04_DependencyBlocked", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "dep", Status: orch.StatusInProgress}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "blocked", Status: orch.StatusOpen}))
-		require.NoError(t, store.AddDep("blocked", "dep"))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "dep-1", Status: orch.StatusInProgress}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "blocked-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.AddDep("blocked-1", "dep-1"))
 
 		ready, err := store.ReadyTasks()
 		require.NoError(t, err)
 		for _, r := range ready {
-			assert.NotEqual(t, "blocked", r.ID)
+			assert.NotEqual(t, "blocked-1", r.ID)
 		}
 	})
 
@@ -64,90 +64,90 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 	// terminal deps do NOT block downstream.
 	t.Run("LDG04a_BlockedDepUnblocksDownstream", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "blocker", Status: orch.StatusBlocked}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "downstream", Status: orch.StatusOpen}))
-		require.NoError(t, store.AddDep("downstream", "blocker"))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "blocker-1", Status: orch.StatusBlocked}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "downstream-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.AddDep("downstream-1", "blocker-1"))
 
 		ready, err := store.ReadyTasks()
 		require.NoError(t, err)
 
 		ids := readyIDs(ready)
-		assert.True(t, ids["downstream"], "downstream should be ready — blocker is terminal (blocked)")
+		assert.True(t, ids["downstream-1"], "downstream should be ready — blocker is terminal (blocked)")
 	})
 
 	t.Run("LDG06_CycleDetection", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "a", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "b", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "c", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "a-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "b-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "c-1", Status: orch.StatusOpen}))
 
-		require.NoError(t, store.AddDep("a", "b"))
-		require.NoError(t, store.AddDep("b", "c"))
-		err := store.AddDep("c", "a")
+		require.NoError(t, store.AddDep("a-1", "b-1"))
+		require.NoError(t, store.AddDep("b-1", "c-1"))
+		err := store.AddDep("c-1", "a-1")
 		require.Error(t, err)
 		assert.ErrorIs(t, err, orch.ErrCycle)
 	})
 
 	t.Run("LDG06_SelfCycle", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "x", Status: orch.StatusOpen}))
-		err := store.AddDep("x", "x")
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "x-1", Status: orch.StatusOpen}))
+		err := store.AddDep("x-1", "x-1")
 		require.Error(t, err)
 		assert.ErrorIs(t, err, orch.ErrCycle)
 	})
 
 	t.Run("LDG07_DeterministicTiebreaker", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "zebra", Status: orch.StatusOpen, Priority: 0}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "alpha", Status: orch.StatusOpen, Priority: 0}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "mid", Status: orch.StatusOpen, Priority: 0}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "zebra-1", Status: orch.StatusOpen, Priority: 0}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "alpha-1", Status: orch.StatusOpen, Priority: 0}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "mid-1", Status: orch.StatusOpen, Priority: 0}))
 
 		ready, err := store.ReadyTasks()
 		require.NoError(t, err)
 		require.Len(t, ready, 3)
-		assert.Equal(t, "alpha", ready[0].ID)
-		assert.Equal(t, "mid", ready[1].ID)
-		assert.Equal(t, "zebra", ready[2].ID)
+		assert.Equal(t, "alpha-1", ready[0].ID)
+		assert.Equal(t, "mid-1", ready[1].ID)
+		assert.Equal(t, "zebra-1", ready[2].ID)
 	})
 
 	t.Run("LDG08_AtomicAssign", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "t1", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w1", Status: orch.WorkerIdle}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "t-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w-1", Status: orch.WorkerIdle}))
 
-		require.NoError(t, store.Assign("t1", "w1"))
+		require.NoError(t, store.Assign("t-1", "w-1"))
 
-		task, _ := store.GetTask("t1")
+		task, _ := store.GetTask("t-1")
 		assert.Equal(t, orch.StatusAssigned, task.Status)
-		assert.Equal(t, "w1", task.Assignee)
+		assert.Equal(t, "w-1", task.Assignee)
 
-		worker, _ := store.GetWorker("w1")
+		worker, _ := store.GetWorker("w-1")
 		assert.Equal(t, orch.WorkerActive, worker.Status)
-		assert.Equal(t, "t1", worker.CurrentTaskID)
+		assert.Equal(t, "t-1", worker.CurrentTaskID)
 	})
 
 	t.Run("LDG09_RejectReassignmentToDifferentWorker", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "t1", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w1", Status: orch.WorkerIdle}))
-		require.NoError(t, store.Assign("t1", "w1"))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "t-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w-1", Status: orch.WorkerIdle}))
+		require.NoError(t, store.Assign("t-1", "w-1"))
 
-		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w2", Status: orch.WorkerIdle}))
-		err := store.Assign("t1", "w2")
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w-2", Status: orch.WorkerIdle}))
+		err := store.Assign("t-1", "w-2")
 		require.Error(t, err)
 	})
 
 	t.Run("LDG10_SerializedAssignment", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "t1", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "t2", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w1", Status: orch.WorkerIdle}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "t-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "t-2", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w-1", Status: orch.WorkerIdle}))
 
 		var wg sync.WaitGroup
 		errs := make([]error, 2)
 		wg.Add(2)
-		go func() { defer wg.Done(); errs[0] = store.Assign("t1", "w1") }()
-		go func() { defer wg.Done(); errs[1] = store.Assign("t2", "w1") }()
+		go func() { defer wg.Done(); errs[0] = store.Assign("t-1", "w-1") }()
+		go func() { defer wg.Done(); errs[1] = store.Assign("t-2", "w-1") }()
 		wg.Wait()
 
 		successes := 0
@@ -163,53 +163,53 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 	// consistency, not crash-safety (which requires fault injection).
 	t.Run("LDG12_ReadAfterWrite", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "atomic", Status: orch.StatusOpen}))
-		got, err := store.GetTask("atomic")
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "atomic-1", Status: orch.StatusOpen}))
+		got, err := store.GetTask("atomic-1")
 		require.NoError(t, err)
-		assert.Equal(t, "atomic", got.ID)
+		assert.Equal(t, "atomic-1", got.ID)
 	})
 
 	t.Run("LDG14_NewTaskInitialization", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "new", Status: orch.StatusOpen}))
-		got, _ := store.GetTask("new")
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "new-1", Status: orch.StatusOpen}))
+		got, _ := store.GetTask("new-1")
 		assert.Equal(t, orch.StatusOpen, got.Status)
 		assert.Equal(t, "", got.Assignee)
 	})
 
 	t.Run("LDG14a_AssignedToInProgress", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "t1", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w1", Status: orch.WorkerIdle}))
-		require.NoError(t, store.Assign("t1", "w1"))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "t-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w-1", Status: orch.WorkerIdle}))
+		require.NoError(t, store.Assign("t-1", "w-1"))
 
-		task, _ := store.GetTask("t1")
+		task, _ := store.GetTask("t-1")
 		assert.Equal(t, orch.StatusAssigned, task.Status)
 
 		task.Status = orch.StatusInProgress
 		require.NoError(t, store.UpdateTask(task))
 
-		got, _ := store.GetTask("t1")
+		got, _ := store.GetTask("t-1")
 		assert.Equal(t, orch.StatusInProgress, got.Status)
 	})
 
 	t.Run("LDG15_NoReassignment", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "t1", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "t2", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w1", Status: orch.WorkerIdle}))
-		require.NoError(t, store.Assign("t1", "w1"))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "t-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "t-2", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w-1", Status: orch.WorkerIdle}))
+		require.NoError(t, store.Assign("t-1", "w-1"))
 
-		err := store.Assign("t2", "w1")
+		err := store.Assign("t-2", "w-1")
 		require.Error(t, err)
 		assert.ErrorIs(t, err, orch.ErrWorkerBusy)
 	})
 
 	t.Run("CreateTask_DuplicateReturnsErrTaskExists", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "dup", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "dup-1", Status: orch.StatusOpen}))
 
-		err := store.CreateTask(&orch.Task{ID: "dup", Status: orch.StatusOpen})
+		err := store.CreateTask(&orch.Task{ID: "dup-1", Status: orch.StatusOpen})
 		require.Error(t, err)
 		assert.ErrorIs(t, err, orch.ErrTaskExists)
 	})
@@ -223,27 +223,27 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 
 	t.Run("AddDepIdempotent", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "a", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "b", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "a-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "b-1", Status: orch.StatusOpen}))
 
-		require.NoError(t, store.AddDep("a", "b"))
-		require.NoError(t, store.AddDep("a", "b"))
+		require.NoError(t, store.AddDep("a-1", "b-1"))
+		require.NoError(t, store.AddDep("a-1", "b-1"))
 
-		deps, _ := store.GetDeps("a")
+		deps, _ := store.GetDeps("a-1")
 		assert.Len(t, deps, 1)
 	})
 
 	t.Run("ReadyWithTerminalDeps", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "dep", Status: orch.StatusCompleted}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "waiter", Status: orch.StatusOpen}))
-		require.NoError(t, store.AddDep("waiter", "dep"))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "dep-1", Status: orch.StatusCompleted}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "waiter-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.AddDep("waiter-1", "dep-1"))
 
 		ready, err := store.ReadyTasks()
 		require.NoError(t, err)
 
 		ids := readyIDs(ready)
-		assert.True(t, ids["waiter"], "waiter should be ready — dep is terminal")
+		assert.True(t, ids["waiter-1"], "waiter should be ready — dep is terminal")
 	})
 
 	// --- Status round-trip tests (prevents beads mapping regressions) ---
@@ -332,16 +332,16 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 
 	t.Run("Assign_TaskNotFound", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w1", Status: orch.WorkerIdle}))
-		err := store.Assign("ghost-task", "w1")
+		require.NoError(t, store.CreateWorker(&orch.Worker{Name: "w-1", Status: orch.WorkerIdle}))
+		err := store.Assign("ghost-task", "w-1")
 		require.Error(t, err)
 		assert.ErrorIs(t, err, orch.ErrNotFound)
 	})
 
 	t.Run("Assign_WorkerNotFound", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "t1", Status: orch.StatusOpen}))
-		err := store.Assign("t1", "ghost-worker")
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "t-1", Status: orch.StatusOpen}))
+		err := store.Assign("t-1", "ghost-worker")
 		require.Error(t, err)
 		assert.ErrorIs(t, err, orch.ErrNotFound)
 	})
@@ -377,47 +377,63 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		assert.Empty(t, workers)
 	})
 
-	// validateID path-traversal rejection: every Store method that accepts
-	// an external task ID or worker name must reject traversal attempts
-	// with ErrInvalidID rather than leaking ENOENT or writing outside the
-	// ledger directory. Contract-level so both FSStore and BeadsStore stay
-	// consistent (BeadsStore still resolves workers on the filesystem).
-	t.Run("ValidateID_RejectsPathTraversal", func(t *testing.T) {
+	// validateID rejection: every Store method that accepts an external task
+	// ID or worker name must reject malformed identifiers with ErrInvalidID
+	// rather than (a) leaking ENOENT, (b) writing outside the ledger directory,
+	// or (c) being misinterpreted as a flag by `bd <subcommand> <ID> --flag`-
+	// shaped argv. Contract-level so all backends (FSStore, BeadsStore,
+	// BDCLIStore) stay consistent on the rejection set.
+	t.Run("ValidateID_RejectsMalformedInputs", func(t *testing.T) {
 		store, _ := factory(t)
-		const bad = "../escape"
+		// Each pattern probes a different failure mode the regex must catch.
+		badIDs := []struct {
+			id   string
+			vuln string
+		}{
+			{"../escape", "path traversal"},
+			{"--status", "argv flag injection"},
+			{"-status", "leading-hyphen flag-shape"},
+			{"foo bar", "embedded space"},
+			{"foo\nbar", "embedded newline"},
+			{"foo\x00bar", "embedded NUL"},
+			{"", "empty"},
+		}
+		for _, bad := range badIDs {
+			t.Run(bad.vuln, func(t *testing.T) {
+				err := store.CreateTask(&orch.Task{ID: bad.id, Status: orch.StatusOpen})
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "CreateTask must reject: %s", bad.vuln)
 
-		err := store.CreateTask(&orch.Task{ID: bad, Status: orch.StatusOpen})
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "CreateTask should reject traversal")
+				_, err = store.GetTask(bad.id)
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "GetTask must reject: %s", bad.vuln)
 
-		_, err = store.GetTask(bad)
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "GetTask should reject traversal")
+				err = store.UpdateTask(&orch.Task{ID: bad.id, Status: orch.StatusOpen})
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "UpdateTask must reject: %s", bad.vuln)
 
-		err = store.UpdateTask(&orch.Task{ID: bad, Status: orch.StatusOpen})
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "UpdateTask should reject traversal")
+				err = store.CreateWorker(&orch.Worker{Name: bad.id, Status: orch.WorkerIdle})
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "CreateWorker must reject: %s", bad.vuln)
 
-		err = store.CreateWorker(&orch.Worker{Name: bad, Status: orch.WorkerIdle})
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "CreateWorker should reject traversal")
+				_, err = store.GetWorker(bad.id)
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "GetWorker must reject: %s", bad.vuln)
 
-		_, err = store.GetWorker(bad)
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "GetWorker should reject traversal")
+				err = store.UpdateWorker(&orch.Worker{Name: bad.id, Status: orch.WorkerIdle})
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "UpdateWorker must reject: %s", bad.vuln)
 
-		err = store.UpdateWorker(&orch.Worker{Name: bad, Status: orch.WorkerIdle})
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "UpdateWorker should reject traversal")
+				err = store.Assign(bad.id, "whatever")
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "Assign taskID must reject: %s", bad.vuln)
 
-		err = store.Assign(bad, "whatever")
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "Assign should reject traversal taskID")
+				err = store.Assign("whatever", bad.id)
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "Assign workerName must reject: %s", bad.vuln)
 
-		err = store.Assign("whatever", bad)
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "Assign should reject traversal workerName")
+				err = store.AddDep(bad.id, "whatever")
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "AddDep taskID must reject: %s", bad.vuln)
 
-		err = store.AddDep(bad, "whatever")
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "AddDep should reject traversal taskID")
+				err = store.AddDep("whatever", bad.id)
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "AddDep dependsOn must reject: %s", bad.vuln)
 
-		err = store.AddDep("whatever", bad)
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "AddDep should reject traversal dependsOn")
-
-		_, err = store.GetDeps(bad)
-		assert.ErrorIs(t, err, orch.ErrInvalidID, "GetDeps should reject traversal")
+				_, err = store.GetDeps(bad.id)
+				assert.ErrorIs(t, err, orch.ErrInvalidID, "GetDeps must reject: %s", bad.vuln)
+			})
+		}
 	})
 
 	// Title/Body round-trip: both fields must survive create + update cycles
@@ -473,25 +489,25 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 	// Label filter: ReadyTasks with branch label filter.
 	t.Run("LDG_LabelFilter_ReadyTasks", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "a", Status: orch.StatusOpen, Labels: map[string]string{"branch": "feat/x"}}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "b", Status: orch.StatusOpen, Labels: map[string]string{"branch": "feat/y"}}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "c", Status: orch.StatusOpen, Labels: map[string]string{"branch": "feat/x", "role": "builder"}}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "a-1", Status: orch.StatusOpen, Labels: map[string]string{"branch": "feat/x"}}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "b-1", Status: orch.StatusOpen, Labels: map[string]string{"branch": "feat/y"}}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "c-1", Status: orch.StatusOpen, Labels: map[string]string{"branch": "feat/x", "role": "builder"}}))
 
 		ready, err := store.ReadyTasks("branch:feat/x")
 		require.NoError(t, err)
 
 		ids := readyIDs(ready)
-		assert.True(t, ids["a"])
-		assert.True(t, ids["c"])
-		assert.False(t, ids["b"], "b has branch:feat/y, should not match")
+		assert.True(t, ids["a-1"])
+		assert.True(t, ids["c-1"])
+		assert.False(t, ids["b-1"], "b has branch:feat/y, should not match")
 	})
 
 	// Label filter: ListTasks with label filter.
 	t.Run("LDG_LabelFilter_ListTasks", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "a", Status: orch.StatusOpen, Labels: map[string]string{"branch": "feat/x"}}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "b", Status: orch.StatusCompleted, Labels: map[string]string{"branch": "feat/x"}}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "c", Status: orch.StatusOpen, Labels: map[string]string{"branch": "feat/y"}}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "a-1", Status: orch.StatusOpen, Labels: map[string]string{"branch": "feat/x"}}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "b-1", Status: orch.StatusCompleted, Labels: map[string]string{"branch": "feat/x"}}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "c-1", Status: orch.StatusOpen, Labels: map[string]string{"branch": "feat/y"}}))
 
 		tasks, err := store.ListTasks("branch:feat/x")
 		require.NoError(t, err)
@@ -532,8 +548,8 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		const numTasks = 20
 		const numWorkers = 20
 
-		taskID := func(i int) string { return fmt.Sprintf("t%d", i) }
-		workerName := func(i int) string { return fmt.Sprintf("w%d", i) }
+		taskID := func(i int) string { return fmt.Sprintf("t-%d", i) }
+		workerName := func(i int) string { return fmt.Sprintf("w-%d", i) }
 
 		for i := 0; i < numTasks; i++ {
 			require.NoError(t, store.CreateTask(&orch.Task{
@@ -551,12 +567,24 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 		// Every (task, worker) pair races simultaneously. This creates both
 		// task-level contention (workers 0..19 all targeting task 0) and
 		// worker-level contention (tasks 0..19 all targeting worker 0).
+		//
+		// The semaphore caps concurrent Assign goroutines at 32 — without it,
+		// CLI-backed stores fork-bomb with 400 simultaneous subprocesses, and
+		// even idle goroutines waste stack memory until they get scheduled.
+		// Acquiring before `go func` (rather than inside) keeps the goroutine
+		// population bounded by maxConcurrent; FSStore and BeadsStore are
+		// unaffected because their Assign is fast. The store-level invariant
+		// (no double-assignment) holds at any concurrency.
+		const maxConcurrent = 32
+		sem := make(chan struct{}, maxConcurrent)
 		var wg sync.WaitGroup
 		wg.Add(numTasks * numWorkers)
 		for ti := 0; ti < numTasks; ti++ {
 			for wi := 0; wi < numWorkers; wi++ {
+				sem <- struct{}{}
 				go func(tID, wName string) {
 					defer wg.Done()
+					defer func() { <-sem }()
 					_ = store.Assign(tID, wName)
 				}(taskID(ti), workerName(wi))
 			}
@@ -617,22 +645,22 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 	t.Run("LDG_LabelRoundtrip_Criticality", func(t *testing.T) {
 		store, _ := factory(t)
 		require.NoError(t, store.CreateTask(&orch.Task{
-			ID:     "crit",
+			ID:     "crit-1",
 			Status: orch.StatusOpen,
 			Labels: map[string]string{orch.LabelCriticality: string(orch.Critical)},
 		}))
 
-		got, err := store.GetTask("crit")
+		got, err := store.GetTask("crit-1")
 		require.NoError(t, err)
 		assert.True(t, got.IsCritical(), "IsCritical() should be true after round-trip")
 
 		// Non-critical task.
 		require.NoError(t, store.CreateTask(&orch.Task{
-			ID:     "noncrit",
+			ID:     "noncrit-1",
 			Status: orch.StatusOpen,
 			Labels: map[string]string{orch.LabelCriticality: string(orch.NonCritical)},
 		}))
-		got2, _ := store.GetTask("noncrit")
+		got2, _ := store.GetTask("noncrit-1")
 		assert.False(t, got2.IsCritical(), "IsCritical() should be false for non_critical")
 	})
 
@@ -640,22 +668,22 @@ func RunStoreContractTests(t *testing.T, factory StoreFactory, reopen ReopenFunc
 	// dependency-blocked tasks.
 	t.Run("ReadyTasks_Correctness", func(t *testing.T) {
 		store, _ := factory(t)
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "blocker", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "blocked", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "ready1", Status: orch.StatusOpen}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "assigned", Status: orch.StatusAssigned, Assignee: "w1"}))
-		require.NoError(t, store.CreateTask(&orch.Task{ID: "done", Status: orch.StatusCompleted}))
-		require.NoError(t, store.AddDep("blocked", "blocker"))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "blocker-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "blocked-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "ready-1", Status: orch.StatusOpen}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "assigned-1", Status: orch.StatusAssigned, Assignee: "w-1"}))
+		require.NoError(t, store.CreateTask(&orch.Task{ID: "done-1", Status: orch.StatusCompleted}))
+		require.NoError(t, store.AddDep("blocked-1", "blocker-1"))
 
 		ready, err := store.ReadyTasks()
 		require.NoError(t, err)
 
 		ids := readyIDs(ready)
-		assert.True(t, ids["ready1"], "ready1 should be in ready set")
-		assert.True(t, ids["blocker"], "blocker should be ready (no deps)")
-		assert.False(t, ids["blocked"], "blocked should not be ready (dep not terminal)")
-		assert.False(t, ids["assigned"], "assigned should not be ready (has assignee)")
-		assert.False(t, ids["done"], "done should not be ready (not open)")
+		assert.True(t, ids["ready-1"], "ready-1 should be in ready set")
+		assert.True(t, ids["blocker-1"], "blocker should be ready (no deps)")
+		assert.False(t, ids["blocked-1"], "blocked should not be ready (dep not terminal)")
+		assert.False(t, ids["assigned-1"], "assigned should not be ready (has assignee)")
+		assert.False(t, ids["done-1"], "done should not be ready (not open)")
 	})
 }
 

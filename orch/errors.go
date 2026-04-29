@@ -13,6 +13,21 @@ var (
 	ErrTaskNotReady    = errors.New("task not ready for assignment")
 	ErrWorkerBusy      = errors.New("worker is not idle")
 	ErrPoolExhausted   = errors.New("worker pool exhausted") // returned by the dispatcher when every worker slot is busy
+
+	// ErrStoreUnavailable signals that the ledger backend cannot be reached.
+	// Returned by BDCLIStore when a `bd` invocation times out, is cancelled by
+	// the orchestrator's context, or exits with a transport-class signal (exec
+	// failure, no such command). Distinct from ErrNotFound or domain errors —
+	// this is "the store is gone, retry later" rather than "your write was
+	// rejected on its merits". The CLI maps it to exitRuntimeError so wrapper
+	// scripts treat it as a transient infra failure, not a config issue.
+	//
+	// Cancellation note: when wrapped around a context.Canceled or
+	// context.DeadlineExceeded, the underlying context error is preserved via
+	// multi-%w so classifyEngineError's signal-interrupt clause (which fires
+	// before the ErrStoreUnavailable clause) still routes signal-driven
+	// shutdown to exitSignalInterrupt.
+	ErrStoreUnavailable = errors.New("ledger backend unavailable")
 )
 
 // Sentinel errors for lifecycle control flow.
