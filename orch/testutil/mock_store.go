@@ -5,6 +5,7 @@ package testutil
 import (
 	"cmp"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -408,10 +409,18 @@ func (s *MockStore) reachable(start, target string) bool {
 	return dfs(start)
 }
 
-// ValidateID rejects identifiers with path traversal characters.
-// Mirrors orch.validateID (unexported) using stdlib string functions.
+// idPattern mirrors orch.idPattern (unexported). Keep both regexes byte-for-byte
+// identical — the contract suite (RunStoreContractTests/ValidateID_RejectsMalformedInputs)
+// runs against MockStore and asserts the same rejection set as FSStore /
+// BeadsStore / BDCLIStore.
+var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
+// ValidateID rejects identifiers that could (a) escape filesystem directories
+// via path traversal, or (b) be misinterpreted as flags by bd subcommands
+// when used positionally. Mirrors orch.validateID (unexported) — see
+// orch/ledger.go for the full rationale.
 func ValidateID(id string) error {
-	if id == "" || strings.ContainsAny(id, "/\\") || id == "." || strings.Contains(id, "..") {
+	if !idPattern.MatchString(id) {
 		return fmt.Errorf("id %q: %w", id, orch.ErrInvalidID)
 	}
 	return nil
