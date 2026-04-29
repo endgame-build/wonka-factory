@@ -40,7 +40,7 @@ import (
 // That keeps the shell-out count to two regardless of result size, instead
 // of N+1 per-issue lookups.
 type BDCLIStore struct {
-	repoPath  string     // <repo>/.beads/ — passed to bd via cmd.Dir as the working tree containing it
+	repoPath  string     // bd database directory (typically <repo>/.beads/); used as cmd.Dir so bd locates its config
 	workerDir string     // <repoPath>/workers/ — bd has no worker primitive
 	bdPath    string     // resolved at construction so we fail fast if bd disappears
 	baseEnv   []string   // os.Environ() snapshot + BEADS_ACTOR=<actor>; reused per call

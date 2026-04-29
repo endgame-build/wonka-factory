@@ -72,7 +72,7 @@ func NewStore(kind LedgerKind, dir string) (Store, LedgerKind, error) {
 	fallback := originalKind == "" && kind == LedgerBeads
 	ctor, ok := storeRegistry[kind]
 	if !ok {
-		return nil, "", fmt.Errorf("unknown ledger kind %q (available: beads, fs)", kind)
+		return nil, "", fmt.Errorf("unknown ledger kind %q (available: beads, bd-cli, fs)", kind)
 	}
 	store, err := ctor(dir)
 	if err != nil && fallback {
