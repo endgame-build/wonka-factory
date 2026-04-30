@@ -1,0 +1,31 @@
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+  name: agent-orchestration
+  description: Durable orchestration of autonomous software-delivery agents
+spec:
+  owner: platform-team
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: wonka-factory
+  description: DAG-driven task dispatch for autonomous software delivery agents
+  annotations:
+    github.com/project-slug: endgame-build/wonka-factory
+    backstage.io/techdocs-ref: dir:.
+  tags:
+    - go
+    - orchestrator
+    - agents
+    - dag
+    - dispatch
+  links:
+    - url: https://github.com/endgame-build/wonka-factory
+      title: Source
+      icon: github
+spec:
+  type: service
+  lifecycle: experimental
+  owner: platform-team
+  system: agent-orchestration
