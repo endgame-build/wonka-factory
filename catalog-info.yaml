@@ -4,7 +4,7 @@ metadata:
   name: agent-orchestration
   description: Durable orchestration of autonomous software-delivery agents
 spec:
-  owner: platform-team
+  owner: engineers
 ---
 apiVersion: backstage.io/v1alpha1
 kind: Component
@@ -27,5 +27,5 @@ metadata:
 spec:
   type: service
   lifecycle: experimental
-  owner: platform-team
+  owner: engineers
   system: agent-orchestration
